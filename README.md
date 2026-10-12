@@ -12,6 +12,27 @@ one searchable view:
 
 ## Install
 
+### Download a signed release
+
+On Linux or macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL \
+  https://raw.githubusercontent.com/yesheytenzin/xses/main/install.sh | sh
+```
+
+The installer detects the platform, downloads the latest release, verifies
+its SHA-256 checksum, and installs `xses` to `~/.local/bin`.
+
+After downloading and extracting a release binary, verify its signed build
+provenance with:
+
+```sh
+gh attestation verify ./xses --repo yesheytenzin/xses
+```
+
+### Build from source
+
 ```sh
 cargo install --path . --root "$HOME/.local"
 ```
@@ -74,6 +95,19 @@ xses clean --dry-run
 
 Session lists and resume commands are usually scoped to the current directory.
 Run `xses sync --all` when you need sessions from other projects.
+
+## Releases
+
+Maintainers publish a release by pushing a version tag:
+
+```sh
+git tag v0.3.0
+git push origin v0.3.0
+```
+
+GitHub Actions then tests the project, builds Linux/macOS/Windows archives,
+publishes checksums, creates signed build provenance, and attaches everything
+to the GitHub Release.
 
 ## License
 

@@ -3,6 +3,13 @@
 `xses` lets you find, resume, and share coding-agent sessions across
 Claude Code, Codex, Pi, oh-my-pi, and OpenCode.
 
+![xses unified session picker](docs/images/xses-picker.png)
+
+Sessions are scanned, normalized, synchronized, and made available through
+one searchable view:
+
+![xses workflow](docs/images/xses-workflow.png)
+
 ## Install
 
 ```sh

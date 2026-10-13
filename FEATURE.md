@@ -1,93 +1,74 @@
 # Transfer capabilities
 
-What a sync between agents can carry, what it cannot, and why.
-Three statuses are used throughout:
+What a sync carries, where it lands, and what can never move. Statuses:
 
-- **shipped** — done today.
-- **possible** — reachable by the normalize-and-project design (`docs`/plan): the
-  source has the data and the target has a construct for it; a writer mapping is
-  all that is missing. Items marked *(probe)* still need their target validator
-  confirmed against the live CLI.
-- **impossible** — the data is not in the source file, is provider-bound, or has
-  no representable equivalent.
+- **carried** — written as the target's own construct (mapping version 2).
+- **text** — preserved as labelled text because the target has no construct.
+- **gap** — recorded as `[gap in imported history: …]` and counted as dropped.
+- **impossible** — the data is not in the source file or has no equivalent.
 
-## Shipped today
+## Carried natively
 
-Sync is text-only. Every structured block is flattened into a labelled text
-part, with per-block fidelity counted and visible to the user:
+| Data class | claude | codex | pi / omp | opencode |
+|---|---|---|---|---|
+| text | `text` blocks | `message` (`input_text`/`output_text`) | `text` parts | `text` parts |
+| thinking (text) | `thinking` blocks | `reasoning` items | `thinking` parts | `reasoning` parts |
+| tool calls | `tool_use` (id, name, input) | `function_call` / `custom_tool_call` | `toolCall` (id, name, arguments) | `tool` part (`callID`, `state.input`) |
+| tool results | `tool_result` rows (`tool_use_id`, `is_error`) | `function_call_output` / `custom_tool_call_output` | `toolResult` messages (`toolCallId`, `toolName`, `isError`, `durationMs`) | `tool.state.output` / `state.error` |
+| images (≤5 MB each, 20 MB/session) | `image` base64 blocks | `input_image` data URLs | `image` parts (data + mimeType) | *gap* — no importable image part |
+| patches | *text* | *text* | *text* | `patch` parts (hash + files) |
+| compaction | *text* | `contextCompaction` projection | `message` text | *text* |
+| usage / cost / tokens | per-message `usage` | `token_count` events | per-message `usage` | `step-finish` tokens |
+| injected context | *text* (`[context: kind]`) | *text* | *text* | *text* |
 
-| Source block | Becomes | Fidelity |
-|---|---|---|
-| text | text | preserved |
-| thinking | `[previous thinking — transcript, not live]` + text | downgraded |
-| tool call | `[previous tool call: NAME — transcript, not live]` + args | normalized |
-| tool result | `[previous tool result: NAME — transcript, not live]` + output | normalized |
-| compaction | `[compaction]` + summary | normalized |
-| image, patch, attachment, redacted reasoning, unreadable record | `[gap in imported history: …]` | dropped |
+Projections each target's own UI reads:
 
-`sync --dry-run` prints the tally; every import also reports what it lost.
-Imports are idempotent (fingerprint per session content) and `clean` removes
-exactly what xses wrote.
+- claude: `custom-title.json` sidecar (picker row) + uuid parent chain.
+- codex: `thread_items` rows — `userMessage`, `agentMessage`, `commandExecution`
+  (shell calls, with `aggregatedOutput` so the TUI shows output), `contextCompaction`.
+- pi / omp: `session_info` (picker name), `parentId` chain, `title` record.
+- opencode: message parts as stored, `session.slug = xses-<id>`.
 
-## Possible (content transfer, not yet implemented)
+## Text fallbacks, by design
 
-| Data class | Verdict | Target construct | Caveats |
-|---|---|---|---|
-| Text | possible → **native everywhere** | all five formats | — |
-| Tool calls (name, args, status) | possible | claude `tool_use`, codex `function_call` / `custom_tool_call`, pi `toolCall`, opencode `tool` part *(probe)* | call ids are re-minted per target; ids are provider-bound |
-| Tool outputs (incl. `is_error`, duration) | possible | claude `tool_result`, codex `function_call_output`, pi `toolResult` message, opencode `tool.state.output` *(probe)* | re-parenting differs per target: claude puts results in a user row, codex as its own item, pi as its own message, opencode folds them into the assistant part |
-| Thinking text | possible (text only) | claude `thinking`, codex `reasoning`, pi `thinking`, opencode `reasoning` part | signature-bound: the provider validates signatures, so the block is never "live reasoning" again |
-| Injected context (AGENTS.md, reminders, environment) | possible, content only | claude system rows, codex developer/system items, pi `custom_message` | opencode's import validator rejects `role:"system"` (measured) → folded into assistant text |
-| Compaction summaries | possible | pi/opencode `compaction`, claude `compact_boundary` *(probe)*, codex summary message | recorded as history; the target's own context window is unaffected |
-| Images / screenshots | possible with caps | claude `image` base64, codex `input_image` data URL, pi `image{data,mimeType}` | caps 5 MB per part / 20 MB per session; opencode `file` part *(probe)*; over-cap → gap |
-| Patches / diffs | text elsewhere | opencode `patch` part *(probe)* | other agents have no patch construct |
-| Usage, cost, tokens, per-message model | possible | opencode `step-finish`, pi message fields, codex `token_count` events, claude usage rows | accounting models differ; the numbers are metadata, not authoritative |
-| Session metadata (title, cwd, git branch, permission mode, model) | possible | claude session rows, codex `session_meta`/`turn_context`, pi header + `session_info`, opencode session columns | fields with no home are preserved in `raw_extra` |
-| Subagents / sidechains | possible as separate sessions | — | transcripts transfer; the nesting relation has no cross-agent equivalent |
+- **Tool traffic is history, never live state.** Every import opens with a note
+  saying the transcript already ran elsewhere; calls are written as completed,
+  and a call whose result the source never recorded becomes a tool-output gap.
+- **Thinking signatures are not replayed.** `signature` / `thinkingSignature`
+  are provider-bound; the reasoning *text* transfers, the signature does not.
+- **Patch bodies** have no home outside opencode, so they arrive as a labelled
+  file list.
+- **Injected context** (AGENTS.md, environment, reminders) is text everywhere:
+  opencode rejects `role: "system"` on import (verified), so it rides as
+  assistant text there.
+- **Non-shell tools in codex's projection** render as text; the rollout still
+  holds their `function_call`/`function_call_output` items.
 
 ## Impossible
 
 | Data class | Why |
 |---|---|
-| Redacted / encrypted reasoning | the content is not in the source file. Claude stores empty `thinking` with a signature (99% of observed blocks: 561 of 566 in one sample, 1471 of 1476 in another); every observed codex `reasoning` item had null content (89 of 89). Only a gap marker is honest |
-| Provider-signed thinking replay | `signature` / `thinkingSignature` are provider-validated; emitting them elsewhere is rejected or meaningless |
-| Live runtime state (running tools, queues, background tasks, permission prompts) | not representable as history in any target; only a narration note can be written |
-| Provider-local bookkeeping (latches, bridge ids, file-history snapshots, fork refs, cache keys, credential pins) | same-tool round-trips keep them in `raw_extra`; no other agent has a place for them |
-| Attachment bytes that no longer exist | claude `file` / `compact_file_reference` carry a path, not content; if the file is gone there is nothing to move |
-| Exact per-message timing | some sources have no usable timestamps; ordering is preserved, timing is synthesized where the target requires monotonic values |
-| Original tool-call ids | ids are validated per provider; they are re-minted |
+| Redacted / encrypted reasoning | not in the source file (claude stores empty `thinking` with a signature; codex stores `reasoning` with null content) |
+| Provider-signed thinking replay | signatures are validated by the originating provider |
+| Live runtime state (running tools, queues, background tasks, permission prompts) | not representable as history in any target; only the import note can describe it |
+| Provider-local bookkeeping (latches, bridge ids, file-history snapshots, fork refs, cache keys, credential pins) | same-tool round-trips keep them in the source; other agents have no place for them |
+| Attachment bytes that no longer exist | claude `file` / `compact_file_reference` carry a path; if the file is gone there is nothing to move |
+| Original tool-call ids | ids are provider-validated; xses re-mints deterministic ids so results still pair |
+| Exact per-message timing | ordering is preserved; timestamps are synthesized where the target requires monotonic values |
 
-## Per-target matrix
+## Accounting
 
-| Part | claude | codex | pi / omp | opencode | sharegpt / openai |
-|---|---|---|---|---|---|
-| text | yes | yes | yes | yes | yes |
-| thinking (text) | possible | possible | possible | possible *(probe)* | text |
-| tool call | possible | possible | possible | possible *(probe)* | text |
-| tool result | possible | possible | possible | possible *(probe)* | text |
-| image | possible (capped) | possible (capped) | possible (capped) | *(probe)* | no |
-| patch | text | text | text | possible *(probe)* | text |
-| injected context | possible | possible | possible | text only (no system role) | text |
-| compaction | possible *(probe)* | text | possible | possible *(probe)* | text |
-| usage / cost | possible | possible | possible | possible | no |
-| session metadata | partial | partial | partial | yes | no |
+Every import header carries a manifest — `xses: {source, srcId, mapping,
+blocks: {kind: count}, gaps: [kinds]}` — so the file itself states what it
+holds and what it lost. `sync --dry-run` prints the same tally before writing,
+and `xses doctor` aggregates recorded failures. A future mapping bump
+re-imports old copies automatically (the mapping version is part of the
+idempotency fingerprint).
 
-*(probe)* = the target's own validator has not been run against that construct
-yet; the planned probe step fills this in before any writer relies on it.
+## Verified against the live CLIs
 
-## Rules that apply to every transfer
-
-1. **History, never live state.** Tool traffic is written as completed history
-   with a narration note; a call without its result becomes a gap, never a
-   pending call.
-2. **Grouping is target-native.** One source message maps to one target message
-   where the schema allows multiple parts (claude content blocks, pi parts,
-   opencode parts); codex splits calls into their own items because that is how
-   its format expresses them.
-3. **Every absence is recorded.** Unmappable parts become named gaps, and each
-   import carries a manifest of what it could not carry, which `xses doctor`
-   aggregates.
-4. **Deterministic bytes.** The same source and mapping version produce
-   identical artifacts, so re-syncs dedupe and `clean` stays exact.
-5. **Caps are explicit.** Size caps for inline media and the mapping version
-   live in the manifest, so a future release can raise them and re-import.
+- `claude --resume` and `pi -r` list and open imports; `omp -r` lists them.
+- codex accepts the drop-in rollout and renders `commandExecution` rows.
+- `opencode import` accepts `tool`, `reasoning`, and `patch` parts, and requires
+  `state.output` **and** `state.error` on every tool part — a call with no
+  recorded output carries an empty one rather than failing the import.

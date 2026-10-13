@@ -1,7 +1,7 @@
 //! opencode writer: synthesize an export payload, pipe it through `opencode import`.
-use super::{first_ask, import_id, role_str};
-use crate::canonical::{CanonicalSession, Role};
-use serde_json::json;
+use super::{first_ask, group_role, import_id, manifest, role_str};
+use crate::canonical::{Block, CanonicalSession, Role};
+use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -39,7 +39,7 @@ static OPENCODE_MODEL: std::sync::LazyLock<serde_json::Value> = std::sync::LazyL
     }
 });
 
-pub(super) fn write(session: &CanonicalSession, msgs: &[(Role, String)]) -> Option<PathBuf> {
+pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
     let ses = format!("ses_{}", import_id(session.tool, &session.id));
     let now_ms = chrono::Utc::now().timestamp_millis();
     let model = local_opencode_model();
@@ -57,18 +57,67 @@ pub(super) fn write(session: &CanonicalSession, msgs: &[(Role, String)]) -> Opti
     // parentID/mode/path/cost/tokens + top-level providerID/modelID, user infos
     // carry agent/model/summary and no parentID.
     let mut prev_id: Option<String> = None;
-    let mut msgs_json: Vec<serde_json::Value> = Vec::with_capacity(msgs.len());
-    for (i, (role, text)) in msgs.iter().enumerate() {
+    let mut msgs_json: Vec<serde_json::Value> = Vec::new();
+    let groups = session.grouped();
+    let total = groups.len().max(1);
+    // opencode keeps a call and its result in ONE `tool` part, so results are
+    // folded by call id before the message loop.
+    let mut folded: std::collections::HashMap<String, (String, bool, Option<u64>)> =
+        std::collections::HashMap::new();
+    for (_, blocks) in &groups {
+        for block in blocks {
+            if let Block::ToolResult {
+                call_id,
+                output,
+                is_error,
+                duration_ms,
+                name,
+            } = block
+            {
+                folded.insert(
+                    call_id.clone().unwrap_or_else(|| format!("call-{name}")),
+                    (output.clone(), *is_error, *duration_ms),
+                );
+            }
+        }
+    }
+    let mut minted = 0usize;
+    // Import note rides on the first message as assistant text: opencode's
+    // import validator rejects `role: "system"` outright (verified).
+    let mut note_pending = true;
+    for (i, (_, blocks)) in groups.into_iter().enumerate() {
         // opencode orders messages by (time_created, id): ids must sort in
         // transcript order and timestamps must increase, or the import shows
         // up scrambled.
         let mid = format!("msg_{i:06}-{}", mint_suffix());
-        let ts = now_ms - ((msgs.len() - i) as i64);
+        let ts = now_ms - ((total - i) as i64);
+        let role = group_role(&blocks, Role::Assistant);
         // opencode's import validator only accepts user/assistant messages
         // ("Expected Message" on role=system, verified against the live CLI),
         // so transcript-context lines ride as assistant text.
         let is_assistant = matches!(role, Role::Assistant | Role::System);
+        let usage = blocks.iter().find_map(|b| match b {
+            Block::Usage {
+                input,
+                output,
+                reasoning,
+                cache_read,
+                cache_write,
+                cost,
+                ..
+            } => Some((
+                *input,
+                *output,
+                *reasoning,
+                *cache_read,
+                *cache_write,
+                *cost,
+            )),
+            _ => None,
+        });
         let info = if is_assistant {
+            let (input, output, reasoning, cache_read, cache_write, cost) =
+                usage.unwrap_or((0, 0, 0, 0, 0, 0.0));
             json!({
                 "id": mid,
                 "sessionID": ses,
@@ -78,8 +127,9 @@ pub(super) fn write(session: &CanonicalSession, msgs: &[(Role, String)]) -> Opti
                 "mode": "build",
                 "agent": "build",
                 "path": {"cwd": session.cwd, "root": session.cwd},
-                "cost": 0,
-                "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
+                "cost": cost,
+                "tokens": {"input": input, "output": output, "reasoning": reasoning,
+                           "cache": {"read": cache_read, "write": cache_write}},
                 "providerID": provider_id,
                 "modelID": model_id,
             })
@@ -87,7 +137,7 @@ pub(super) fn write(session: &CanonicalSession, msgs: &[(Role, String)]) -> Opti
             let mut info = json!({
                 "id": mid,
                 "sessionID": ses,
-                "role": role_str(*role),
+                "role": role_str(role),
                 "time": {"created": ts},
                 "agent": "build",
                 "model": model,
@@ -98,16 +148,171 @@ pub(super) fn write(session: &CanonicalSession, msgs: &[(Role, String)]) -> Opti
             }
             info
         };
-        msgs_json.push(json!({
-            "info": info,
-            "parts": [{
+        let mut parts: Vec<serde_json::Value> = Vec::new();
+        fn part_id(minted: &mut usize, prefix: &str) -> String {
+            *minted += 1;
+            format!("{prefix}{minted:04}-{}", mint_suffix())
+        }
+        if note_pending {
+            note_pending = false;
+            let pid = part_id(&mut minted, "prt_");
+            parts.push(json!({
                 "type": "text",
-                "id": mint_id("prt_"),
+                "id": pid,
                 "sessionID": ses,
                 "messageID": mid,
-                "text": text,
-            }],
-        }));
+                "text": super::pi::IMPORT_NOTE,
+            }));
+        }
+        for block in &blocks {
+            match block {
+                Block::Text { text, .. } => {
+                    let pid = part_id(&mut minted, "prt_");
+                    parts.push(json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid, "text": text}));
+                }
+                Block::Thinking { text, .. } => {
+                    if text.trim().is_empty() {
+                        continue;
+                    }
+                    let pid = part_id(&mut minted, "prt_");
+                    parts.push(json!({
+                        "type": "reasoning",
+                        "id": pid,
+                        "sessionID": ses,
+                        "messageID": mid,
+                        "text": text,
+                        "time": {"start": ts, "end": ts},
+                    }));
+                }
+                Block::ToolCall {
+                    name,
+                    args,
+                    call_id,
+                    status,
+                } => {
+                    let cid = call_id
+                        .clone()
+                        .unwrap_or_else(|| format!("call-{minted}-{name}"));
+                    // The validator requires an object input and a mandatory
+                    // `state.output`; a call whose result was never recorded
+                    // keeps an empty output rather than failing the import.
+                    let input: serde_json::Value = serde_json::from_str(args)
+                        .ok()
+                        .filter(|v: &serde_json::Value| v.is_object())
+                        .unwrap_or_else(|| json!({"raw": args}));
+                    let (output, is_error, duration) = folded
+                        .get(&cid)
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), false, None));
+                    let pid = part_id(&mut minted, "prt_");
+                    // The import validator wants the whole union present:
+                    // `output` and `error` both, with the unused one null.
+                    let mut state = json!({
+                        "status": if is_error || status.as_deref() == Some("error") {
+                            "error"
+                        } else {
+                            "completed"
+                        },
+                        "input": input,
+                        "output": if is_error { Value::Null } else { json!(output) },
+                        "error": if is_error { json!(output) } else { Value::Null },
+                        "title": name,
+                        "metadata": {},
+                        "time": {"start": ts, "end": ts},
+                    });
+                    if let Some(d) = duration {
+                        state["metadata"]["durationMs"] = json!(d);
+                    }
+                    parts.push(json!({
+                        "type": "tool",
+                        "id": pid,
+                        "sessionID": ses,
+                        "messageID": mid,
+                        "tool": name,
+                        "callID": cid,
+                        "state": state,
+                    }));
+                }
+                // Results were folded into their call's part above.
+                Block::ToolResult { .. } => {}
+                Block::Patch { hash, files } => {
+                    let pid = part_id(&mut minted, "prt_");
+                    if hash.as_deref().is_some_and(|h| !h.is_empty()) {
+                        parts.push(json!({
+                            "type": "patch",
+                            "id": pid,
+                            "sessionID": ses,
+                            "messageID": mid,
+                            "hash": hash.clone().unwrap_or_default(),
+                            "files": files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
+                        }));
+                    } else {
+                        parts.push(json!({
+                            "type": "text",
+                            "id": pid,
+                            "sessionID": ses,
+                            "messageID": mid,
+                            "text": format!(
+                                "[patch: {} file{}]\n{}",
+                                files.len(),
+                                if files.len() == 1 { "" } else { "s" },
+                                files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join("\n")
+                            ),
+                        }));
+                    }
+                }
+                Block::Image {
+                    mime, bytes, path, ..
+                } => {
+                    // opencode has no importable image part; record the loss
+                    // inline so the transcript shows what is missing.
+                    let pid = part_id(&mut minted, "prt_");
+                    parts.push(json!({
+                        "type": "text",
+                        "id": pid,
+                        "sessionID": ses,
+                        "messageID": mid,
+                        "text": format!(
+                            "[image: {} ({bytes} bytes) not carried]",
+                            path.as_ref().map(|p| p.display().to_string())
+                                .unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()))
+                        ),
+                    }));
+                }
+                Block::Context { kind, text, path } => {
+                    let body = text
+                        .clone()
+                        .or_else(|| path.as_ref().map(|p| p.display().to_string()))
+                        .unwrap_or_default();
+                    let pid = part_id(&mut minted, "prt_");
+                    parts.push(
+                        json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid,
+                                      "text": format!("[context: {kind}]\n{body}")}),
+                    );
+                }
+                Block::Compressed { text } => {
+                    let pid = part_id(&mut minted, "prt_");
+                    parts.push(
+                        json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid,
+                                      "text": format!("[compaction]\n{text}")}),
+                    );
+                }
+                Block::Gap { detail, .. } => {
+                    let pid = part_id(&mut minted, "prt_");
+                    parts.push(
+                        json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid,
+                                      "text": format!("[gap in imported history: {detail}]")}),
+                    );
+                }
+                Block::Usage { .. } => {}
+            }
+        }
+        if parts.is_empty() {
+            // Never emit an empty message: opencode's validator rejects it.
+            let pid = part_id(&mut minted, "prt_");
+            parts.push(json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid, "text": "[empty message]"}));
+        }
+        msgs_json.push(json!({"info": info, "parts": parts}));
         prev_id = Some(mid);
     }
     let payload = json!({
@@ -117,7 +322,7 @@ pub(super) fn write(session: &CanonicalSession, msgs: &[(Role, String)]) -> Opti
             "projectID": "global",
             "directory": session.cwd,
             "path": session.cwd.to_string_lossy().trim_start_matches('/'),
-            "title": format!("[{}] {}", session.tool.as_str(), first_ask(msgs)),
+            "title": format!("[{}] {}", session.tool.as_str(), first_ask(session)),
             "version": "1.0.0",
             "time": {"created": now_ms, "updated": now_ms},
             "agent": "build",
@@ -125,7 +330,7 @@ pub(super) fn write(session: &CanonicalSession, msgs: &[(Role, String)]) -> Opti
             "summary": {"diffs": [], "additions": 0, "deletions": 0, "files": 0},
             "cost": 0,
             "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
-        "xses": {"source": session.tool.as_str(), "srcId": session.id},
+        "xses": manifest(session),
         },
         "messages": msgs_json,
     });
@@ -193,9 +398,6 @@ pub(super) fn write(session: &CanonicalSession, msgs: &[(Role, String)]) -> Opti
 }
 fn local_opencode_model() -> serde_json::Value {
     OPENCODE_MODEL.clone()
-}
-fn mint_id(prefix: &str) -> String {
-    format!("{prefix}{}", mint_suffix())
 }
 /// 24 random alphanumerics.
 fn mint_suffix() -> String {

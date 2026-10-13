@@ -1,13 +1,22 @@
 //! Extract: source transcript → IR (`CanonicalSession`).
 //!
-//! One extractor per source tool. Sources are strictly read-only.
-use crate::canonical::{Block, CanonicalSession, Role};
+//! One extractor per source tool. Sources are strictly read-only. Everything a
+//! source holds is captured: tool calls and results with their correlation ids,
+//! reasoning (with its signature when present), injected context, images,
+//! patches, compaction summaries, and token/cost accounting. Anything that
+//! cannot be captured becomes a named gap rather than disappearing.
+use crate::canonical::{Block, Block::*, CanonicalSession, Event, Events, Role};
 use crate::model::Tool;
 use anyhow::Result;
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Largest binary payload carried inline. Sources embed base64 images; past
+/// this size a sync would bloat every target store, so the image is recorded
+/// as a gap and the manifest says why.
+const MAX_INLINE_BYTES: u64 = 5 * 1024 * 1024;
 
 pub fn extract(
     tool: Tool,
@@ -16,7 +25,7 @@ pub fn extract(
     created: chrono::DateTime<chrono::Utc>,
     path: &Path,
 ) -> Result<CanonicalSession> {
-    let blocks = match tool {
+    let events = match tool {
         Tool::Claude => claude(path)?,
         Tool::Codex => codex(path)?,
         Tool::Pi | Tool::Omp => pi_family(path)?,
@@ -27,14 +36,14 @@ pub fn extract(
         tool,
         cwd: cwd.to_path_buf(),
         created,
-        blocks,
+        events,
     })
 }
 
 /// opencode transcripts via read-only SQL (message + part `data` JSON).
 /// The runtime shapes are identical to `opencode export` output, but SQL is
 /// deterministic: the CLI truncates large stdout to 64KB multiples with exit 0.
-fn opencode(id: &str) -> Result<Vec<Block>> {
+fn opencode(id: &str) -> Result<Vec<Event>> {
     let Some(db) = crate::scan::opencode_db() else {
         anyhow::bail!("opencode database not found")
     };
@@ -52,8 +61,10 @@ fn opencode(id: &str) -> Result<Vec<Block>> {
                 String::from_utf8_lossy(&q.stderr).trim()
             );
         }
-        let text = String::from_utf8_lossy(&q.stdout);
-        Ok(crate::proc::json_rows(&text, "opencode transcript").unwrap_or_default())
+        Ok(
+            crate::proc::json_rows(&String::from_utf8_lossy(&q.stdout), "opencode transcript")
+                .unwrap_or_default(),
+        )
     };
     let msgs = run(&format!(
         "SELECT id, data FROM message WHERE session_id = '{esc}' ORDER BY time_created, id;"
@@ -73,7 +84,7 @@ fn opencode(id: &str) -> Result<Vec<Block>> {
             by_msg.entry(mid.to_string()).or_default().push(data);
         }
     }
-    let mut blocks = Vec::new();
+    let mut out = Events::default();
     for m in msgs {
         let Some(minfo) = m
             .get("data")
@@ -88,19 +99,23 @@ fn opencode(id: &str) -> Result<Vec<Block>> {
             _ => Role::Assistant,
         };
         let mid = m.get("id").and_then(|i| i.as_str()).unwrap_or("");
+        out.boundary();
         if let Some(items) = by_msg.get(mid) {
             for part in items {
                 match part.get("type").and_then(|t| t.as_str()) {
                     Some("text") => {
                         if let Some(t) = classify_text(part.get("text")) {
-                            blocks.push(Block::Text { role, text: t });
+                            out.push(Text { role, text: t });
                         }
                     }
                     Some("reasoning") => {
                         if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            blocks.push(Block::Thinking {
-                                text: t.to_string(),
-                            });
+                            if !t.trim().is_empty() {
+                                out.push(Thinking {
+                                    text: t.to_string(),
+                                    signature: None,
+                                });
+                            }
                         }
                     }
                     Some("tool") => {
@@ -109,52 +124,114 @@ fn opencode(id: &str) -> Result<Vec<Block>> {
                             .and_then(|t| t.as_str())
                             .unwrap_or("tool")
                             .to_string();
-                        let input = part
-                            .pointer("/state/input")
+                        let call_id = part
+                            .get("callID")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string);
+                        let state = part.get("state").cloned().unwrap_or(Value::Null);
+                        let status = state
+                            .get("status")
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string);
+                        let input = state
+                            .get("input")
                             .map(|i| i.to_string())
                             .unwrap_or_default();
-                        blocks.push(Block::ToolCall {
+                        out.push(ToolCall {
                             name: name.clone(),
                             args: input,
+                            call_id: call_id.clone(),
+                            status: status.clone(),
                         });
-                        match part.pointer("/state/output") {
-                            Some(o) => {
-                                let output = o.to_string();
-                                if output.is_empty() {
-                                    blocks.push(tool_output_gap(&name));
-                                } else {
-                                    blocks.push(Block::ToolResult { name, output });
-                                }
-                            }
-                            // 181/11148 live tool parts carry no output key: the
-                            // call ran but its result never landed in the DB.
-                            None => blocks.push(tool_output_gap(&name)),
+                        let output = state
+                            .get("output")
+                            .and_then(|o| o.as_str())
+                            .map(str::to_string);
+                        let error = state
+                            .get("error")
+                            .and_then(|e| e.as_str())
+                            .map(str::to_string);
+                        let duration = state
+                            .pointer("/time/end")
+                            .and_then(|e| e.as_i64())
+                            .zip(state.pointer("/time/start").and_then(|s| s.as_i64()))
+                            .map(|(end, start)| (end - start).max(0) as u64);
+                        match (output, error) {
+                            (Some(o), _) if !o.is_empty() => out.push(ToolResult {
+                                name: name.clone(),
+                                output: o,
+                                call_id: call_id.clone(),
+                                is_error: status.as_deref() == Some("error"),
+                                duration_ms: duration,
+                            }),
+                            (_, Some(e)) if !e.is_empty() => out.push(ToolResult {
+                                name: name.clone(),
+                                output: e,
+                                call_id: call_id.clone(),
+                                is_error: true,
+                                duration_ms: duration,
+                            }),
+                            _ => out.push(tool_output_gap(&name)),
                         }
                     }
-                    Some("compaction") => blocks.push(Block::Gap {
-                        kind: "compaction".into(),
-                        detail: "session was compacted; earlier history summarized away".into(),
-                    }),
-                    Some("patch") => {
-                        let files = part
+                    Some("patch") => out.push(Patch {
+                        hash: part
+                            .get("hash")
+                            .and_then(|h| h.as_str())
+                            .map(str::to_string),
+                        files: part
                             .get("files")
                             .and_then(|f| f.as_array())
-                            .map(|a| a.len())
-                            .unwrap_or(0);
-                        blocks.push(Block::Gap {
-                            kind: "patch".into(),
-                            detail: format!(
-                                "code patch ({} file{}) not carried over",
-                                files,
-                                if files == 1 { "" } else { "s" }
-                            ),
+                            .map(|a| {
+                                a.iter()
+                                    .filter_map(|f| f.as_str())
+                                    .map(PathBuf::from)
+                                    .collect()
+                            })
+                            .unwrap_or_default(),
+                    }),
+                    Some("compaction") => out.push(Compressed {
+                        text: "session was compacted; earlier history summarized away".into(),
+                    }),
+                    Some("file") => {
+                        let path = part
+                            .get("path")
+                            .or_else(|| part.pointer("/file/path"))
+                            .and_then(|p| p.as_str())
+                            .map(PathBuf::from);
+                        let text = part
+                            .get("text")
+                            .and_then(|t| t.as_str())
+                            .map(str::to_string);
+                        out.push(Context {
+                            kind: "file".into(),
+                            text,
+                            path,
                         });
                     }
-                    // step-start/step-finish are run bookkeeping, file parts
-                    // duplicate text, subtask/agent parts are orchestration:
-                    // none carry user-visible transcript content.
-                    Some("step-start" | "step-finish" | "file" | "subtask" | "agent") => {}
-                    Some(other) => blocks.push(Block::Gap {
+                    Some("subtask") => out.push(Context {
+                        kind: "subtask".into(),
+                        text: part
+                            .get("description")
+                            .and_then(|d| d.as_str())
+                            .map(|d| format!("subtask: {d}")),
+                        path: None,
+                    }),
+                    Some("step-finish") => {
+                        let t = part.get("tokens").cloned().unwrap_or(Value::Null);
+                        out.push(Usage {
+                            input: num(&t, "/input"),
+                            output: num(&t, "/output"),
+                            reasoning: num(&t, "/reasoning"),
+                            cache_read: num(&t, "/cache/read"),
+                            cache_write: num(&t, "/cache/write"),
+                            cost: part.get("cost").and_then(|c| c.as_f64()).unwrap_or(0.0),
+                            model: None,
+                        });
+                    }
+                    // step-start/agent parts are run bookkeeping, not content.
+                    Some("step-start" | "agent") => {}
+                    Some(other) => out.push(Gap {
                         kind: "opencode-part".into(),
                         detail: format!("opencode {other} part not carried over"),
                     }),
@@ -163,24 +240,45 @@ fn opencode(id: &str) -> Result<Vec<Block>> {
             }
         }
     }
-    Ok(blocks)
+    Ok(out.into_vec())
+}
+
+fn num(v: &Value, pointer: &str) -> u64 {
+    v.pointer(pointer).and_then(|n| n.as_u64()).unwrap_or(0)
 }
 
 fn lines(path: &Path) -> Result<impl Iterator<Item = std::io::Result<String>>> {
     Ok(BufReader::new(fs::File::open(path)?).lines())
 }
 
-fn claude(path: &Path) -> Result<Vec<Block>> {
-    let mut out = Vec::new();
+/// Parse one JSONL record. A truncated or corrupt line (partial write from a
+/// crashed agent) becomes a visible gap instead of failing the whole session.
+fn parse_record(line_no: usize, line: &str, out: &mut Events) -> Option<Value> {
+    match serde_json::from_str::<Value>(line) {
+        Ok(v) => Some(v),
+        Err(_) => {
+            out.push(Gap {
+                kind: "unreadable-record".into(),
+                detail: format!("record at line {} could not be read", line_no + 1),
+            });
+            None
+        }
+    }
+}
+
+fn claude(path: &Path) -> Result<Vec<Event>> {
+    let mut out = Events::default();
     for (line_no, line) in lines(path)?.enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let Some(v) = crate::jsonl::parse_record(line_no, &line, &mut out) else {
+        let Some(v) = parse_record(line_no, &line, &mut out) else {
             continue;
         };
         let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // Sidechain (subagent) rows and meta rows are not part of the
+        // resumable transcript; they stay in the source.
         if v.get("isMeta").and_then(|b| b.as_bool()).unwrap_or(false)
             || v.get("isSidechain")
                 .and_then(|b| b.as_bool())
@@ -195,53 +293,68 @@ fn claude(path: &Path) -> Result<Vec<Block>> {
                     "system" => Role::System,
                     _ => Role::Assistant,
                 };
-                let Some(content) = v.pointer("/message/content") else {
-                    continue;
-                };
-                collect_parts(content, role, Tool::Claude, &mut out);
+                out.boundary();
+                if let Some(content) = v.pointer("/message/content") {
+                    collect_parts(content, role, Tool::Claude, &mut out);
+                }
+                if let Some(u) = v.pointer("/message/usage") {
+                    out.push(usage_from_claude(u));
+                }
             }
-            // Attachments are out-of-band context, not transcript turns: only
-            // content-bearing ones (user files, compaction pointers) retire as
-            // gaps. Reminders/snapshots/listings stay silent.
             "attachment" => {
-                if let Some(gap) = claude_attachment_gap(v.get("attachment")) {
-                    out.push(gap);
+                if let Some(block) = claude_attachment(v.get("attachment")) {
+                    out.push(block);
                 }
             }
             _ => {}
         }
     }
-    Ok(out)
+    Ok(out.into_vec())
 }
 
-/// Content-bearing claude attachment → gap; environment noise → silent.
-fn claude_attachment_gap(a: Option<&Value>) -> Option<Block> {
+fn usage_from_claude(u: &Value) -> Block {
+    Usage {
+        input: num(u, "/input_tokens"),
+        output: num(u, "/output_tokens"),
+        reasoning: num(u, "/output_tokens_details/thinking_tokens"),
+        cache_read: num(u, "/cache_read_input_tokens"),
+        cache_write: num(u, "/cache_creation_input_tokens"),
+        cost: 0.0,
+        model: None,
+    }
+}
+
+/// Content-bearing claude attachment → context block; environment noise is
+/// skipped (it is regenerated by every agent on resume).
+fn claude_attachment(a: Option<&Value>) -> Option<Block> {
     let a = a?;
+    let file_name = |v: Option<&Value>| -> String {
+        v.and_then(|f| f.as_str())
+            .and_then(|f| f.rsplit('/').next())
+            .unwrap_or("file")
+            .to_string()
+    };
     match a.get("type").and_then(|t| t.as_str()) {
-        Some("file") => {
-            let name = a
+        Some("file") => Some(Context {
+            kind: "attachment".into(),
+            text: Some(format!(
+                "attached file {} not carried",
+                file_name(a.get("filename"))
+            )),
+            path: a
                 .get("filename")
                 .and_then(|f| f.as_str())
-                .and_then(|f| f.rsplit('/').next())
-                .unwrap_or("file");
-            Some(Block::Gap {
-                kind: "attachment".into(),
-                detail: format!("attached file {name} not carried over"),
-            })
-        }
-        // Pre-compaction file pointer: the content it names is already gone
-        // from the source; the resumed session only needs the reference.
-        Some("compact_file_reference") => {
-            let name = a
-                .get("displayPath")
-                .and_then(|d| d.as_str())
-                .unwrap_or("file");
-            Some(Block::Gap {
-                kind: "attachment".into(),
-                detail: format!("pre-compaction reference to {name}; re-read if needed"),
-            })
-        }
-        Some("thinking_stripped") => Some(Block::Gap {
+                .map(PathBuf::from),
+        }),
+        Some("compact_file_reference") => Some(Context {
+            kind: "pre-compaction-reference".into(),
+            text: Some("read before the last compaction; re-read if needed".into()),
+            path: a
+                .get("filename")
+                .and_then(|f| f.as_str())
+                .map(PathBuf::from),
+        }),
+        Some("thinking_stripped") => Some(Gap {
             kind: "thinking".into(),
             detail: "reasoning stripped before import; not carried over".into(),
         }),
@@ -251,168 +364,309 @@ fn claude_attachment_gap(a: Option<&Value>) -> Option<Block> {
                 .and_then(|p| p.as_str())
                 .and_then(|p| p.split("<status>").nth(1)?.split("</status>").next())
                 .unwrap_or("event");
-            Some(Block::Gap {
+            Some(Context {
                 kind: "background-task".into(),
-                detail: format!("background task {status}; output not carried over"),
+                text: Some(format!("background task {status}; output not carried over")),
+                path: None,
             })
         }
         _ => None,
     }
 }
 
-fn codex(path: &Path) -> Result<Vec<Block>> {
-    let mut out = Vec::new();
+fn codex(path: &Path) -> Result<Vec<Event>> {
+    let mut out = Events::default();
     for (line_no, line) in lines(path)?.enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let Some(v) = crate::jsonl::parse_record(line_no, &line, &mut out) else {
+        let Some(v) = parse_record(line_no, &line, &mut out) else {
             continue;
         };
         match v.get("type").and_then(|t| t.as_str()) {
-            Some("response_item") => match v.pointer("/payload/type").and_then(|t| t.as_str()) {
-                Some("message") => {
-                    let role = match v.pointer("/payload/role").and_then(|r| r.as_str()) {
-                        Some("user") => Role::User,
-                        Some("system") => Role::System,
-                        _ => Role::Assistant,
-                    };
-                    if let Some(c) = v.pointer("/payload/content") {
-                        collect_parts(c, role, Tool::Codex, &mut out);
+            Some("response_item") => {
+                let payload = v.get("payload").cloned().unwrap_or(Value::Null);
+                match payload.get("type").and_then(|t| t.as_str()) {
+                    Some("message") => {
+                        let role = match payload.get("role").and_then(|r| r.as_str()) {
+                            Some("user") => Role::User,
+                            Some("system") => Role::System,
+                            _ => Role::Assistant,
+                        };
+                        out.boundary();
+                        if let Some(c) = payload.get("content") {
+                            collect_parts(c, role, Tool::Codex, &mut out);
+                        }
                     }
+                    Some("reasoning") => {
+                        out.boundary();
+                        let text = payload
+                            .get("content")
+                            .and_then(|c| c.as_str())
+                            .filter(|t| !t.trim().is_empty())
+                            .map(str::to_string)
+                            .or_else(|| {
+                                payload
+                                    .pointer("/summary/0/text")
+                                    .and_then(|t| t.as_str())
+                                    .filter(|t| !t.trim().is_empty())
+                                    .map(str::to_string)
+                            });
+                        match text {
+                            Some(t) => out.push(Thinking {
+                                text: t,
+                                signature: None,
+                            }),
+                            None => out.push(Gap {
+                                kind: "thinking".into(),
+                                detail: "reasoning was not stored in plain text".into(),
+                            }),
+                        }
+                    }
+                    Some("function_call") => {
+                        out.boundary();
+                        out.push(ToolCall {
+                            name: payload
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("tool")
+                                .to_string(),
+                            args: payload
+                                .get("arguments")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            call_id: payload
+                                .get("call_id")
+                                .or_else(|| payload.get("id"))
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string),
+                            status: payload
+                                .get("status")
+                                .and_then(|s| s.as_str())
+                                .map(str::to_string),
+                        });
+                    }
+                    Some("function_call_output") => {
+                        out.push(ToolResult {
+                            name: "function".into(),
+                            output: payload
+                                .get("output")
+                                .map(|o| o.to_string())
+                                .unwrap_or_default(),
+                            call_id: payload
+                                .get("call_id")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string),
+                            is_error: false,
+                            duration_ms: None,
+                        });
+                    }
+                    Some("custom_tool_call") => {
+                        out.boundary();
+                        out.push(ToolCall {
+                            name: payload
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("exec")
+                                .to_string(),
+                            args: payload
+                                .get("input")
+                                .and_then(|i| i.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            call_id: payload
+                                .get("call_id")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string),
+                            status: payload
+                                .get("status")
+                                .and_then(|s| s.as_str())
+                                .map(str::to_string),
+                        });
+                    }
+                    Some("custom_tool_call_output") => {
+                        out.push(ToolResult {
+                            name: "exec".into(),
+                            output: payload.get("output").and_then(text_of).unwrap_or_default(),
+                            call_id: payload
+                                .get("call_id")
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string),
+                            is_error: false,
+                            duration_ms: None,
+                        });
+                    }
+                    Some(other) => out.push(Gap {
+                        kind: "codex-item".into(),
+                        detail: format!("codex {other} item not carried over"),
+                    }),
+                    None => {}
                 }
-                Some("reasoning") => {
-                    match v.pointer("/payload/content").and_then(|c| c.as_str()) {
-                        Some(t) if !t.trim().is_empty() => {
-                            out.push(Block::Thinking {
-                                text: t.to_string(),
+            }
+            // Lifecycle events carry accounting and free text; item content
+            // mirrors the response_items above.
+            Some("event_msg") => {
+                let payload = v.get("payload").cloned().unwrap_or(Value::Null);
+                match payload.get("type").and_then(|t| t.as_str()) {
+                    Some("token_count") => {
+                        if let Some(u) = payload.pointer("/info/last_token_usage") {
+                            out.push(Usage {
+                                input: num(u, "/input_tokens"),
+                                output: num(u, "/output_tokens"),
+                                reasoning: num(u, "/reasoning_output_tokens"),
+                                cache_read: num(u, "/cached_input_tokens"),
+                                cache_write: num(u, "/cache_write_input_tokens"),
+                                cost: 0.0,
+                                model: None,
                             });
                         }
-                        // codex writes reasoning placeholders with null content
-                        // (89/89 live); the shape carries no transcript value.
-                        _ => {}
                     }
-                }
-                Some("function_call") => {
-                    out.push(Block::ToolCall {
-                        name: v
-                            .pointer("/payload/name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("tool")
-                            .to_string(),
-                        args: v
-                            .pointer("/payload/arguments")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    });
-                }
-                Some("function_call_output") => {
-                    let o = v
-                        .pointer("/payload/output")
-                        .map(|o| o.to_string())
-                        .unwrap_or_default();
-                    push_tool_result(&mut out, "function".into(), o);
-                }
-                Some("custom_tool_call") => {
-                    let payload = v.pointer("/payload").unwrap_or(&Value::Null);
-                    out.push(Block::ToolCall {
-                        name: payload
-                            .get("name")
-                            .and_then(|n| n.as_str())
-                            .unwrap_or("exec")
-                            .to_string(),
-                        args: payload
-                            .get("input")
-                            .and_then(|i| i.as_str())
-                            .unwrap_or("")
-                            .to_string(),
-                    });
-                }
-                Some("custom_tool_call_output") => {
-                    let output = v
-                        .pointer("/payload/output")
-                        .and_then(text_of)
-                        .unwrap_or_default();
-                    push_tool_result(&mut out, "exec".into(), output);
-                }
-                Some(other) => out.push(Block::Gap {
-                    kind: "codex-part".into(),
-                    detail: format!("codex {other} part not carried over"),
-                }),
-                None => {}
-            },
-            // event_msg item/task lifecycle mirrors response_items; only
-            // free-text payloads (turn_aborted, notices) carry transcript.
-            Some("event_msg") => {
-                if let Some(t) = v.pointer("/payload/text").and_then(|t| t.as_str()) {
-                    if !t.trim().is_empty() {
-                        out.push(Block::Text {
-                            role: Role::System,
-                            text: t.to_string(),
-                        });
+                    _ => {
+                        if let Some(t) = payload.get("text").and_then(|t| t.as_str()) {
+                            if !t.trim().is_empty() {
+                                out.push(Text {
+                                    role: Role::System,
+                                    text: t.to_string(),
+                                });
+                            }
+                        }
                     }
                 }
             }
             _ => {}
         }
     }
-    Ok(out)
+    Ok(out.into_vec())
 }
 
-fn pi_family(path: &Path) -> Result<Vec<Block>> {
-    let mut out = Vec::new();
+fn pi_family(path: &Path) -> Result<Vec<Event>> {
+    let mut out = Events::default();
     for (line_no, line) in lines(path)?.enumerate() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        let Some(v) = crate::jsonl::parse_record(line_no, &line, &mut out) else {
+        let Some(v) = parse_record(line_no, &line, &mut out) else {
             continue;
         };
-        if v.get("type").and_then(|t| t.as_str()) != Some("message") {
-            continue;
-        }
-        let msg_role = v.pointer("/message/role").and_then(|r| r.as_str());
-        let Some(c) = v.pointer("/message/content") else {
-            continue;
-        };
-        match msg_role {
-            Some("toolResult") => {
-                // pi/omp name results via the message, not the parts: every
-                // toolResult message (9521 text + 39 image live) names its
-                // tool in toolName.
-                let name = v
-                    .pointer("/message/toolName")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("tool")
-                    .to_string();
-                let output = text_of(c).unwrap_or_default();
-                if image_part_present(c) {
-                    out.push(Block::Gap {
-                        kind: "image".into(),
-                        detail: format!("{name} returned an image; not carried over"),
-                    });
-                }
-                push_tool_result(&mut out, name, output);
-            }
-            _ => {
-                let role = match msg_role {
-                    Some("user") => Role::User,
-                    Some("system") | Some("developer") => Role::System,
-                    _ => Role::Assistant,
+        match v.get("type").and_then(|t| t.as_str()) {
+            Some("message") => {
+                let msg = v.get("message").cloned().unwrap_or(Value::Null);
+                let msg_role = msg.get("role").and_then(|r| r.as_str());
+                let Some(content) = msg.get("content") else {
+                    continue;
                 };
-                // pi and omp share the v3 schema; omp is the target-local
-                // variant, so unknown parts name the family generically.
-                collect_parts(c, role, Tool::Pi, &mut out);
+                out.boundary();
+                match msg_role {
+                    Some("toolResult") => {
+                        let name = msg
+                            .get("toolName")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("tool")
+                            .to_string();
+                        let call_id = msg
+                            .get("toolCallId")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string);
+                        let is_error = msg
+                            .get("isError")
+                            .and_then(|e| e.as_bool())
+                            .unwrap_or(false);
+                        let duration = msg.get("durationMs").and_then(|d| d.as_u64());
+                        for it in content.as_array().cloned().unwrap_or_default() {
+                            if let Some("image") = it.get("type").and_then(|t| t.as_str()) {
+                                out.push(image_block(&it));
+                            }
+                        }
+                        let output = text_of(content).unwrap_or_default();
+                        if !output.trim().is_empty() {
+                            out.push(ToolResult {
+                                name,
+                                output,
+                                call_id,
+                                is_error,
+                                duration_ms: duration,
+                            });
+                        } else if !content_has_image(content) {
+                            out.push(tool_output_gap(&name));
+                        }
+                    }
+                    _ => {
+                        let role = match msg_role {
+                            Some("user") => Role::User,
+                            Some("system") | Some("developer") => Role::System,
+                            _ => Role::Assistant,
+                        };
+                        collect_parts(content, role, Tool::Pi, &mut out);
+                        if let Some(u) = msg.get("usage") {
+                            out.push(Usage {
+                                input: num(u, "/input"),
+                                output: num(u, "/output"),
+                                reasoning: num(u, "/reasoning"),
+                                cache_read: num(u, "/cacheRead"),
+                                cache_write: num(u, "/cacheWrite"),
+                                cost: u
+                                    .pointer("/cost/total")
+                                    .and_then(|c| c.as_f64())
+                                    .unwrap_or(0.0),
+                                model: msg
+                                    .get("model")
+                                    .and_then(|m| m.as_str())
+                                    .map(str::to_string),
+                            });
+                        }
+                    }
+                }
             }
+            Some("compaction") => {
+                let summary = v
+                    .get("summary")
+                    .or_else(|| v.get("shortSummary"))
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("session compacted");
+                out.boundary();
+                out.push(Compressed {
+                    text: summary.to_string(),
+                });
+            }
+            Some("context_edit") => out.push(Context {
+                kind: "context-edit".into(),
+                text: Some(format!(
+                    "context {} for {}",
+                    if v.get("replacement").map(|r| !r.is_null()).unwrap_or(false) {
+                        "replaced"
+                    } else {
+                        "omitted"
+                    },
+                    v.get("targetId").and_then(|t| t.as_str()).unwrap_or("?")
+                )),
+                path: None,
+            }),
+            Some("ttsr_injection") | Some("custom_message") => {
+                let text = v
+                    .get("content")
+                    .or_else(|| v.get("text"))
+                    .and_then(|t| t.as_str())
+                    .map(str::to_string);
+                out.push(Context {
+                    kind: v
+                        .get("customType")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("injection")
+                        .to_string(),
+                    text,
+                    path: None,
+                });
+            }
+            _ => {}
         }
     }
-    Ok(out)
+    Ok(out.into_vec())
 }
 
-fn image_part_present(content: &Value) -> bool {
+fn content_has_image(content: &Value) -> bool {
     content.as_array().is_some_and(|items| {
         items.iter().any(|it| {
             matches!(
@@ -423,174 +677,68 @@ fn image_part_present(content: &Value) -> bool {
     })
 }
 
-/// True when a result content carries real text (not marker placeholders).
-fn content_has_text(content: &Value) -> bool {
-    match content {
-        Value::String(s) => !s.trim().is_empty(),
-        Value::Array(items) => {
-            items
-                .iter()
-                .any(|it| match it.get("type").and_then(|t| t.as_str()) {
-                    Some("text" | "input_text" | "output_text") => it
-                        .get("text")
-                        .and_then(|t| t.as_str())
-                        .is_some_and(|t| !t.trim().is_empty()),
-                    None => it.as_str().is_some_and(|s| !s.trim().is_empty()),
-                    _ => false,
-                })
-        }
-        _ => false,
-    }
-}
-
-/// Split a format-native content field into IR blocks.
-///
-/// `tool` is the source agent; unknown part types retire as gaps naming it so
-/// a resumed session shows what its new home could not carry over.
-fn collect_parts(content: &Value, role: Role, tool: crate::model::Tool, out: &mut Vec<Block>) {
-    match content {
-        Value::String(s) => {
-            if !s.trim().is_empty() {
-                out.push(Block::Text {
-                    role,
-                    text: s.clone(),
-                });
-            }
-        }
-        Value::Array(items) => {
-            for it in items {
-                match it.get("type").and_then(|t| t.as_str()) {
-                    Some("text") | Some("input_text") | Some("output_text") => {
-                        if let Some(t) = classify_text(it.get("text")) {
-                            out.push(Block::Text { role, text: t });
-                        }
+/// Image part → `Image` block when it fits the inline cap, otherwise a gap.
+fn image_block(part: &Value) -> Block {
+    let mime = part
+        .get("mimeType")
+        .or_else(|| part.get("mime_type"))
+        .and_then(|m| m.as_str())
+        .map(str::to_string);
+    // pi/omp: {type:image, data, mimeType}; codex: {type:input_image, image_url:"data:…;base64,…"}
+    let data = part
+        .get("data")
+        .and_then(|d| d.as_str())
+        .map(str::to_string);
+    let (data, mime) = match (data, part.get("image_url").and_then(|u| u.as_str())) {
+        (Some(d), _) => (Some(d), mime),
+        (None, Some(url)) => {
+            let mut mime = mime;
+            match url.split_once("base64,") {
+                Some((head, b64)) => {
+                    if mime.is_none() {
+                        mime = head
+                            .trim_start_matches("data:")
+                            .split(';')
+                            .next()
+                            .filter(|m| !m.is_empty())
+                            .map(str::to_string);
                     }
-                    Some("thinking") => {
-                        match it.get("thinking").and_then(|t| t.as_str()) {
-                            Some(t) if !t.trim().is_empty() => {
-                                out.push(Block::Thinking {
-                                    text: t.to_string(),
-                                });
-                            }
-                            // claude redacts thinking to `{thinking: "", signature}`
-                            // (1471/1476 live blocks); pi keeps empty signed
-                            // placeholders. Both mean reasoning existed but its
-                            // content is gone.
-                            _ if it.get("signature").is_some()
-                                || it.get("thinkingSignature").is_some() =>
-                            {
-                                out.push(Block::Gap {
-                                    kind: "thinking".into(),
-                                    detail: "redacted reasoning not carried over".into(),
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some("tool_use") => {
-                        out.push(Block::ToolCall {
-                            name: it
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("tool")
-                                .to_string(),
-                            args: it.get("input").map(|i| i.to_string()).unwrap_or_default(),
-                        });
-                    }
-                    // pi/omp assistant turns pair `toolCall` items with
-                    // `toolResult`-role messages (named via toolName).
-                    Some("toolCall") => {
-                        out.push(Block::ToolCall {
-                            name: it
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("tool")
-                                .to_string(),
-                            args: it
-                                .get("arguments")
-                                .map(|i| i.to_string())
-                                .unwrap_or_default(),
-                        });
-                    }
-                    Some("tool_result") => {
-                        let content = it.get("content").unwrap_or(&Value::Null);
-                        let has_image = image_part_present(content);
-                        if has_image && !content_has_text(content) {
-                            // Image-only results (29/33 live): one gap names the
-                            // loss; no separate tool-output gap stacks behind it.
-                            out.push(Block::Gap {
-                                kind: "image".into(),
-                                detail: "image-only tool result not carried over".into(),
-                            });
-                        } else {
-                            // Mixed results: keep the text, mark the lost pixels.
-                            if has_image {
-                                out.push(Block::Gap {
-                                    kind: "image".into(),
-                                    detail: "image in tool result not carried over".into(),
-                                });
-                            }
-                            push_tool_result(
-                                out,
-                                "tool".into(),
-                                text_of(content).unwrap_or_default(),
-                            );
-                        }
-                    }
-                    Some("function_call") => {
-                        out.push(Block::ToolCall {
-                            name: it
-                                .get("name")
-                                .and_then(|n| n.as_str())
-                                .unwrap_or("function")
-                                .to_string(),
-                            args: it
-                                .get("arguments")
-                                .and_then(|a| a.as_str())
-                                .unwrap_or("")
-                                .to_string(),
-                        });
-                    }
-                    Some("image" | "input_image") => {
-                        out.push(Block::Gap {
-                            kind: "image".into(),
-                            detail: "image attachment not carried over".into(),
-                        });
-                    }
-                    None => {
-                        if let Some(s) = it.as_str() {
-                            out.push(Block::Text {
-                                role,
-                                text: s.to_string(),
-                            });
-                        }
-                    }
-                    Some(other) => out.push(Block::Gap {
-                        kind: format!("{}-part", tool.as_str()),
-                        detail: format!("{other} part not carried over"),
-                    }),
+                    (Some(b64.to_string()), mime)
                 }
+                None => (None, mime),
             }
         }
-        _ => {}
+        (None, None) => (None, mime),
+    };
+    let bytes = data
+        .as_ref()
+        .map(|d| d.len() as u64 * 3 / 4)
+        .or_else(|| part.get("bytes").and_then(|b| b.as_u64()))
+        .unwrap_or(0);
+    if bytes > MAX_INLINE_BYTES {
+        return Gap {
+            kind: "image".into(),
+            detail: format!(
+                "image ({:.1} MB{}) exceeds the {} MB inline cap",
+                bytes as f64 / 1e6,
+                mime.as_deref().map(|m| format!(" {m}")).unwrap_or_default(),
+                MAX_INLINE_BYTES / 1024 / 1024
+            ),
+        };
+    }
+    Image {
+        mime,
+        data,
+        path: part.get("path").and_then(|p| p.as_str()).map(PathBuf::from),
+        bytes,
     }
 }
 
 /// A tool call whose result never landed in the source store.
 fn tool_output_gap(name: &str) -> Block {
-    Block::Gap {
+    Gap {
         kind: "tool-output".into(),
         detail: format!("{name} ran but its output was not recorded"),
-    }
-}
-
-/// Empty-output tool results are indistinguishable from lost ones at resume
-/// time, so they retire as explicit gaps instead of silent blanks.
-fn push_tool_result(out: &mut Vec<Block>, name: String, output: String) {
-    if output.trim().is_empty() {
-        out.push(tool_output_gap(&name));
-    } else {
-        out.push(Block::ToolResult { name, output });
     }
 }
 
@@ -603,8 +751,163 @@ fn classify_text(v: Option<&Value>) -> Option<String> {
     }
 }
 
+/// Split a format-native content field into IR blocks.
+///
+/// `tool` is the source agent; unknown part types retire as gaps naming it so
+/// a resumed session shows what its new home could not carry over.
+fn collect_parts(content: &Value, role: Role, tool: Tool, out: &mut Events) {
+    match content {
+        Value::String(s) => {
+            if !s.trim().is_empty() {
+                out.push(Text {
+                    role,
+                    text: s.clone(),
+                });
+            }
+        }
+        Value::Array(items) => {
+            for it in items {
+                match it.get("type").and_then(|t| t.as_str()) {
+                    Some("text") | Some("input_text") | Some("output_text") => {
+                        if let Some(t) = classify_text(it.get("text")) {
+                            out.push(Text { role, text: t });
+                        }
+                    }
+                    // claude/pi reasoning. Sources often keep only a signature
+                    // (claude redacts the text); that is a gap, not silence.
+                    Some("thinking") => {
+                        let text = it
+                            .get("thinking")
+                            .or_else(|| it.get("text"))
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("");
+                        let signature = it
+                            .get("signature")
+                            .or_else(|| it.get("thinkingSignature"))
+                            .and_then(|s| s.as_str())
+                            .map(str::to_string);
+                        if !text.trim().is_empty() {
+                            out.push(Thinking {
+                                text: text.to_string(),
+                                signature,
+                            });
+                        } else if signature.is_some() {
+                            out.push(Gap {
+                                kind: "thinking".into(),
+                                detail: "redacted reasoning not carried over".into(),
+                            });
+                        }
+                    }
+                    Some("tool_use") => {
+                        out.push(ToolCall {
+                            name: it
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("tool")
+                                .to_string(),
+                            args: it.get("input").map(|i| i.to_string()).unwrap_or_default(),
+                            call_id: it.get("id").and_then(|i| i.as_str()).map(str::to_string),
+                            status: None,
+                        });
+                    }
+                    // pi/omp assistant turns pair `toolCall` items with
+                    // `toolResult`-role messages (named via toolName).
+                    Some("toolCall") => {
+                        out.push(ToolCall {
+                            name: it
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("tool")
+                                .to_string(),
+                            args: it
+                                .get("arguments")
+                                .map(|i| i.to_string())
+                                .unwrap_or_default(),
+                            call_id: it.get("id").and_then(|i| i.as_str()).map(str::to_string),
+                            status: None,
+                        });
+                    }
+                    // claude tool results: string or [text|image|tool_reference]
+                    Some("tool_result") => {
+                        let content = it.get("content").unwrap_or(&Value::Null);
+                        let call_id = it
+                            .get("tool_use_id")
+                            .and_then(|c| c.as_str())
+                            .map(str::to_string);
+                        let is_error = it
+                            .get("is_error")
+                            .and_then(|e| e.as_bool())
+                            .unwrap_or(false);
+                        if let Some(items) = content.as_array() {
+                            for inner in items {
+                                if matches!(
+                                    inner.get("type").and_then(|t| t.as_str()),
+                                    Some("image" | "input_image")
+                                ) {
+                                    out.push(image_block(inner));
+                                }
+                            }
+                        }
+                        let output = text_of(content).unwrap_or_default();
+                        if output.trim().is_empty() {
+                            if !content_has_image(content) {
+                                out.push(tool_output_gap("tool"));
+                            }
+                        } else {
+                            out.push(ToolResult {
+                                name: "tool".into(),
+                                output,
+                                call_id,
+                                is_error,
+                                duration_ms: None,
+                            });
+                        }
+                    }
+                    Some("function_call") => {
+                        out.push(ToolCall {
+                            name: it
+                                .get("name")
+                                .and_then(|n| n.as_str())
+                                .unwrap_or("function")
+                                .to_string(),
+                            args: it
+                                .get("arguments")
+                                .and_then(|a| a.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                            call_id: it
+                                .get("call_id")
+                                .or_else(|| it.get("id"))
+                                .and_then(|c| c.as_str())
+                                .map(str::to_string),
+                            status: it
+                                .get("status")
+                                .and_then(|s| s.as_str())
+                                .map(str::to_string),
+                        });
+                    }
+                    Some("image" | "input_image") => out.push(image_block(it)),
+                    None => {
+                        if let Some(s) = it.as_str() {
+                            out.push(Text {
+                                role,
+                                text: s.to_string(),
+                            });
+                        }
+                    }
+                    Some(other) => out.push(Gap {
+                        kind: format!("{}-part", tool.as_str()),
+                        detail: format!("{other} part not carried over"),
+                    }),
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Format-native content (string or typed-parts array) → plain text, for
-/// first-message scanning. The IR's typed path is `collect_parts`.
+/// first-message scanning and tool-output capture.
 pub fn text_of(v: &Value) -> Option<String> {
     match v {
         Value::String(s) => Some(s.clone()),
@@ -618,6 +921,11 @@ pub fn text_of(v: &Value) -> Option<String> {
                                 out.push('\n');
                             }
                             out.push_str(t);
+                        } else if let Some(s) = it.as_str() {
+                            if !out.is_empty() {
+                                out.push('\n');
+                            }
+                            out.push_str(s);
                         }
                     }
                     Some("tool_use" | "toolCall" | "function_call") => {
@@ -626,6 +934,13 @@ pub fn text_of(v: &Value) -> Option<String> {
                     }
                     Some("image" | "input_image") => {
                         out.push_str("\n[image attachment]");
+                    }
+                    Some("tool_reference") => {
+                        let name = it
+                            .get("tool_name")
+                            .and_then(|n| n.as_str())
+                            .unwrap_or("tool");
+                        out.push_str(&format!("\n[tool reference: {name}]"));
                     }
                     _ => {}
                 }
@@ -643,102 +958,117 @@ pub fn text_of(v: &Value) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::canonical::Event;
     use serde_json::json;
+    use std::path::Path;
 
-    #[test]
-    fn redacted_thinking_retires_as_gap() {
-        let mut out = Vec::new();
-        collect_parts(
-            &json!([{"type": "thinking", "thinking": "", "signature": "abc"}]),
-            Role::Assistant,
-            Tool::Claude,
-            &mut out,
-        );
-        assert_eq!(out.len(), 1);
-        assert!(matches!(out[0], Block::Gap { .. }));
+    fn parts(items: Value) -> Vec<Event> {
+        let mut out = Events::default();
+        collect_parts(&items, Role::Assistant, Tool::Claude, &mut out);
+        out.into_vec()
     }
 
     #[test]
-    fn pi_toolcall_extracts_with_name_and_args() {
-        let mut out = Vec::new();
-        collect_parts(
-            &json!([{"type": "toolCall", "name": "bash", "arguments": {"command": "ls"}}]),
-            Role::Assistant,
-            Tool::Pi,
-            &mut out,
-        );
-        assert_eq!(out.len(), 1);
-        match &out[0] {
-            Block::ToolCall { name, args } => {
-                assert_eq!(name, "bash");
-                assert!(args.contains("ls"));
+    fn thinking_keeps_text_and_signature() {
+        let events = parts(json!([{"type": "thinking", "thinking": "why", "signature": "sig"}]));
+        match &events[0].block {
+            Block::Thinking { text, signature } => {
+                assert_eq!(text, "why");
+                assert_eq!(signature.as_deref(), Some("sig"));
             }
-            other => panic!("want ToolCall, got {other:?}"),
+            other => panic!("want Thinking, got {other:?}"),
         }
     }
 
     #[test]
-    fn image_only_tool_result_yields_single_image_gap() {
-        let mut out = Vec::new();
-        collect_parts(
-            &json!([{
-                "type": "tool_result",
-                "content": [{"type": "image", "source": {"data": "qq=="}}],
-            }]),
-            Role::User,
-            Tool::Claude,
-            &mut out,
-        );
-        assert_eq!(out.len(), 1);
-        match &out[0] {
-            Block::Gap { kind, .. } => assert_eq!(kind, "image"),
-            other => panic!("want image Gap, got {other:?}"),
+    fn redacted_thinking_retires_as_gap() {
+        let events = parts(json!([{"type": "thinking", "thinking": "", "signature": "abc"}]));
+        assert!(matches!(&events[0].block, Block::Gap { .. }));
+    }
+
+    #[test]
+    fn tool_pairs_keep_call_ids() {
+        let events = parts(json!([
+            {"type": "tool_use", "id": "tu1", "name": "bash", "input": {"command": "ls"}},
+            {"type": "tool_result", "tool_use_id": "tu1", "content": "a.txt", "is_error": false},
+        ]));
+        match (&events[0].block, &events[1].block) {
+            (
+                Block::ToolCall { call_id: c, .. },
+                Block::ToolResult {
+                    call_id: r, output, ..
+                },
+            ) => {
+                assert_eq!(c.as_deref(), Some("tu1"));
+                assert_eq!(r.as_deref(), Some("tu1"));
+                assert_eq!(output, "a.txt");
+            }
+            other => panic!("want call/result pair, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oversized_images_become_gaps_with_reason() {
+        let big = "A".repeat(8 * 1024 * 1024);
+        let events = parts(json!([{"type": "image", "mimeType": "image/png", "data": big}]));
+        match &events[0].block {
+            Block::Gap { kind, detail } => {
+                assert_eq!(kind, "image");
+                assert!(detail.contains("inline cap"), "detail: {detail}");
+            }
+            other => panic!("want image gap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn small_images_carry_base64() {
+        let events = parts(json!([{"type": "image", "mimeType": "image/png", "data": "qq=="}]));
+        match &events[0].block {
+            Block::Image {
+                mime, data, bytes, ..
+            } => {
+                assert_eq!(mime.as_deref(), Some("image/png"));
+                assert_eq!(data.as_deref(), Some("qq=="));
+                assert_eq!(*bytes, 3u64);
+            }
+            other => panic!("want Image, got {other:?}"),
         }
     }
 
     #[test]
     fn empty_tool_output_retires_as_gap() {
-        let mut out = Vec::new();
-        push_tool_result(&mut out, "bash".into(), "  ".into());
-        assert_eq!(out.len(), 1);
-        match &out[0] {
-            Block::Gap { kind, detail } => {
-                assert_eq!(kind, "tool-output");
-                assert!(detail.contains("bash"));
-            }
-            other => panic!("want tool-output Gap, got {other:?}"),
-        }
+        let events = parts(json!([{"type": "tool_result", "content": "  "}]));
+        assert!(matches!(&events[0].block, Block::Gap { .. }));
     }
 
     #[test]
     fn unknown_part_types_retire_as_named_gaps() {
-        let mut out = Vec::new();
+        let mut out = Events::default();
         collect_parts(
-            &json!([{"type": "mystery_widget", "x": 1}]),
+            &json!([{"type": "mystery_widget"}]),
             Role::Assistant,
             Tool::Codex,
             &mut out,
         );
-        assert_eq!(out.len(), 1);
-        match &out[0] {
-            Block::Gap { kind, detail } => {
-                assert_eq!(kind, "codex-part");
-                assert!(detail.contains("mystery_widget"));
-            }
-            other => panic!("want codex-part Gap, got {other:?}"),
+        let events = out.into_vec();
+        match &events[0].block {
+            Block::Gap { kind, .. } => assert_eq!(kind, "codex-part"),
+            other => panic!("want gap, got {other:?}"),
         }
     }
 
     #[test]
-    fn file_attachments_retire_as_gaps_while_reminders_stay_silent() {
-        let file = claude_attachment_gap(Some(&json!({
-            "type": "file",
-            "filename": "/tmp/notes/plan.md",
-        })));
-        assert!(matches!(file, Some(Block::Gap { .. })));
-        let reminder = claude_attachment_gap(Some(&json!({"type": "total_tokens_reminder"})));
-        assert!(reminder.is_none());
-        let env = claude_attachment_gap(Some(&json!({"type": "environment"})));
-        assert!(env.is_none());
+    fn file_attachments_become_context_while_reminders_stay_silent() {
+        let file = claude_attachment(Some(&json!({"type": "file", "filename": "/tmp/plan.md"})));
+        assert!(matches!(file, Some(Block::Context { .. })));
+        assert!(claude_attachment(Some(&json!({"type": "total_tokens_reminder"}))).is_none());
+        assert!(claude_attachment(Some(&json!({"type": "environment"}))).is_none());
+    }
+
+    #[test]
+    fn text_of_reads_tool_references() {
+        let v = json!([{"type": "tool_reference", "tool_name": "read"}]);
+        assert!(text_of(&v).unwrap().contains("read"));
+        let _ = Path::new("/tmp");
     }
 }

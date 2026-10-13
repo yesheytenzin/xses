@@ -129,11 +129,15 @@ gone), and the newest failures from the issue journal.
 - Shows sessions from all supported agents in one searchable picker.
 - Resumes a session in the agent that owns it.
 - Imports sessions into other agents without modifying the source.
-- Marks untransferable content (images, patches, redacted reasoning, lost tool
-  output) with in-transcript `[gap in imported history: …]` markers, and counts
-  it as `dropped` in the fidelity report.
-- Labels flattened tool traffic as `transcript, not live`, so a resumed agent
-  never mistakes past tool output for state it can continue.
+- Carries the transcript's structure: tool calls and their results (with ids,
+  error state, durations), reasoning text, injected context, images (up to
+  5 MB each), patches, compaction, and token/cost accounting land in each
+  target's own native constructs.
+- Opens every import with a note that the history already ran elsewhere, so a
+  resumed agent reads tool traffic as a transcript, never as pending state.
+- Marks what a target cannot hold (redacted reasoning, oversized images,
+  patches outside opencode, live state) with `[gap in imported history: …]`
+  markers, counted as `dropped` in the fidelity report.
 - Skips empty sessions, and skips xses-made imports unless `--include-imports`.
 - Avoids duplicate imports (idempotent per session content) and reports what
   survived each conversion.
@@ -161,13 +165,14 @@ imported sessions stay identifiable in `claude --resume`, `codex resume`,
 1. **Scan** — each store is read into one session record per transcript; a
    per-file cache means an append costs one re-parse, not a full rescan.
 2. **Extract** — transcripts parse into a typed intermediate representation
-   (text, thinking, tool calls/results, compactions) with per-block fidelity.
+   (text, thinking, tool calls/results with ids, context, images, patches,
+   compaction, usage) with per-block fidelity.
    A corrupt or truncated record becomes a visible gap instead of failing the
    session.
-3. **Write** — each target writer serializes that IR into its native format:
-   Claude JSONL plus a `custom-title.json` sidecar, Codex rollouts plus the
-   `threads` row and history projections, Pi/oh-my-pi v3 JSONL with a
-   `session_info` name, OpenCode through `opencode import`.
+3. **Write** — each target writer serializes that IR into its native format,
+   structure included: Claude content blocks plus a `custom-title.json` sidecar,
+   Codex rollouts plus `threads`/projection rows, Pi/oh-my-pi v3 parts plus a
+   `session_info` name, OpenCode parts through `opencode import`.
 4. **Record** — every (target, source) pair is fingerprinted in
    `index.jsonl`, which makes re-syncs idempotent and lets `clean` undo
    exactly what xses wrote.

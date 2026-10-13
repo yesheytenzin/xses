@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased — structured transfer (mapping 2)
+
+Imports now carry the source's own structure instead of flattening everything
+to text. A source message maps to one native message, and its parts map to the
+target's constructs:
+
+- tool calls and results travel as `tool_use`/`tool_result` (claude),
+  `function_call`/`function_call_output` (codex), `toolCall`/`toolResult`
+  (pi/omp), `tool` parts (opencode) — with correlation ids, error state, and
+  durations, so a resumed agent sees what ran and what it returned.
+- reasoning travels as `thinking` / `reasoning` parts (text only: provider
+  signatures are never replayed).
+- images travel inline (base64/`input_image`/`image` parts) up to 5 MB per part
+  and 20 MB per session; larger ones become named gaps.
+- codex projections carry `commandExecution` rows (with output) and usage
+  arrives as `token_count` events; opencode gets `reasoning`, `tool`, and
+  `patch` parts plus `step-finish` tokens; claude gets per-message `usage`.
+- every import opens with a note that the transcript already ran elsewhere, so
+  tool traffic is read as history, never continued as pending state.
+- import headers carry a manifest (`blocks`, `gaps`, `mapping`), the mapping
+  version is part of the idempotency fingerprint (older copies re-import once),
+  and `FEATURE.md` documents what is carried, text-only, or impossible.
+
+Also fixed along the way: `ls --all -n N` ignored the explicit `-n`
+(`scope::limit`), and the release script's `--help` leaked the `set -euo` line.
+
 ## 0.5.0 — release tooling and transfer docs
 
 - `scripts/release.sh <X.Y.Z>`: bumps the version in `Cargo.toml`, `Cargo.lock`,

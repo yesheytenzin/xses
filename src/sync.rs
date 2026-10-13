@@ -121,15 +121,18 @@ fn acquire_index_lock() -> Result<IndexLock> {
     )
 }
 
-/// Idempotency key: target + source tool + source id + mtime + size.
+/// Idempotency key: target + source tool + source id + mtime + size, plus the
+/// writer mapping version — a mapping change must re-import so older, poorer
+/// copies get upgraded instead of lingering.
 pub fn fingerprint(target: Tool, src: &Session) -> String {
     format!(
-        "{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|m{}",
         target.as_str(),
         src.tool.as_str(),
         src.id,
         src.mtime.timestamp_nanos_opt().unwrap_or(0),
-        src.size
+        src.size,
+        crate::write::MAPPING,
     )
 }
 

@@ -1,5 +1,4 @@
 //! JSONL record helpers shared by the store scanners and the extractors.
-use crate::canonical::Block;
 use anyhow::Result;
 use serde_json::Value;
 use std::io::{BufRead, BufReader};
@@ -27,22 +26,6 @@ pub fn for_each_record(path: &Path, mut f: impl FnMut(&Value) -> bool) -> Result
         }
     }
     Ok(n)
-}
-
-/// Parse one record for an extractor. A truncated or corrupt line (partial
-/// write from a crashed agent) becomes a visible gap instead of failing the
-/// whole session.
-pub fn parse_record(line_no: usize, line: &str, out: &mut Vec<Block>) -> Option<Value> {
-    match serde_json::from_str::<Value>(line) {
-        Ok(v) => Some(v),
-        Err(_) => {
-            out.push(Block::Gap {
-                kind: "unreadable-record".into(),
-                detail: format!("record at line {} could not be read", line_no + 1),
-            });
-            None
-        }
-    }
 }
 
 /// Head of a file, for provenance markers stored in the first record.

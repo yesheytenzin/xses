@@ -139,6 +139,9 @@ gone), and the newest failures from the issue journal.
   survived each conversion.
 - Retries opencode imports once, serialized, and journals what still fails.
 
+What transfers, what is planned, and what can never move is documented per
+data class in [FEATURE.md](FEATURE.md).
+
 Supported agents:
 
 | Agent | Source | Resume command |

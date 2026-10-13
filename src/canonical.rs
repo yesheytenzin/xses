@@ -116,6 +116,8 @@ pub enum Block {
         cost: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         model: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider: Option<String>,
     },
     /// Content the source carried that no transcript can reproduce: a redacted
     /// turn, an unreadable record, a tool output that was never recorded.
@@ -516,6 +518,7 @@ mod tests {
                     cache_write: 0,
                     cost: 0.0,
                     model: None,
+                    provider: None,
                 },
             ),
             ev(

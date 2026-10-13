@@ -121,18 +121,11 @@ pub(super) fn write(
     // verified against a live session — missing usage crashes the renderer).
     let model_id = format!("{sid}-mdl");
     let think_id = format!("{sid}-thk");
-    // Model chain mirrors a native session, but reuses the model the user
-    // actually runs in opencode so the import opens on a real model instead
-    // of a placeholder (`xses/imported` broke model resolution in pi's TUI).
-    let oc_model = super::opencode::current_model();
-    let pi_provider = oc_model
-        .get("providerID")
-        .and_then(|v| v.as_str())
-        .unwrap_or("xses");
-    let pi_model_id = oc_model
-        .get("modelID")
-        .and_then(|v| v.as_str())
-        .unwrap_or("imported");
+    // Model priority: the source transcript's own model first (honest
+    // provenance), then the user's last native pi model, then the model
+    // currently used in opencode, and only finally the `xses/imported`
+    // placeholder so the import still opens on a model pi accepts.
+    let (pi_provider, pi_model_id) = resolve_pi_model(session);
     let model_change = if is_omp {
         json!({
             "type": "model_change",
@@ -222,6 +215,7 @@ pub(super) fn write(
                 cache_write,
                 cost,
                 model,
+                provider,
             } => Some((
                 *input,
                 *output,
@@ -230,6 +224,7 @@ pub(super) fn write(
                 *cache_write,
                 *cost,
                 model.clone(),
+                provider.clone(),
             )),
             _ => None,
         });
@@ -321,11 +316,12 @@ pub(super) fn write(
                 "timestamp": row_ts_ms,
             });
             if matches!(role, Role::Assistant) {
-                let (input, output, reasoning, cache_read, cache_write, cost, model) =
-                    usage.clone().unwrap_or((0, 0, 0, 0, 0, 0.0, None));
-                message["api"] = json!(pi_provider);
-                message["provider"] = json!(pi_provider);
-                message["model"] = json!(model.unwrap_or_else(|| pi_model_id.into()));
+                let (input, output, reasoning, cache_read, cache_write, cost, model, provider) =
+                    usage.clone().unwrap_or((0, 0, 0, 0, 0, 0.0, None, None));
+                let msg_provider = provider.as_deref().unwrap_or(&pi_provider);
+                message["api"] = json!(msg_provider);
+                message["provider"] = json!(msg_provider);
+                message["model"] = json!(model.as_deref().unwrap_or(&pi_model_id));
                 message["stopReason"] = json!("stop");
                 message["thinkingLevel"] = json!("off");
                 message["durationMs"] = json!(0);
@@ -400,6 +396,100 @@ fn role_str(role: Role) -> &'static str {
         Role::Assistant => "assistant",
         Role::System => "system",
     }
+}
+
+/// Model for a pi import, by provenance priority: the source transcript's
+/// own model first, then the user's last native pi model, then the model
+/// currently used in opencode, and only finally a placeholder.
+fn resolve_pi_model(session: &CanonicalSession) -> (String, String) {
+    for block in session.blocks() {
+        if let Block::Usage {
+            model: Some(model),
+            provider,
+            ..
+        } = block
+        {
+            if model.trim().is_empty() || model == "imported" {
+                continue;
+            }
+            let provider = provider
+                .as_deref()
+                .filter(|p| !p.trim().is_empty() && *p != "xses")
+                .map(str::to_string)
+                .or_else(|| last_native_pi_model().map(|(p, _)| p))
+                .unwrap_or_else(|| {
+                    super::opencode::current_model()
+                        .get("providerID")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("xses")
+                        .to_string()
+                });
+            return (provider, model.clone());
+        }
+    }
+    if let Some(native) = last_native_pi_model() {
+        return native;
+    }
+    let oc_model = super::opencode::current_model();
+    (
+        oc_model
+            .get("providerID")
+            .and_then(|v| v.as_str())
+            .unwrap_or("xses")
+            .to_string(),
+        oc_model
+            .get("modelID")
+            .and_then(|v| v.as_str())
+            .unwrap_or("imported")
+            .to_string(),
+    )
+}
+
+/// Newest native pi session's (`provider`, `modelId`) from its `model_change`
+/// record. Skips xses imports so an old placeholder never becomes the
+/// default for the next import.
+fn last_native_pi_model() -> Option<(String, String)> {
+    let root = dirs::home_dir()?.join(".pi/agent/sessions");
+    let mut newest: Option<(std::time::SystemTime, String, String)> = None;
+    for entry in walkdir::WalkDir::new(&root)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let path = entry.path();
+        if !entry.file_type().is_file()
+            || path.extension().and_then(|e| e.to_str()) != Some("jsonl")
+        {
+            continue;
+        }
+        let head = crate::jsonl::head_bytes(path, 4096)?;
+        if head.contains("\"xses\":") || head.contains("\"source\":\"xses\"") {
+            continue;
+        }
+        let mtime = std::fs::metadata(path).and_then(|m| m.modified()).ok()?;
+        if !newest.as_ref().is_some_and(|(t, _, _)| *t >= mtime) {
+            let content = std::fs::read_to_string(path).ok()?;
+            for line in content.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if v.get("type").and_then(|t| t.as_str()) != Some("model_change") {
+                    continue;
+                }
+                let (Some(provider), Some(model)) = (
+                    v.get("provider").and_then(|p| p.as_str()),
+                    v.get("modelId").and_then(|m| m.as_str()),
+                ) else {
+                    continue;
+                };
+                if model.trim().is_empty() || model == "imported" {
+                    continue;
+                }
+                newest = Some((mtime, provider.to_string(), model.to_string()));
+                break;
+            }
+        }
+    }
+    newest.map(|(_, provider, model)| (provider, model))
 }
 
 /// OMP validates session IDs as UUIDv7: the first 48 bits are the millisecond

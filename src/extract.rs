@@ -274,6 +274,7 @@ fn opencode_part(part: &Value, role: Role, out: &mut Events) {
                 cache_write: num(&t, "/cache/write"),
                 cost: part.get("cost").and_then(|c| c.as_f64()).unwrap_or(0.0),
                 model: None,
+                provider: None,
             });
         }
         // step-start/agent parts are run bookkeeping, not content.
@@ -440,6 +441,7 @@ fn usage_from_claude(u: &Value) -> Block {
         cache_write: num(u, "/cache_creation_input_tokens"),
         cost: 0.0,
         model: None,
+        provider: None,
     }
 }
 
@@ -662,6 +664,7 @@ fn codex(path: &Path) -> Result<Events> {
                                 cache_write: num(u, "/cache_write_input_tokens"),
                                 cost: 0.0,
                                 model: None,
+                                provider: None,
                             });
                         }
                     }
@@ -758,6 +761,10 @@ fn pi_family(path: &Path, tool: Tool) -> Result<Events> {
                                     .unwrap_or(0.0),
                                 model: msg
                                     .get("model")
+                                    .and_then(|m| m.as_str())
+                                    .map(str::to_string),
+                                provider: msg
+                                    .get("provider")
                                     .and_then(|m| m.as_str())
                                     .map(str::to_string),
                             });

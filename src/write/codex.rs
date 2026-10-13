@@ -1133,6 +1133,7 @@ mod tests {
                 cache_write: 0,
                 cost: 0.0,
                 model: None,
+                provider: None,
             },
         }]);
         let items = rollout_items(&s);

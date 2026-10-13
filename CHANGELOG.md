@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Removed the push-CI workflow; the release workflow keeps its own test
+gate, so every tag is still gated on tests and clippy.
+
 ## 0.7.1
 
 - Pre-snapshot opencode digest keys migrate without re-importing: a

@@ -21,6 +21,14 @@ target's constructs:
   tool traffic is read as history, never continued as pending state.
 - images also reach opencode, as `file` parts carrying the data URL (verified
   against the live importer; its schema is `type/mime/filename/url`).
+- images kept as content-addressed references (`blob:sha256:<hash>`) are
+  resolved from the agent's own blob store (both pi's and omp's stores are
+  searched) and inlined as base64 instead of arriving as a broken data URL.
+  Mapping version 4 re-imports existing copies once so old imports stop
+  carrying the unresolved form.
+- `--from <tool>` scopes the candidate stores before refs resolve, so
+  `sync --from pi <id>` picks the pi session even when the same id also exists
+  in stores it was imported into.
 - opencode imports are serialized: its CLI opens SQLite with `busy_timeout=0`,
   so a second writer fails instead of waiting. Retries back off three times for
   the case where another app is writing.

@@ -33,12 +33,17 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         out,
     } = args;
     let plan = refs::resolve_items(&items, &from, &to)?;
-    let sessions = scope::load(all)?;
+    let mut sessions = scope::load(all)?;
+    // `--from <tool>` scopes which stores a ref may resolve against and which
+    // tools bulk mode draws from, so it must apply before selection.
+    if !plan.from_tools.is_empty() {
+        sessions.retain(|s| plan.from_tools.contains(&s.tool));
+    }
     // Sources: explicit refs select; empty refs mean the newest per tool.
     // Explicit picks always resolve (even to imports); bulk mode skips
     // imports unless asked, to prevent echo loops.
     let has_refs = !plan.refs.is_empty();
-    let mut sources: Vec<Session> = if has_refs {
+    let sources: Vec<Session> = if has_refs {
         let mut picked = Vec::new();
         for r in plan.refs.clone() {
             picked.push(refs::select(&sessions, r)?.clone());
@@ -49,9 +54,6 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         bulk.retain(|s| include_imports || !s.is_import);
         bulk
     };
-    if !plan.from_tools.is_empty() {
-        sources.retain(|s| plan.from_tools.contains(&s.tool));
-    }
     let mut tool_targets = refs::tool_targets(&plan.dests);
     let format_targets = refs::format_targets(&plan.dests);
     if tool_targets.is_empty() && format_targets.is_empty() && !has_refs {

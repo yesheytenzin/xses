@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 
 /// Mapping version recorded in every import. Bump it whenever the writers
 /// change what they emit, so `sync` can re-import and upgrade old copies.
-pub(crate) const MAPPING: u32 = 2;
+pub(crate) const MAPPING: u32 = 4;
 
 /// What a writer produced for a session: the artifacts recorded in the index
 /// (and removed again by `clean`).

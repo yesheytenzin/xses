@@ -28,7 +28,8 @@ pub fn extract(
     let events = match tool {
         Tool::Claude => claude(path)?,
         Tool::Codex => codex(path)?,
-        Tool::Pi | Tool::Omp => pi_family(path)?,
+        Tool::Pi => pi_family(path, Tool::Pi)?,
+        Tool::Omp => pi_family(path, Tool::Omp)?,
         Tool::Opencode => opencode(id)?,
     };
     Ok(CanonicalSession {
@@ -541,7 +542,7 @@ fn codex(path: &Path) -> Result<Vec<Event>> {
     Ok(out.into_vec())
 }
 
-fn pi_family(path: &Path) -> Result<Vec<Event>> {
+fn pi_family(path: &Path, tool: Tool) -> Result<Vec<Event>> {
     let mut out = Events::default();
     for (line_no, line) in lines(path)?.enumerate() {
         let line = line?;
@@ -577,7 +578,7 @@ fn pi_family(path: &Path) -> Result<Vec<Event>> {
                         let duration = msg.get("durationMs").and_then(|d| d.as_u64());
                         for it in content.as_array().cloned().unwrap_or_default() {
                             if let Some("image") = it.get("type").and_then(|t| t.as_str()) {
-                                out.push(image_block(&it));
+                                out.push(image_block(&it, tool));
                             }
                         }
                         let output = text_of(content).unwrap_or_default();
@@ -599,7 +600,7 @@ fn pi_family(path: &Path) -> Result<Vec<Event>> {
                             Some("system") | Some("developer") => Role::System,
                             _ => Role::Assistant,
                         };
-                        collect_parts(content, role, Tool::Pi, &mut out);
+                        collect_parts(content, role, tool, &mut out);
                         if let Some(u) = msg.get("usage") {
                             out.push(Usage {
                                 input: num(u, "/input"),
@@ -678,22 +679,31 @@ fn content_has_image(content: &Value) -> bool {
 }
 
 /// Image part → `Image` block when it fits the inline cap, otherwise a gap.
-fn image_block(part: &Value) -> Block {
-    let mime = part
+fn image_block(part: &Value, tool: Tool) -> Block {
+    let mut mime = part
         .get("mimeType")
         .or_else(|| part.get("mime_type"))
         .and_then(|m| m.as_str())
         .map(str::to_string);
-    // pi/omp: {type:image, data, mimeType}; codex: {type:input_image, image_url:"data:…;base64,…"}
-    let data = part
-        .get("data")
-        .and_then(|d| d.as_str())
-        .map(str::to_string);
-    let (data, mime) = match (data, part.get("image_url").and_then(|u| u.as_str())) {
-        (Some(d), _) => (Some(d), mime),
-        (None, Some(url)) => {
-            let mut mime = mime;
-            match url.split_once("base64,") {
+    // pi/omp: {type:image, data, mimeType}; codex: {type:input_image, image_url:"data:…;base64,…"}.
+    // `data` is base64, but it can also be a reference (`blob:sha256:<hash>`,
+    // `file:`/path) — those blobs live in the agent's own store and are read
+    // back so the image transfers for real.
+    let raw = part.get("data").and_then(|d| d.as_str());
+    let (data, path, bytes) = match raw {
+        Some(r) if r.starts_with("blob:") => match resolve_blob(tool, r) {
+            Some((b64, n)) => (Some(b64), None, n),
+            None => (None, Some(PathBuf::from(r)), 0),
+        },
+        Some(r) if r.starts_with("file:") || r.starts_with('/') || r.contains("://") => {
+            (None, Some(PathBuf::from(r)), 0)
+        }
+        Some(r) => {
+            let bytes = r.len() as u64 * 3 / 4;
+            (Some(r.to_string()), None, bytes)
+        }
+        None => match part.get("image_url").and_then(|u| u.as_str()) {
+            Some(url) => match url.split_once("base64,") {
                 Some((head, b64)) => {
                     if mime.is_none() {
                         mime = head
@@ -703,18 +713,13 @@ fn image_block(part: &Value) -> Block {
                             .filter(|m| !m.is_empty())
                             .map(str::to_string);
                     }
-                    (Some(b64.to_string()), mime)
+                    (Some(b64.to_string()), None, b64.len() as u64 * 3 / 4)
                 }
-                None => (None, mime),
-            }
-        }
-        (None, None) => (None, mime),
+                None => (None, Some(PathBuf::from(url)), 0),
+            },
+            None => (None, None, 0),
+        },
     };
-    let bytes = data
-        .as_ref()
-        .map(|d| d.len() as u64 * 3 / 4)
-        .or_else(|| part.get("bytes").and_then(|b| b.as_u64()))
-        .unwrap_or(0);
     if bytes > MAX_INLINE_BYTES {
         return Gap {
             kind: "image".into(),
@@ -726,12 +731,80 @@ fn image_block(part: &Value) -> Block {
             ),
         };
     }
+    let path = path.or_else(|| part.get("path").and_then(|p| p.as_str()).map(PathBuf::from));
     Image {
         mime,
         data,
-        path: part.get("path").and_then(|p| p.as_str()).map(PathBuf::from),
+        path,
         bytes,
     }
+}
+
+/// Resolve a content-addressed reference (`blob:sha256:<hash>`) against the
+/// agent's own blob store, returning base64 of the bytes.
+fn resolve_blob(tool: Tool, reference: &str) -> Option<(String, u64)> {
+    let hash = reference.rsplit(':').next()?;
+    if hash.is_empty() || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let home = dirs::home_dir()?;
+    // Content-addressed: the hash identifies the bytes, and the store that
+    // holds them can belong to the sibling agent (pi sessions referencing omp
+    // blobs, and vice versa), so both are searched.
+    let pi = home.join(".pi/agent/blobs");
+    let omp = home.join(".omp/agent/blobs");
+    let dirs = match tool {
+        Tool::Pi => vec![pi, omp],
+        _ => vec![omp, pi],
+    };
+    for dir in dirs {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if !name.starts_with(hash) {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.len() > MAX_INLINE_BYTES {
+                return None;
+            }
+            let Ok(bytes) = std::fs::read(entry.path()) else {
+                continue;
+            };
+            return Some((base64_encode(&bytes), bytes.len() as u64));
+        }
+    }
+    None
+}
+
+/// Minimal base64 encoder (no dependency for one call site).
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b = [
+            chunk[0],
+            chunk.get(1).copied().unwrap_or(0),
+            chunk.get(2).copied().unwrap_or(0),
+        ];
+        let n = ((b[0] as u32) << 16) | ((b[1] as u32) << 8) | b[2] as u32;
+        out.push(TABLE[(n >> 18) as usize & 63] as char);
+        out.push(TABLE[(n >> 12) as usize & 63] as char);
+        out.push(if chunk.len() > 1 {
+            TABLE[(n >> 6) as usize & 63] as char
+        } else {
+            '='
+        });
+        out.push(if chunk.len() > 2 {
+            TABLE[n as usize & 63] as char
+        } else {
+            '='
+        });
+    }
+    out
 }
 
 /// A tool call whose result never landed in the source store.
@@ -844,7 +917,7 @@ fn collect_parts(content: &Value, role: Role, tool: Tool, out: &mut Events) {
                                     inner.get("type").and_then(|t| t.as_str()),
                                     Some("image" | "input_image")
                                 ) {
-                                    out.push(image_block(inner));
+                                    out.push(image_block(inner, tool));
                                 }
                             }
                         }
@@ -886,7 +959,7 @@ fn collect_parts(content: &Value, role: Role, tool: Tool, out: &mut Events) {
                                 .map(str::to_string),
                         });
                     }
-                    Some("image" | "input_image") => out.push(image_block(it)),
+                    Some("image" | "input_image") => out.push(image_block(it, tool)),
                     None => {
                         if let Some(s) = it.as_str() {
                             out.push(Text {

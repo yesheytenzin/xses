@@ -49,6 +49,11 @@ Projections each target's own UI reads:
   assistant text there.
 - **Non-shell tools in codex's projection** render as text; the rollout still
   holds their `function_call`/`function_call_output` items.
+- **Attachments carry what the source embedded**: claude's `file` rows hold the
+  text it read (`content.file.content` with its line range) or an image
+  payload, and that is what transfers. A bare path still inlines an on-disk
+  image within the cap; anything else arrives as a labelled note naming the
+  file.
 
 ## Impossible
 
@@ -58,7 +63,7 @@ Projections each target's own UI reads:
 | Provider-signed thinking replay | signatures are validated by the originating provider |
 | Live runtime state (running tools, queues, background tasks, permission prompts) | not representable as history in any target; only the import note can describe it |
 | Provider-local bookkeeping (latches, bridge ids, file-history snapshots, fork refs, cache keys, credential pins) | same-tool round-trips keep them in the source; other agents have no place for them |
-| Claude `file` / `compact_file_reference` attachment bytes | the row carries a path, not content: xses records the path and that it was not carried. If the file is gone there is nothing to move; if it still exists, the bytes are not read (only images embedded in the transcript are carried) |
+| Non-image attachments with no embedded payload | a claude `file` row that carries only a path has nothing to move: xses inlines on-disk images within the cap, and for anything else writes a note naming the file. Text files claude already embedded (`content.file.content`) do transfer as text |
 | Original tool-call ids | ids are provider-validated; xses re-mints deterministic ids so results still pair |
 | Exact per-message timing | ordering is preserved; timestamps are synthesized where the target requires monotonic values |
 

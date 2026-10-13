@@ -220,6 +220,13 @@ fn scan_claude(prev: &HashMap<PathBuf, Session>) -> Result<Vec<Session>> {
         if !entry.file_type().is_file() || p.extension().and_then(|e| e.to_str()) != Some("jsonl") {
             continue;
         }
+        // `<slug>/<session-uuid>/subagents/agent-*.jsonl` is a subagent's own
+        // transcript: claude's picker never lists one and `claude --resume`
+        // cannot open it, so it is not a session to resume or move. It stays
+        // in the source store.
+        if p.components().any(|c| c.as_os_str() == "subagents") {
+            continue;
+        }
         if let Some(cached) = reused_if_unchanged(prev, p) {
             out.push(cached);
             continue;

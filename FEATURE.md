@@ -62,12 +62,13 @@ Projections each target's own UI reads:
 
 ## Not carried, by design
 
-claude rows flagged `isMeta` (skill bodies and local-command output claude
-injects itself — 68 in the store checked) and rows flagged `isSidechain` (a
-subagent's own conversation) are skipped: neither is a turn of this
-transcript, and every target injects its own context on resume, so carrying
-claude's private injections would present machinery as history. They stay in
-the source file and are not counted as gaps.
+claude rows flagged `isMeta` transfer as context — once, since claude re-sends
+the same skill body on every later turn. Two things stay behind: rows flagged
+`isSidechain`, and the subagent transcripts claude keeps beside a session
+(`<slug>/<session>/subagents/agent-*.jsonl`, 67 in the store checked). A
+subagent's conversation is not this transcript, is not listed by claude's own
+picker, and cannot be resumed with `claude --resume`, so it is neither a
+session to move nor turns to carry.
 
 ## Impossible
 

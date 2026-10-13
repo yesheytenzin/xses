@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.0.6 — mapping 6: tool ids, message times and restored outputs
+## 0.6.0 — mapping 6: tool ids, message times and restored outputs
 
 The transfer layer stopped assuming what a store *might* hold and started
 recording what it does: ids that the target's own validator accepts, the time

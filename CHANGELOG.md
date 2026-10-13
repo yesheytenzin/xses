@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.2
 
 - Removed the push-CI workflow; the release workflow keeps its own test
 gate, so every tag is still gated on tests and clippy.

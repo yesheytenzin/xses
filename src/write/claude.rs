@@ -3,7 +3,7 @@
 //! Emits claude's own content blocks: `thinking`, `text`, `tool_use`, and
 //! `tool_result` (the latter in a `user` row, as claude does), plus image
 //! blocks for inline pictures and per-message `usage`.
-use super::{atomic_write, group_role, iso, manifest, push, synth_id};
+use super::{group_role, iso, manifest, push, synth_id};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -221,16 +221,23 @@ fn write_inner(session: &CanonicalSession) -> Option<(PathBuf, PathBuf)> {
             parent = Some(uuid);
         }
     }
-    atomic_write(&target, &buf).ok()?;
+    let subject = format!("{} {}", session.tool.as_str(), session.id);
+    if !super::atomic_write_journaled(&target, &buf, &subject) {
+        return None;
+    }
     // Sidecar must exist or the picker row shows the bare first prompt.
     let sidecar_dir = target.with_extension("");
-    std::fs::create_dir_all(&sidecar_dir).ok()?;
     let sidecar = sidecar_dir.join("custom-title.json");
-    std::fs::write(
-        &sidecar,
-        serde_json::to_vec(&json!({"customTitle": title})).ok()?,
-    )
-    .ok()?;
+    let sidecar_bytes = match serde_json::to_vec(&json!({"customTitle": title})) {
+        Ok(b) => b,
+        Err(e) => {
+            super::journal_failure(&subject, &format!("title sidecar: {e}"));
+            return None;
+        }
+    };
+    if !super::atomic_write_journaled(&sidecar, &sidecar_bytes, &subject) {
+        return None;
+    }
     Some((target, sidecar))
 }
 

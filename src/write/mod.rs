@@ -159,6 +159,24 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Atomic write that journals the reason on failure: writers signal "nothing
+/// produced" with `None`, so without this the OS error would vanish and
+/// `doctor` could only say "target wrote nothing".
+pub(super) fn atomic_write_journaled(path: &Path, bytes: &[u8], subject: &str) -> bool {
+    match atomic_write(path, bytes) {
+        Ok(()) => true,
+        Err(e) => {
+            crate::issues::record("write-failed", subject, &format!("{}: {e}", path.display()));
+            false
+        }
+    }
+}
+
+/// Journal any non-write failure (serialization, sidecar, payload staging).
+pub(super) fn journal_failure(subject: &str, detail: &str) {
+    crate::issues::record("write-failed", subject, detail);
+}
+
 pub(super) fn push(buf: &mut Vec<u8>, v: &Value) {
     buf.extend(serde_json::to_vec(v).unwrap_or_default());
     buf.push(b'\n');

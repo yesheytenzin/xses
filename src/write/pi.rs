@@ -3,7 +3,7 @@
 //! Emits native records: multi-part messages (`text`, `thinking`, `toolCall`,
 //! `image`), `toolResult` messages carrying their `toolCallId`, compaction
 //! records, and per-message usage so the TUI's stats still render.
-use super::{atomic_write, import_id, iso, iso_stamp, push, synth_id};
+use super::{import_id, iso, iso_stamp, push, synth_id};
 use crate::canonical::{Block, CanonicalSession, Role};
 use crate::model::Tool;
 use serde_json::{json, Value};
@@ -346,7 +346,13 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
             parent = Some(mid);
         }
     }
-    atomic_write(&target, &buf).ok()?;
+    if !super::atomic_write_journaled(
+        &target,
+        &buf,
+        &format!("{} {}", session.tool.as_str(), session.id),
+    ) {
+        return None;
+    }
     Some(target)
 }
 

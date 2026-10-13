@@ -6,7 +6,7 @@
 //! events — while the TUI projection (`thread_items`) uses the item types the
 //! picker renders: `userMessage`, `agentMessage`, `commandExecution`,
 //! `contextCompaction`.
-use super::{atomic_write, iso, iso_stamp, manifest, push, synth_id};
+use super::{iso, iso_stamp, manifest, push, synth_id};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::fs;
@@ -94,7 +94,13 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
             }),
         );
     }
-    atomic_write(&target, &buf).ok()?;
+    if !super::atomic_write_journaled(
+        &target,
+        &buf,
+        &format!("{} {}", session.tool.as_str(), session.id),
+    ) {
+        return None;
+    }
     // codex's own picker lists from the `threads` table, not the sessions dir:
     // register the drop-in file so `codex resume` sees it.
     let title = super::title_for(session);

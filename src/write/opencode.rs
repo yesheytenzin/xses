@@ -361,8 +361,18 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
         "messages": msgs_json,
     });
     let tmp = std::env::temp_dir().join(format!("xses-{ses}.json"));
-    let bytes = serde_json::to_vec_pretty(&payload).ok()?;
-    fs::write(&tmp, &bytes).ok()?;
+    let subject = format!("{} {}", session.tool.as_str(), session.id);
+    let bytes = match serde_json::to_vec_pretty(&payload) {
+        Ok(b) => b,
+        Err(e) => {
+            super::journal_failure(&subject, &format!("payload serialization: {e}"));
+            return None;
+        }
+    };
+    if let Err(e) = fs::write(&tmp, &bytes) {
+        super::journal_failure(&subject, &format!("{}: {e}", tmp.display()));
+        return None;
+    }
     // Concurrent `opencode import` runs are safe (verified 8-way against the
     // live store); only serial `export` truncated stdout, and xses never
     // shells out to export. Imports therefore run parallel across sessions.

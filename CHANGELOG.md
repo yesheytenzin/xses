@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 — release tooling and transfer docs
+
+- `scripts/release.sh <X.Y.Z>`: bumps the version in `Cargo.toml`, `Cargo.lock`,
+  and the changelog, runs the `--locked` gates, commits, tags, and pushes.
+  Pushing the tag is what builds the release (linux-x86_64, macos-x86_64,
+  macos-aarch64, windows-x86_64 + `SHA256SUMS` and signed provenance).
+- `FEATURE.md` documents what a sync can carry, what is planned, and what can
+  never transfer (provider-signed reasoning, redacted content, live state).
+- Install references point at the canonical `yesheytenzin/xsession` name.
+
 ## 0.0.4 — CLI contract, diagnostics, and faster syncs
 
 - `doctor` reports what is installed (agent CLIs, `sqlite3`), what each store

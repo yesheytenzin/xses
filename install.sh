@@ -1,7 +1,7 @@
 #!/usr/bin/env sh
 set -eu
 
-repo="yesheytenzin/xses"
+repo="yesheytenzin/xsession"
 version="${XSES_VERSION:-latest}"
 prefix="${PREFIX:-${HOME}/.local}"
 

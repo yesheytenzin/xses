@@ -18,7 +18,7 @@ On Linux or macOS:
 
 ```sh
 curl --proto '=https' --tlsv1.2 -fsSL \
-  https://raw.githubusercontent.com/yesheytenzin/xses/main/install.sh | sh
+  https://raw.githubusercontent.com/yesheytenzin/xsession/main/install.sh | sh
 ```
 
 The installer detects the platform, downloads the latest release, verifies
@@ -30,7 +30,7 @@ its SHA-256 checksum, and installs `xses` to `~/.local/bin`.
 cargo install --path . --root "$HOME/.local"
 ```
 
-The command is `xses`.
+The project is `xsession`; the command it installs is `xses`.
 
 ## Quick start
 

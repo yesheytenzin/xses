@@ -370,16 +370,21 @@ fn claude_attachment(a: Option<&Value>) -> Option<Block> {
         // claude embeds what it read: text (with the line range) or an image
         // payload. Carrying that beats a note that says it was not carried.
         Some("file") => Some(attachment_content(a, path)),
-        Some("compact_file_reference") => Some(match attachment_content(a, path.clone()) {
-            // The reference exists so the model can re-read; when there is
-            // nothing embedded (and the file is not a readable image), only
-            // that fact can be carried.
-            Context { .. } => Context {
-                kind: "pre-compaction-reference".into(),
-                text: Some("read before the last compaction; re-read if needed".into()),
-                path,
-            },
-            block => block,
+        Some("compact_file_reference") => Some(if a.get("content").is_some() {
+            // Embedded content is evidence: carry it whatever the reference is.
+            attachment_content(a, path.clone())
+        } else {
+            match attachment_content(a, path.clone()) {
+                // A readable image on disk still transfers.
+                image @ Image { .. } => image,
+                // Otherwise the reference is all there is: say what it means,
+                // so the resumed agent knows it can read the file itself.
+                _ => Context {
+                    kind: "pre-compaction-reference".into(),
+                    text: Some("read before the last compaction; re-read if needed".into()),
+                    path,
+                },
+            }
         }),
         Some("thinking_stripped") => Some(Gap {
             kind: "thinking".into(),
@@ -1393,6 +1398,46 @@ mod tests {
                 assert!(text.contains("README.md"), "the name identifies it: {text}");
                 assert!(text.contains("83 lines"), "line count kept: {text}");
                 assert_eq!(path.as_deref(), path.as_deref().filter(|_| true));
+            }
+            other => panic!("want Context, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_reference_keeps_embedded_content_and_inlines_images() {
+        // No payload: the reference note, naming the file.
+        let row = json!({
+            "type": "attachment",
+            "attachment": {
+                "type": "compact_file_reference",
+                "filename": "/home/some/notes.md",
+                "displayPath": "../notes.md"
+            }
+        });
+        match &claude_rows(&[row])[0].block {
+            Block::Context { kind, text, .. } => {
+                assert_eq!(kind, "pre-compaction-reference");
+                assert!(
+                    text.as_deref().unwrap_or("").contains("re-read"),
+                    "{text:?}"
+                );
+            }
+            other => panic!("want Context, got {other:?}"),
+        }
+
+        // With embedded text: carry the text, not just the reference.
+        let row = json!({
+            "type": "attachment",
+            "attachment": {
+                "type": "compact_file_reference",
+                "filename": "/home/some/notes.md",
+                "content": {"type": "text", "file": {"content": "notes body", "totalLines": 4}}
+            }
+        });
+        match &claude_rows(&[row])[0].block {
+            Block::Context { text, .. } => {
+                let text = text.as_deref().unwrap_or("");
+                assert!(text.contains("notes body"), "embedded text wins: {text}");
             }
             other => panic!("want Context, got {other:?}"),
         }

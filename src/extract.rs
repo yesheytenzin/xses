@@ -104,145 +104,160 @@ fn opencode(id: &str) -> Result<Vec<Event>> {
         out.boundary();
         if let Some(items) = by_msg.get(mid) {
             for part in items {
-                match part.get("type").and_then(|t| t.as_str()) {
-                    Some("text") => {
-                        if let Some(t) = classify_text(part.get("text")) {
-                            out.push(Text { role, text: t });
-                        }
-                    }
-                    Some("reasoning") => {
-                        if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
-                            if !t.trim().is_empty() {
-                                out.push(Thinking {
-                                    text: t.to_string(),
-                                    signature: None,
-                                });
-                            }
-                        }
-                    }
-                    Some("tool") => {
-                        let name = part
-                            .get("tool")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("tool")
-                            .to_string();
-                        let call_id = part
-                            .get("callID")
-                            .and_then(|c| c.as_str())
-                            .map(str::to_string);
-                        let state = part.get("state").cloned().unwrap_or(Value::Null);
-                        let status = state
-                            .get("status")
-                            .and_then(|s| s.as_str())
-                            .map(str::to_string);
-                        let input = state
-                            .get("input")
-                            .map(|i| i.to_string())
-                            .unwrap_or_default();
-                        out.push(ToolCall {
-                            name: name.clone(),
-                            args: input,
-                            call_id: call_id.clone(),
-                            status: status.clone(),
-                        });
-                        let output = state
-                            .get("output")
-                            .and_then(|o| o.as_str())
-                            .map(str::to_string);
-                        let error = state
-                            .get("error")
-                            .and_then(|e| e.as_str())
-                            .map(str::to_string);
-                        let duration = state
-                            .pointer("/time/end")
-                            .and_then(|e| e.as_i64())
-                            .zip(state.pointer("/time/start").and_then(|s| s.as_i64()))
-                            .map(|(end, start)| (end - start).max(0) as u64);
-                        match (output, error) {
-                            (Some(o), _) if !o.is_empty() => out.push(ToolResult {
-                                name: name.clone(),
-                                output: o,
-                                call_id: call_id.clone(),
-                                is_error: status.as_deref() == Some("error"),
-                                duration_ms: duration,
-                            }),
-                            (_, Some(e)) if !e.is_empty() => out.push(ToolResult {
-                                name: name.clone(),
-                                output: e,
-                                call_id: call_id.clone(),
-                                is_error: true,
-                                duration_ms: duration,
-                            }),
-                            _ => out.push(tool_output_gap(&name)),
-                        }
-                    }
-                    Some("patch") => out.push(Patch {
-                        hash: part
-                            .get("hash")
-                            .and_then(|h| h.as_str())
-                            .map(str::to_string),
-                        files: part
-                            .get("files")
-                            .and_then(|f| f.as_array())
-                            .map(|a| {
-                                a.iter()
-                                    .filter_map(|f| f.as_str())
-                                    .map(PathBuf::from)
-                                    .collect()
-                            })
-                            .unwrap_or_default(),
-                    }),
-                    Some("compaction") => out.push(Compressed {
-                        text: "session was compacted; earlier history summarized away".into(),
-                    }),
-                    Some("file") => {
-                        let path = part
-                            .get("path")
-                            .or_else(|| part.pointer("/file/path"))
-                            .and_then(|p| p.as_str())
-                            .map(PathBuf::from);
-                        let text = part
-                            .get("text")
-                            .and_then(|t| t.as_str())
-                            .map(str::to_string);
-                        out.push(Context {
-                            kind: "file".into(),
-                            text,
-                            path,
-                        });
-                    }
-                    Some("subtask") => out.push(Context {
-                        kind: "subtask".into(),
-                        text: part
-                            .get("description")
-                            .and_then(|d| d.as_str())
-                            .map(|d| format!("subtask: {d}")),
-                        path: None,
-                    }),
-                    Some("step-finish") => {
-                        let t = part.get("tokens").cloned().unwrap_or(Value::Null);
-                        out.push(Usage {
-                            input: num(&t, "/input"),
-                            output: num(&t, "/output"),
-                            reasoning: num(&t, "/reasoning"),
-                            cache_read: num(&t, "/cache/read"),
-                            cache_write: num(&t, "/cache/write"),
-                            cost: part.get("cost").and_then(|c| c.as_f64()).unwrap_or(0.0),
-                            model: None,
-                        });
-                    }
-                    // step-start/agent parts are run bookkeeping, not content.
-                    Some("step-start" | "agent") => {}
-                    Some(other) => out.push(Gap {
-                        kind: "opencode-part".into(),
-                        detail: format!("opencode {other} part not carried over"),
-                    }),
-                    None => {}
-                }
+                opencode_part(part, role, &mut out);
             }
         }
     }
     Ok(out.into_vec())
+}
+
+/// One opencode part → blocks. Kept separate from the message walk so the part
+/// vocabulary can be exercised directly.
+fn opencode_part(part: &Value, role: Role, out: &mut Events) {
+    match part.get("type").and_then(|t| t.as_str()) {
+        Some("text") => {
+            if let Some(t) = classify_text(part.get("text")) {
+                out.push(Text { role, text: t });
+            }
+        }
+        Some("reasoning") => {
+            if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                if !t.trim().is_empty() {
+                    out.push(Thinking {
+                        text: t.to_string(),
+                        signature: None,
+                    });
+                }
+            }
+        }
+        Some("tool") => {
+            let name = part
+                .get("tool")
+                .and_then(|t| t.as_str())
+                .unwrap_or("tool")
+                .to_string();
+            let call_id = part
+                .get("callID")
+                .and_then(|c| c.as_str())
+                .map(str::to_string);
+            let state = part.get("state").cloned().unwrap_or(Value::Null);
+            let status = state
+                .get("status")
+                .and_then(|s| s.as_str())
+                .map(str::to_string);
+            let input = state
+                .get("input")
+                .map(|i| i.to_string())
+                .unwrap_or_default();
+            out.push(ToolCall {
+                name: name.clone(),
+                args: input,
+                call_id: call_id.clone(),
+                status: status.clone(),
+            });
+            let output = state
+                .get("output")
+                .and_then(|o| o.as_str())
+                .map(str::to_string);
+            let error = state
+                .get("error")
+                .and_then(|e| e.as_str())
+                .map(str::to_string);
+            let duration = state
+                .pointer("/time/end")
+                .and_then(|e| e.as_i64())
+                .zip(state.pointer("/time/start").and_then(|s| s.as_i64()))
+                .map(|(end, start)| (end - start).max(0) as u64);
+            match (output, error) {
+                (Some(o), _) if !o.is_empty() => out.push(ToolResult {
+                    name: name.clone(),
+                    output: o,
+                    call_id: call_id.clone(),
+                    is_error: status.as_deref() == Some("error"),
+                    duration_ms: duration,
+                }),
+                (_, Some(e)) if !e.is_empty() => out.push(ToolResult {
+                    name: name.clone(),
+                    output: e,
+                    call_id: call_id.clone(),
+                    is_error: true,
+                    duration_ms: duration,
+                }),
+                _ => out.push(tool_output_gap(&name)),
+            }
+        }
+        Some("patch") => out.push(Patch {
+            hash: part
+                .get("hash")
+                .and_then(|h| h.as_str())
+                .map(str::to_string),
+            files: part
+                .get("files")
+                .and_then(|f| f.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|f| f.as_str())
+                        .map(PathBuf::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+        }),
+        Some("compaction") => out.push(Compressed {
+            text: "session was compacted; earlier history summarized away".into(),
+        }),
+        Some("file") => {
+            // Attachments are `file` parts here; the image ones
+            // carry a data URL and must transfer as images rather
+            // than as a context note with nothing in it.
+            let mime = part.get("mime").and_then(|m| m.as_str()).unwrap_or("");
+            let url = part.get("url").and_then(|u| u.as_str()).unwrap_or("");
+            if mime.starts_with("image/") || url.starts_with("data:image/") {
+                out.push(image_block(part, Tool::Opencode));
+                return;
+            }
+            let path = part
+                .get("path")
+                .or_else(|| part.pointer("/file/path"))
+                .and_then(|p| p.as_str())
+                .map(PathBuf::from);
+            let text = part
+                .get("text")
+                .and_then(|t| t.as_str())
+                .map(str::to_string);
+            out.push(Context {
+                kind: "file".into(),
+                text,
+                path,
+            });
+        }
+        Some("subtask") => out.push(Context {
+            kind: "subtask".into(),
+            text: part
+                .get("description")
+                .and_then(|d| d.as_str())
+                .map(|d| format!("subtask: {d}")),
+            path: None,
+        }),
+        Some("step-finish") => {
+            let t = part.get("tokens").cloned().unwrap_or(Value::Null);
+            out.push(Usage {
+                input: num(&t, "/input"),
+                output: num(&t, "/output"),
+                reasoning: num(&t, "/reasoning"),
+                cache_read: num(&t, "/cache/read"),
+                cache_write: num(&t, "/cache/write"),
+                cost: part.get("cost").and_then(|c| c.as_f64()).unwrap_or(0.0),
+                model: None,
+            });
+        }
+        // step-start/agent parts are run bookkeeping, not content.
+        Some("step-start" | "agent") => {}
+        Some(other) => out.push(Gap {
+            kind: "opencode-part".into(),
+            detail: format!("opencode {other} part not carried over"),
+        }),
+        None => {}
+    }
 }
 
 fn num(v: &Value, pointer: &str) -> u64 {
@@ -720,6 +735,8 @@ fn image_block(part: &Value, tool: Tool) -> Block {
         .get("mimeType")
         .or_else(|| part.get("mime_type"))
         .or_else(|| part.get("media_type"))
+        // opencode `file` parts name it `mime`
+        .or_else(|| part.get("mime"))
         .and_then(|m| m.as_str())
         .map(str::to_string);
     // pi/omp: {type:image, data, mimeType}; codex: {type:input_image, image_url:"data:…;base64,…"}.
@@ -739,7 +756,12 @@ fn image_block(part: &Value, tool: Tool) -> Block {
             let bytes = r.len() as u64 * 3 / 4;
             (Some(r.to_string()), None, bytes)
         }
-        None => match part.get("image_url").and_then(|u| u.as_str()) {
+        // codex says `image_url`; opencode's `file` parts say `url`.
+        None => match part
+            .get("image_url")
+            .or_else(|| part.get("url"))
+            .and_then(|u| u.as_str())
+        {
             Some(url) => match url.split_once("base64,") {
                 Some((head, b64)) => {
                     if mime.is_none() {
@@ -1167,6 +1189,33 @@ mod tests {
                     Some("qq=="),
                     "claude's base64 must be read"
                 );
+                assert_eq!(*bytes, 3u64);
+            }
+            other => panic!("want Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opencode_file_parts_with_images_carry_bytes() {
+        // Shape read from a live store: {"type":"file","mime":"image/webp",
+        // "filename":"image-84994.webp","url":"data:image/webp;base64,…"}.
+        let mut out = Events::default();
+        opencode_part(
+            &json!({
+                "type": "file",
+                "mime": "image/webp",
+                "filename": "image-84994.webp",
+                "url": "data:image/webp;base64,qq==",
+            }),
+            Role::User,
+            &mut out,
+        );
+        match &out.into_vec()[0].block {
+            Block::Image {
+                mime, data, bytes, ..
+            } => {
+                assert_eq!(mime.as_deref(), Some("image/webp"));
+                assert_eq!(data.as_deref(), Some("qq=="));
                 assert_eq!(*bytes, 3u64);
             }
             other => panic!("want Image, got {other:?}"),

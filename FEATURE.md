@@ -21,6 +21,12 @@ What a sync carries, where it lands, and what can never move. Statuses:
 | usage / cost / tokens | per-message `usage` | `token_count` events | per-message `usage` | message `tokens` / `cost` (read side parses its `step-finish` parts) |
 | injected context | *text* (`[context: kind]`) | *text* | *text* | *text* |
 
+Sources are read symmetrically, in each store's own encoding: claude nests an
+image as `source.data` + `source.media_type`, codex uses `input_image` data
+URLs, pi/omp store `image` parts (inline base64 or a `blob:` reference into
+their own blob store, which is resolved), and opencode stores a `file` part
+with `mime` + a base64 `url`.
+
 Projections each target's own UI reads:
 
 - claude: `custom-title.json` sidecar (picker row) + uuid parent chain.
@@ -52,7 +58,7 @@ Projections each target's own UI reads:
 | Provider-signed thinking replay | signatures are validated by the originating provider |
 | Live runtime state (running tools, queues, background tasks, permission prompts) | not representable as history in any target; only the import note can describe it |
 | Provider-local bookkeeping (latches, bridge ids, file-history snapshots, fork refs, cache keys, credential pins) | same-tool round-trips keep them in the source; other agents have no place for them |
-| Attachment bytes that no longer exist | claude `file` / `compact_file_reference` carry a path; if the file is gone there is nothing to move |
+| Claude `file` / `compact_file_reference` attachment bytes | the row carries a path, not content: xses records the path and that it was not carried. If the file is gone there is nothing to move; if it still exists, the bytes are not read (only images embedded in the transcript are carried) |
 | Original tool-call ids | ids are provider-validated; xses re-mints deterministic ids so results still pair |
 | Exact per-message timing | ordering is preserved; timestamps are synthesized where the target requires monotonic values |
 

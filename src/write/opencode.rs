@@ -431,7 +431,10 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
         None => "unknown".into(),
     };
     crate::issues::record("opencode-import", &ses, &reason);
-    eprintln!("opencode import failed for {ses}: {reason}");
+    eprintln!(
+        "opencode import failed for {ses}: {}",
+        crate::ansi::strip(&reason)
+    );
     fs::remove_file(&tmp).ok();
     None
 }

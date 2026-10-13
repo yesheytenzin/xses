@@ -35,7 +35,7 @@ xses sync latest --to codex   # one session by ref
 xses sync latest sharegpt -o chat.json
 xses clean                    # remove the newest synced session's imports
 xses clean --all --dry-run    # report every import that would go
-xses doctor                   # stores, index, and the newest failures
+xses doctor                   # installed stores, index, newest failures
 ```
 
 `sync` tokens are destinations (tool names, `sharegpt`, `openai`) or session

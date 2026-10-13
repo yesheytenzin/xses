@@ -12,7 +12,19 @@ struct ScanCache {
     sessions: Vec<Session>,
 }
 
+/// Every store.
 pub fn scan_all(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
+    scan_tools(cwd_filter, Tool::write_targets(), true)
+}
+
+/// The requested stores only. `save_cache` is false for read-only callers: a
+/// partial scan must not overwrite the shared cache with what it happened to
+/// look at.
+pub fn scan_tools(
+    cwd_filter: Option<&Path>,
+    tools: &[Tool],
+    save_cache: bool,
+) -> Result<Vec<Session>> {
     // Reuse per unchanged file rather than per store: any agent the user is
     // actively working in appends to its own transcript continuously, and that
     // must cost one file re-parse, not a full-store rescan.
@@ -27,17 +39,23 @@ pub fn scan_all(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
         })
         .unwrap_or_default();
     let mut out = Vec::new();
-    out.extend(scan_claude(&prev)?);
-    out.extend(scan_codex(&prev)?);
-    out.extend(scan_pi_family(&prev, Tool::Pi)?);
-    out.extend(scan_pi_family(&prev, Tool::Omp)?);
-    out.extend(scan_opencode(cwd_filter)?);
+    for tool in tools {
+        match tool {
+            Tool::Claude => out.extend(scan_claude(&prev)?),
+            Tool::Codex => out.extend(scan_codex(&prev)?),
+            Tool::Pi => out.extend(scan_pi_family(&prev, Tool::Pi)?),
+            Tool::Omp => out.extend(scan_pi_family(&prev, Tool::Omp)?),
+            Tool::Opencode => out.extend(scan_opencode(cwd_filter)?),
+        }
+    }
     out.sort_by_key(|a| std::cmp::Reverse(a.mtime));
     let mut seen = std::collections::HashSet::new();
     out.retain(|s| seen.insert((s.tool, s.id.clone())));
-    let _ = save_cache(&ScanCache {
-        sessions: out.clone(),
-    });
+    if save_cache {
+        let _ = self::save_cache(&ScanCache {
+            sessions: out.clone(),
+        });
+    }
     Ok(filter_sessions(out, cwd_filter))
 }
 

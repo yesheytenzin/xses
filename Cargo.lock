@@ -1134,6 +1134,7 @@ dependencies = [
  "crossterm",
  "dirs",
  "fuzzy-matcher",
+ "libc",
  "ratatui",
  "serde",
  "serde_json",

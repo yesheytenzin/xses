@@ -20,7 +20,8 @@ pub struct Issue {
     pub detail: String,
 }
 
-fn path() -> Option<PathBuf> {
+/// Journal location, for callers that need to point at the full text.
+pub fn path() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("xses").join("issues.jsonl"))
 }
 

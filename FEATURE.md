@@ -31,7 +31,9 @@ Projections each target's own UI reads:
 
 - claude: `custom-title.json` sidecar (picker row) + uuid parent chain.
 - codex: `thread_items` rows — `userMessage`, `agentMessage`, `commandExecution`
-  (shell calls, with `aggregatedOutput` so the TUI shows output), `contextCompaction`.
+  (shell calls, with `aggregatedOutput` so the TUI shows output),
+  `fileChange` (patch calls, with per-file kind and diff), `mcpToolCall`
+  (server, tool, arguments, status and output), `imageView`, `contextCompaction`.
 - pi / omp: `session_info` (picker name), `parentId` chain, `title` record.
 - opencode: message parts as stored, `session.slug = xses-<id>`.
 
@@ -47,8 +49,11 @@ Projections each target's own UI reads:
 - **Injected context** (AGENTS.md, environment, reminders) is text everywhere:
   opencode rejects `role: "system"` on import (verified), so it rides as
   assistant text there.
-- **Non-shell tools in codex's projection** render as text; the rollout still
-  holds their `function_call`/`function_call_output` items.
+- **Non-shell tools in codex's projection** use codex's own item types where it
+  has one (patch calls become `fileChange` with the diff taken from the call's
+  arguments, MCP calls `mcpToolCall`, `view_image` an `imageView`); a tool with
+  no native item, and any patch whose result failed, renders as a command row.
+  The rollout keeps every `function_call`/`function_call_output` either way.
 - **Attachments carry what the source embedded**: claude's `file` rows hold the
   text it read (`content.file.content` with its line range) or an image
   payload, and that is what transfers. A bare path still inlines an on-disk

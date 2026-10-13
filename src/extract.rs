@@ -285,6 +285,9 @@ fn parse_record(line_no: usize, line: &str, out: &mut Events) -> Option<Value> {
 
 fn claude(path: &Path) -> Result<Vec<Event>> {
     let mut out = Events::default();
+    // Dedupes repeated meta injections (claude re-sends the same skill body on
+    // every turn it applies to).
+    let mut seen_meta: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (line_no, line) in lines(path)?.enumerate() {
         let line = line?;
         if line.trim().is_empty() {
@@ -294,13 +297,31 @@ fn claude(path: &Path) -> Result<Vec<Event>> {
             continue;
         };
         let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        // Sidechain (subagent) rows and meta rows are not part of the
-        // resumable transcript; they stay in the source.
-        if v.get("isMeta").and_then(|b| b.as_bool()).unwrap_or(false)
-            || v.get("isSidechain")
-                .and_then(|b| b.as_bool())
-                .unwrap_or(false)
+        // Sidechain (subagent) rows are a different conversation: carrying
+        // them would present someone else's turns as this transcript's, so
+        // they stay in the source.
+        if v.get("isSidechain")
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false)
         {
+            continue;
+        }
+        // Meta rows are injections claude made itself (skill bodies, local
+        // command output). They are context the model read, so they transfer
+        // as context — once: the same injection repeats on every later turn,
+        // and one copy is the whole information.
+        if v.get("isMeta").and_then(|b| b.as_bool()).unwrap_or(false) {
+            if let Some(text) = v.pointer("/message/content").and_then(text_of) {
+                let text = text.trim();
+                if !text.is_empty() && seen_meta.insert(text.to_string()) {
+                    out.boundary();
+                    out.push(Context {
+                        kind: "meta".into(),
+                        text: Some(text.to_string()),
+                        path: None,
+                    });
+                }
+            }
             continue;
         }
         match t {
@@ -1401,6 +1422,37 @@ mod tests {
             }
             other => panic!("want Context, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn meta_injections_transfer_once() {
+        let skill = json!({
+            "type": "user",
+            "isMeta": true,
+            "message": {"role": "user", "content": [{"type": "text", "text": "# Omarchy Skill\nhow to use it"}]}
+        });
+        let turn = json!({
+            "type": "user",
+            "message": {"role": "user", "content": "do the thing"}
+        });
+        // same injection twice, then a real turn
+        let events = claude_rows(&[skill.clone(), skill.clone(), turn.clone()]);
+        let contexts: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match &e.block {
+                Block::Context { kind, text, .. } if kind == "meta" => text.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(contexts.len(), 1, "one copy of a repeated injection");
+        assert!(contexts[0].contains("Omarchy Skill"), "{:?}", contexts[0]);
+        assert!(
+            !claude_rows(&[turn]).iter().any(|e| matches!(
+                &e.block,
+                Block::Context { kind, .. } if kind == "meta"
+            )),
+            "ordinary turns stay ordinary"
+        );
     }
 
     #[test]

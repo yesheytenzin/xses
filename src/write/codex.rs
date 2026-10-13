@@ -149,7 +149,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
     }
 
     // Pending shell calls, so a result can complete its item.
-    let mut pending: Vec<(Option<String>, String, String)> = Vec::new();
+    let mut pending: Vec<(Option<String>, String, ThreadTool)> = Vec::new();
     for (_, blocks) in session.grouped() {
         for block in &blocks {
             match block {
@@ -232,13 +232,11 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                             "arguments": args,
                         })
                     };
-                    let command = shell_command(args, name);
-                    pending.push((Some(id.clone()), name.clone(), command.clone()));
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload,
-                        thread: Some((
-                            "commandExecution".into(),
+                    let tool = classify_tool(name, args);
+                    pending.push((Some(id.clone()), name.clone(), tool.clone()));
+                    let thread = match &tool {
+                        ThreadTool::Shell(command) => (
+                            "commandExecution",
                             json!({
                                 "type": "commandExecution",
                                 "id": id,
@@ -250,7 +248,34 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                                 "durationMs": null,
                                 "source": "xses-import",
                             }),
-                        )),
+                        ),
+                        // codex's TUI draws a patch as a file change, not as a
+                        // command; the diff lives in the call's arguments.
+                        ThreadTool::FileChange(changes) => (
+                            "fileChange",
+                            json!({"type": "fileChange", "id": id, "changes": changes}),
+                        ),
+                        ThreadTool::Mcp { server, tool } => (
+                            "mcpToolCall",
+                            json!({
+                                "type": "mcpToolCall",
+                                "id": id,
+                                "server": server,
+                                "tool": tool,
+                                "status": "in_progress",
+                                "arguments": serde_json::from_str::<Value>(args).unwrap_or(Value::Null),
+                                "result": null,
+                            }),
+                        ),
+                        ThreadTool::ImageView(path) => (
+                            "imageView",
+                            json!({"type": "imageView", "id": id, "path": path}),
+                        ),
+                    };
+                    out.push(Item {
+                        wrapper: "response_item",
+                        payload,
+                        thread: Some((thread.0.to_string(), thread.1)),
                         item_id: id,
                     });
                 }
@@ -291,17 +316,35 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                             "output": output,
                         })
                     };
-                    let command = pending
+                    let tool = pending
                         .iter()
                         .rev()
-                        .find(|(c, _, _)| c.as_deref() == Some(&id))
-                        .map(|(_, _, cmd)| cmd.clone())
-                        .unwrap_or_else(|| name.clone());
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload: wrapper_payload,
-                        thread: Some((
-                            "commandExecution".into(),
+                        .find(|(c, n, _)| *n == *name && (c.as_deref() == Some(&id) || c.is_none()))
+                        .map(|(_, _, t)| t.clone())
+                        .unwrap_or_else(|| classify_tool(name, ""));
+                    let command = match &tool {
+                        ThreadTool::Shell(command) => command.clone(),
+                        _ => name.clone(),
+                    };
+                    // A successful patch already rendered as the file change
+                    // itself; only its failure needs a row of its own.
+                    let thread = match &tool {
+                        ThreadTool::FileChange(_) if !*is_error => None,
+                        ThreadTool::ImageView(_) => None,
+                        ThreadTool::Mcp { server, tool: mcp } => Some((
+                            "mcpToolCall".to_string(),
+                            json!({
+                                "type": "mcpToolCall",
+                                "id": id,
+                                "server": server,
+                                "tool": mcp,
+                                "status": if *is_error { "failed" } else { "completed" },
+                                "arguments": Value::Null,
+                                "result": {"content": [{"type": "text", "text": output}]},
+                            }),
+                        )),
+                        _ => Some((
+                            "commandExecution".to_string(),
                             json!({
                                 "type": "commandExecution",
                                 "id": id,
@@ -314,6 +357,11 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                                 "source": "xses-import",
                             }),
                         )),
+                    };
+                    out.push(Item {
+                        wrapper: "response_item",
+                        payload: wrapper_payload,
+                        thread,
                         item_id: id,
                     });
                 }
@@ -485,6 +533,124 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
 }
 
 /// The command a shell-ish tool actually ran, for the projection row.
+#[derive(Clone)]
+/// How a tool call shows up in codex's own transcript projection. codex only
+/// renders a shell string for `commandExecution`; edits, MCP calls and image
+/// views have their own item types, which is what its TUI draws.
+enum ThreadTool {
+    Shell(String),
+    FileChange(Vec<Value>),
+    Mcp { server: String, tool: String },
+    ImageView(PathBuf),
+}
+
+fn classify_tool(name: &str, args: &str) -> ThreadTool {
+    let lower = name.to_ascii_lowercase();
+    if let Some(rest) = lower.strip_prefix("mcp__") {
+        let (server, tool) = rest.split_once("__").unwrap_or(("mcp", rest));
+        return ThreadTool::Mcp {
+            server: name
+                .get("mcp__".len()..)
+                .and_then(|r| r.split_once("__").map(|(s, _)| s))
+                .unwrap_or(server)
+                .to_string(),
+            tool: name
+                .rsplit_once("__")
+                .map(|(_, t)| t)
+                .unwrap_or(tool)
+                .to_string(),
+        };
+    }
+    let parsed: Option<Value> = serde_json::from_str(args).ok();
+    let field = |keys: &[&str]| -> Option<String> {
+        keys.iter().find_map(|k| {
+            parsed
+                .as_ref()
+                .and_then(|v| v.get(*k))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+    };
+    if matches!(
+        lower.as_str(),
+        "view_image" | "viewimage" | "image_view" | "read_image"
+    ) {
+        if let Some(path) = field(&["file_path", "path", "filePath", "filename"]) {
+            return ThreadTool::ImageView(PathBuf::from(path));
+        }
+    }
+    if lower == "apply_patch" || lower == "patch" {
+        let text = field(&["patch", "input", "content"]).unwrap_or_else(|| args.to_string());
+        let changes = patch_changes(&text);
+        if !changes.is_empty() {
+            return ThreadTool::FileChange(changes);
+        }
+    }
+    if matches!(
+        lower.as_str(),
+        "write"
+            | "create_file"
+            | "save_file"
+            | "edit"
+            | "multiedit"
+            | "str_replace"
+            | "str_replace_editor"
+            | "notebookedit"
+            | "notebook_edit"
+    ) {
+        if let Some(path) = field(&["file_path", "path", "filePath"]) {
+            let diff = field(&["content", "new_string", "new_str"]).unwrap_or_default();
+            // Whether the file was created or rewritten is not knowable from
+            // the call alone, so the change is an update; codex's own patches
+            // report `add` only because it applies them itself.
+            return ThreadTool::FileChange(vec![json!({
+                "path": path,
+                "kind": {"type": "update"},
+                "diff": diff,
+            })]);
+        }
+    }
+    ThreadTool::Shell(shell_command(args, name))
+}
+
+/// Paths, kinds and bodies from a codex `apply_patch` body.
+fn patch_changes(text: &str) -> Vec<Value> {
+    let mut out: Vec<Value> = Vec::new();
+    let mut current: Option<(String, String, Vec<String>)> = None;
+    let flush = |out: &mut Vec<Value>, cur: Option<(String, String, Vec<String>)>| {
+        if let Some((path, kind, lines)) = cur {
+            out.push(json!({
+                "path": path,
+                "kind": {"type": kind},
+                "diff": lines.join("\n"),
+            }));
+        }
+    };
+    for line in text.lines() {
+        let marker = ["*** Add File: ", "*** Update File: ", "*** Delete File: "]
+            .iter()
+            .find_map(|m| line.strip_prefix(m).map(|rest| (*m, rest.trim())));
+        match marker {
+            Some((m, path)) => {
+                flush(&mut out, current.take());
+                let kind = match m {
+                    "*** Add File: " => "add",
+                    "*** Delete File: " => "delete",
+                    _ => "update",
+                };
+                current = Some((path.to_string(), kind.to_string(), Vec::new()));
+            }
+            None => {
+                if let Some((_, _, lines)) = current.as_mut() {
+                    lines.push(line.to_string());
+                }
+            }
+        }
+    }
+    flush(&mut out, current.take());
+    out
+}
+
 fn shell_command(args: &str, fallback: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(args) {
         for key in ["command", "cmd", "script", "code"] {
@@ -818,6 +984,101 @@ mod tests {
             .expect("completed execution row");
         assert_eq!(ce.1["status"], "completed");
         assert_eq!(ce.1["durationMs"], 12);
+    }
+
+    #[test]
+    fn tool_calls_project_as_codex_native_items() {
+        let s = test_session(vec![
+            Event {
+                msg: 0,
+                block: Block::ToolCall {
+                    name: "apply_patch".into(),
+                    args: r#"{"patch":"*** Begin Patch\n*** Update File: /tmp/a.py\n@@\n-x = 1\n+x = 2\n*** Add File: /tmp/b.py\n+print(1)\n*** End Patch"}"#.into(),
+                    call_id: Some("c1".into()),
+                    status: None,
+                },
+            },
+            Event {
+                msg: 1,
+                block: Block::ToolResult {
+                    name: "apply_patch".into(),
+                    output: "Done!".into(),
+                    call_id: Some("c1".into()),
+                    is_error: false,
+                    duration_ms: None,
+                },
+            },
+            Event {
+                msg: 2,
+                block: Block::ToolCall {
+                    name: "mcp__cua_repl__js".into(),
+                    args: r#"{"code":"1+1"}"#.into(),
+                    call_id: Some("c2".into()),
+                    status: None,
+                },
+            },
+            Event {
+                msg: 3,
+                block: Block::ToolResult {
+                    name: "mcp__cua_repl__js".into(),
+                    output: "2".into(),
+                    call_id: Some("c2".into()),
+                    is_error: false,
+                    duration_ms: None,
+                },
+            },
+            Event {
+                msg: 4,
+                block: Block::ToolCall {
+                    name: "view_image".into(),
+                    args: r#"{"path":"/tmp/shot.png"}"#.into(),
+                    call_id: Some("c3".into()),
+                    status: None,
+                },
+            },
+            Event {
+                msg: 5,
+                block: Block::ToolCall {
+                    name: "bash".into(),
+                    args: r#"{"command":"ls"}"#.into(),
+                    call_id: Some("c4".into()),
+                    status: None,
+                },
+            },
+        ]);
+        let items = rollout_items(&s);
+        let by_type = |t: &str| -> Vec<&Value> {
+            items
+                .iter()
+                .filter_map(|i| i.thread.as_ref())
+                .filter(|(kind, _)| kind == t)
+                .map(|(_, j)| j)
+                .collect()
+        };
+        // A patch is a file change with both files, kinds and bodies.
+        let changes = &by_type("fileChange")[0]["changes"];
+        assert_eq!(changes.as_array().map(Vec::len), Some(2), "{changes}");
+        assert_eq!(changes[0]["kind"]["type"], "update");
+        assert_eq!(changes[0]["path"], "/tmp/a.py");
+        assert!(changes[0]["diff"].as_str().unwrap_or("").contains("+x = 2"));
+        assert_eq!(changes[1]["kind"]["type"], "add");
+        assert_eq!(changes[1]["path"], "/tmp/b.py");
+        // Its successful result adds nothing; the diff is the result.
+        assert_eq!(by_type("fileChange").len(), 1);
+        assert_eq!(by_type("commandExecution").len(), 1, "only the shell call");
+
+        // MCP: server, tool, arguments at the call, status and output after.
+        let mcp = by_type("mcpToolCall");
+        assert_eq!(mcp.len(), 2, "call row plus completed row");
+        assert_eq!(mcp[0]["server"], "cua_repl");
+        assert_eq!(mcp[0]["tool"], "js");
+        assert_eq!(mcp[0]["arguments"]["code"], "1+1");
+        assert_eq!(mcp[1]["status"], "completed");
+        assert_eq!(mcp[1]["result"]["content"][0]["text"], "2");
+
+        // An image view keeps codex's own item type and path.
+        let view = by_type("imageView");
+        assert_eq!(view[0]["path"], "/tmp/shot.png");
     }
 
     #[test]

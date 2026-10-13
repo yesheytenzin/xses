@@ -55,6 +55,15 @@ Projections each target's own UI reads:
   image within the cap; anything else arrives as a labelled note naming the
   file.
 
+## Not carried, by design
+
+claude rows flagged `isMeta` (skill bodies and local-command output claude
+injects itself — 68 in the store checked) and rows flagged `isSidechain` (a
+subagent's own conversation) are skipped: neither is a turn of this
+transcript, and every target injects its own context on resume, so carrying
+claude's private injections would present machinery as history. They stay in
+the source file and are not counted as gaps.
+
 ## Impossible
 
 | Data class | Why |

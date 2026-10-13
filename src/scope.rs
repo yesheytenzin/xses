@@ -49,6 +49,15 @@ pub fn noise_tally(sessions: &[Session]) -> Vec<(&'static str, usize)> {
     out
 }
 
+/// Render a tally as `"2 empty, 1 failed"` for status lines.
+pub fn format_noise(tally: &[(&'static str, usize)]) -> String {
+    tally
+        .iter()
+        .map(|(k, n)| format!("{n} {k}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Effective row cap. An explicit `-n` always wins (`-n 0` = no cap);
 /// `--all` only drops the default cap, widening the view to every project.
 pub fn limit(all: bool, requested: Option<usize>) -> Option<usize> {
@@ -65,6 +74,43 @@ pub fn capped(mut sessions: Vec<Session>, cap: Option<usize>) -> Vec<Session> {
         sessions.truncate(n);
     }
     sessions
+}
+
+/// Apply `--scope last:N`: keep only the trailing N user turns (plus
+/// everything after the Nth-from-last user message).
+pub fn last_n(
+    mut session: crate::canonical::CanonicalSession,
+    n: usize,
+) -> crate::canonical::CanonicalSession {
+    use crate::canonical::Block;
+    let users: Vec<usize> = session
+        .events
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| match &e.block {
+            Block::Text {
+                role: crate::canonical::Role::User,
+                ..
+            } => Some(i),
+            _ => None,
+        })
+        .collect();
+    let keep_from = if n == 0 || users.is_empty() {
+        None
+    } else if n >= users.len() {
+        return session;
+    } else {
+        Some(users[users.len() - n])
+    };
+    match keep_from {
+        Some(start) => {
+            session.events.drain(..start);
+        }
+        None => session.events.clear(),
+    }
+    let retained: std::collections::HashSet<_> = session.events.iter().map(|e| e.msg).collect();
+    session.msg_times.retain(|msg, _| retained.contains(msg));
+    session
 }
 
 #[cfg(test)]

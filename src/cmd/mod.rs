@@ -85,13 +85,8 @@ fn export_path(base: &Path, fmt: &str, session: &Session, disambiguate: bool) ->
         .file_stem()
         .and_then(|s| s.to_str())
         .unwrap_or("export");
-    let id: String = session
-        .id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(24)
-        .collect();
-    let id = if id.is_empty() { "session" } else { &id };
+    let slug = crate::model::slug_id(&session.id, 24);
+    let id = if slug.is_empty() { "session".into() } else { slug };
     parent.join(format!("{stem}.{}-{id}.{fmt}", session.tool.as_str()))
 }
 
@@ -112,7 +107,7 @@ fn select_bulk_sources(
             .collect());
     };
     let mut selected = Vec::new();
-    for tool in Tool::write_targets() {
+    for tool in Tool::all_tools() {
         let mut per_tool: Vec<Session> = sessions
             .iter()
             .filter(|s| s.tool == *tool && (include_imports || !s.is_import))

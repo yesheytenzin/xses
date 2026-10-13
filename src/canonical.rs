@@ -406,38 +406,6 @@ impl LossReport {
     }
 }
 
-/// Apply `--scope last:N`: keep only the trailing N user turns (plus
-/// everything after the Nth-from-last user message).
-pub fn scope_last_n(mut session: CanonicalSession, n: usize) -> CanonicalSession {
-    let users: Vec<usize> = session
-        .events
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| match &e.block {
-            Block::Text {
-                role: Role::User, ..
-            } => Some(i),
-            _ => None,
-        })
-        .collect();
-    let keep_from = if n == 0 || users.is_empty() {
-        None
-    } else if n >= users.len() {
-        return session;
-    } else {
-        Some(users[users.len() - n])
-    };
-    match keep_from {
-        Some(start) => {
-            session.events.drain(..start);
-        }
-        None => session.events.clear(),
-    }
-    let retained: std::collections::HashSet<_> = session.events.iter().map(|e| e.msg).collect();
-    session.msg_times.retain(|msg, _| retained.contains(msg));
-    session
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -576,8 +544,107 @@ mod tests {
                 },
             ),
         ]);
-        let scoped = scope_last_n(s, 1);
+        let scoped = crate::scope::last_n(s, 1);
         assert_eq!(scoped.events.len(), 3);
         assert!(matches!(&scoped.events[1].block, Block::Thinking { .. }));
+    }
+
+    #[test]
+    fn text_flattening_still_labels_history() {
+        let s = session(vec![ev(
+            0,
+            Block::ToolResult {
+                name: "bash".into(),
+                output: "ok".into(),
+                call_id: None,
+                is_error: false,
+                duration_ms: None,
+            },
+        )]);
+        let (msgs, report) = s.messages();
+        assert!(msgs[0].1.contains("transcript, not live"));
+        assert_eq!(report.normalized, 1);
+    }
+
+    #[test]
+    fn gaps_render_in_place_as_system_markers() {
+        let s = session(vec![
+            ev(
+                0,
+                Block::Text {
+                    role: Role::User,
+                    text: "before".into(),
+                },
+            ),
+            ev(
+                1,
+                Block::Gap {
+                    kind: "image".into(),
+                    detail: "image attachment not carried over".into(),
+                },
+            ),
+            ev(
+                2,
+                Block::Text {
+                    role: Role::User,
+                    text: "after".into(),
+                },
+            ),
+        ]);
+        let (msgs, report) = s.messages();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[1].0, Role::System);
+        assert!(msgs[1].1.contains("[gap in imported history:"));
+        assert_eq!(report.dropped, 1);
+        assert_eq!(s.gap_kinds(), vec!["image".to_string()]);
+    }
+
+    #[test]
+    fn empty_thinking_flattens_to_nothing() {
+        let s = session(vec![
+            ev(
+                0,
+                Block::Text {
+                    role: Role::User,
+                    text: "hi".into(),
+                },
+            ),
+            ev(
+                1,
+                Block::Thinking {
+                    text: "".into(),
+                    signature: None,
+                },
+            ),
+        ]);
+        let (msgs, report) = s.messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(report.downgraded, 0);
+    }
+
+    #[test]
+    fn fidelity_tally_counts_each_block() {
+        let s = session(vec![
+            ev(
+                0,
+                Block::Text {
+                    role: Role::User,
+                    text: "hi".into(),
+                },
+            ),
+            ev(
+                1,
+                Block::Image {
+                    mime: Some("image/png".into()),
+                    data: Some("qq==".into()),
+                    path: None,
+                    bytes: 3,
+                },
+            ),
+        ]);
+        let (_, report) = s.messages();
+        assert_eq!(report.preserved, 1);
+        assert_eq!(report.downgraded, 1);
+        let _ = Fidelity::Preserved;
     }
 }

@@ -6,7 +6,7 @@
 //! events — while the TUI projection (`thread_items`) uses the item types the
 //! picker renders: `userMessage`, `agentMessage`, `commandExecution`,
 //! `contextCompaction`.
-use super::{iso, iso_stamp, manifest, push, synth_id};
+use super::{fallback_text, iso, iso_stamp, manifest, next_row_time, push, synth_id};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::fs;
@@ -143,11 +143,11 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                 "type": "message",
                 "id": id,
                 "role": "developer",
-                "content": [{"type": "input_text", "text": super::pi::IMPORT_NOTE}],
+                "content": [{"type": "input_text", "text": super::IMPORT_NOTE}],
             }),
             thread: Some((
                 "agentMessage".into(),
-                json!({"type": "agentMessage", "id": id, "text": super::pi::IMPORT_NOTE}),
+                json!({"type": "agentMessage", "id": id, "text": super::IMPORT_NOTE}),
             )),
             item_id: id,
             ts: None,
@@ -159,11 +159,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
     let mut ids = super::TargetIds::default();
     let mut prev_ts = session.created;
     for (m, blocks) in session.grouped() {
-        let group_ts = match session.msg_times.get(&m).copied() {
-            Some(ts) if ts > prev_ts => ts,
-            _ => prev_ts + chrono::Duration::milliseconds(1),
-        };
-        prev_ts = group_ts;
+        let group_ts = next_row_time(session, m, &mut prev_ts);
         for block in &blocks {
             match block {
                 Block::Text { role, text, .. } => {
@@ -430,13 +426,9 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                         ts: Some(group_ts),
                     });
                 }
-                Block::Context { kind, text, path } => {
+                Block::Context { .. } => {
                     let id = mint("ctx_", &mut n);
-                    let body = text
-                        .clone()
-                        .or_else(|| path.as_ref().map(|p| p.display().to_string()))
-                        .unwrap_or_default();
-                    let text = format!("[context: {kind}]\n{body}");
+                    let text = fallback_text(block).unwrap_or_default();
                     out.push(Item {
                         wrapper: "response_item",
                         payload: json!({
@@ -453,18 +445,9 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                         ts: Some(group_ts),
                     });
                 }
-                Block::Patch { files, .. } => {
+                Block::Patch { .. } => {
                     let id = mint("patch_", &mut n);
-                    let text = format!(
-                        "[patch: {} file{}]\n{}",
-                        files.len(),
-                        if files.len() == 1 { "" } else { "s" },
-                        files
-                            .iter()
-                            .map(|f| f.display().to_string())
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    );
+                    let text = fallback_text(block).unwrap_or_default();
                     out.push(Item {
                         wrapper: "response_item",
                         payload: json!({
@@ -481,9 +464,9 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                         ts: Some(group_ts),
                     });
                 }
-                Block::Compressed { text } => {
+                Block::Compressed { .. } => {
                     let id = mint("cmp_", &mut n);
-                    let text = format!("[compaction]\n{text}");
+                    let text = fallback_text(block).unwrap_or_default();
                     out.push(Item {
                         wrapper: "response_item",
                         payload: json!({
@@ -533,9 +516,9 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                         ts: Some(group_ts),
                     });
                 }
-                Block::Gap { detail, .. } => {
+                Block::Gap { .. } => {
                     let id = mint("gap_", &mut n);
-                    let text = format!("[gap in imported history: {detail}]");
+                    let text = fallback_text(block).unwrap_or_default();
                     out.push(Item {
                         wrapper: "response_item",
                         payload: json!({

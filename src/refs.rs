@@ -1,12 +1,10 @@
-//! Resolve a source store reference to a `CanonicalSession`.
+//! Resolve a source store reference to a session.
 //!
 //! Accepts: `latest`, `latest:N`, tool name, tool:id, tool:last, or a session
 //! short-id prefix. Falls back to scanning.
 #![allow(clippy::items_after_test_module)]
-use crate::canonical::CanonicalSession;
 use crate::model::{Session, Tool};
 use anyhow::{Context, Result};
-use std::path::Path;
 
 #[derive(Debug, Clone)]
 pub enum Ref {
@@ -228,13 +226,7 @@ mod tests {
     }
 }
 
-/// Turn a discovered session into its IR.
-pub fn canonicalize(s: &Session, _path: &Path) -> Result<CanonicalSession> {
-    let mut canon = crate::extract::extract(s.tool, &s.id, &s.cwd, s.created, &s.path)?;
-    canon.title = Some(s.summary.clone()).filter(|t| !t.trim().is_empty());
-    Ok(canon)
-}
-
+/// Session picking lives here (IR building is `extract::canonicalize`).
 /// Pick a session from the discovered list by ref.
 pub fn select(sessions: &[Session], r: Ref) -> anyhow::Result<&Session> {
     match r {

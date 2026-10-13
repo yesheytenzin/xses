@@ -62,7 +62,7 @@ fn stores(all: bool) -> anyhow::Result<()> {
     );
     let filter = scope::filter(all);
     let mut shown = 0;
-    for tool in Tool::write_targets() {
+    for tool in Tool::all_tools() {
         // Only installed agents: an agent nobody can resume in has no store
         // worth reporting, and its reader cannot run.
         if !on_path(resume_binary(*tool)) {
@@ -87,11 +87,7 @@ fn stores(all: bool) -> anyhow::Result<()> {
             rows.len(),
             imports,
             if noise.is_empty() { "" } else { " | hidden: " },
-            noise
-                .iter()
-                .map(|(k, n)| format!("{n} {k}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            scope::format_noise(&noise)
         );
     }
     if shown == 0 {
@@ -107,60 +103,41 @@ fn imports() -> anyhow::Result<()> {
     println!("\nimports");
     println!("  index     {}", path.display());
     println!("  recorded  {} source sessions", sources.len());
-    println!("  artifacts {}", recorded_artifacts()?);
-    let stale = stale_artifacts()?;
+    let (artifacts, stale) = artifact_health()?;
+    println!("  artifacts {artifacts}");
     if stale > 0 {
         println!("  stale     {stale} index records point at missing artifacts");
     }
     Ok(())
 }
 
-fn index_lines() -> anyhow::Result<Vec<String>> {
+/// One pass over the index: recorded artifacts, and how many point at
+/// artifacts that no longer exist.
+fn artifact_health() -> anyhow::Result<(usize, usize)> {
     let p = index::path()?;
     if !p.exists() {
-        return Ok(Vec::new());
+        return Ok((0, 0));
     }
     use std::io::BufRead;
-    Ok(std::io::BufReader::new(std::fs::File::open(p)?)
+    let mut recorded = 0;
+    let mut stale = 0;
+    for line in std::io::BufReader::new(std::fs::File::open(p)?)
         .lines()
         .map_while(Result::ok)
-        .collect())
-}
-
-fn recorded_artifacts() -> anyhow::Result<usize> {
-    let mut n = 0;
-    for line in index_lines()? {
-        if let Some((_, paths)) = line.split_once('\t') {
-            n += serde_json::from_str::<Vec<String>>(paths)
-                .map(|v| v.len())
-                .unwrap_or_else(|_| paths.split(',').filter(|s| !s.is_empty()).count());
-        }
-    }
-    Ok(n)
-}
-
-fn stale_artifacts() -> anyhow::Result<usize> {
-    let mut stale = 0;
-    for line in index_lines()? {
+    {
         let Some((_, paths)) = line.split_once('\t') else {
             continue;
         };
-        let Ok(paths) = serde_json::from_str::<Vec<String>>(paths) else {
-            continue;
-        };
-        for path in paths {
-            if let Some(id) = path.strip_prefix("opencode://") {
-                if id.is_empty() {
-                    stale += 1;
-                }
-                continue;
-            }
-            if !Path::new(&path).exists() {
-                stale += 1;
-            }
+        for path in crate::index::decode_paths(paths) {
+            recorded += 1;
+            let missing = match path.strip_prefix("opencode://") {
+                Some(id) => id.is_empty(),
+                None => !Path::new(&path).exists(),
+            };
+            stale += usize::from(missing);
         }
     }
-    Ok(stale)
+    Ok((recorded, stale))
 }
 
 /// Recent failures from the journal (the newest `limit`), one line each: the
@@ -184,9 +161,9 @@ fn issues(limit: usize) {
             crate::ansi::strip(&issue.subject)
         );
         let budget = width.saturating_sub(head.chars().count()).max(24);
-        let detail = collapse(&crate::ansi::strip(&issue.detail));
-        let (line, truncated) = clip(&detail, budget);
-        cut |= truncated;
+        let detail = crate::text::collapse(&crate::ansi::strip(&issue.detail));
+        let line = crate::text::shorten(&detail, budget);
+        cut |= line != detail;
         println!("{head}{line}");
     }
     if cut {
@@ -194,20 +171,6 @@ fn issues(limit: usize) {
             println!("  (full text: {})", path.display());
         }
     }
-}
-
-/// One line: runs of whitespace (newlines included) become single spaces.
-fn collapse(s: &str) -> String {
-    s.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-/// Cut to `width` characters, marking the cut. Returns whether it cut.
-fn clip(s: &str, width: usize) -> (String, bool) {
-    if s.chars().count() <= width {
-        return (s.to_string(), false);
-    }
-    let kept: String = s.chars().take(width.saturating_sub(1)).collect();
-    (format!("{}…", kept.trim_end()), true)
 }
 
 /// Line budget: the terminal's width, capped so one issue still reads as one
@@ -221,23 +184,15 @@ fn report_width() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn issue_details_become_one_short_line() {
-        assert_eq!(collapse("a\n b\t\tc "), "a b c");
-        let sql = "exit status: 1 Error: Unexpected error | | Failed query: insert into \"message\" (\"id\", \"session_id\", \"time_created\", \"time_updated\", \"data\") values (?, ?, ?, ?, ?) on conflict do nothing | params: msg_000000-JpjBgqGMuMlfThIb3k8pbhJ3,ses_2072fc640e2442358c9d0e242072fc64,1791911116704";
-        let (line, cut) = clip(&collapse(sql), 80);
-        assert!(cut, "long details must be cut");
-        assert!(
-            line.chars().count() <= 80,
-            "line must fit the budget: {} chars",
-            line.chars().count()
-        );
-        assert!(line.chars().count() >= 78, "not a stub: {line}");
+        let sql = "exit status: 1 Error: Unexpected error | | Failed query: insert into \"message\"";
+        let line = crate::text::shorten(&crate::text::collapse(sql), 40);
+        assert!(line.chars().count() <= 40, "{line}");
         assert!(line.ends_with('…'), "{line}");
-        let (short, cut) = clip("exit status: 1", 80);
-        assert!(!cut);
-        assert_eq!(short, "exit status: 1");
+        assert_eq!(
+            crate::text::shorten("exit status: 1", 80),
+            "exit status: 1"
+        );
     }
 }

@@ -1,6 +1,6 @@
 //! Incremental JSONL summaries. Only complete records are checkpointed; a
 //! trailing partial line is retried when its writer appends the remainder.
-use super::{display_title, looks_like_error, marker_source, noise_reason, prefixed_title_source};
+use super::{display_title, looks_like_error, marker_tool, noise_reason, prefixed_title_source};
 use crate::{
     extract::text_of,
     model::{Session, Tool},
@@ -91,7 +91,7 @@ impl State {
             ("user", Some(text)) => {
                 self.users += 1;
                 if self.first_user.is_none() && (!skip_tagged_user || !text.starts_with('<')) {
-                    self.first_user = Some(super::truncate(&text, 120));
+                    self.first_user = Some(crate::text::shorten(&text, 120));
                 }
             }
             ("assistant", Some(text)) => {
@@ -120,8 +120,8 @@ impl State {
             }
         }
         self.imported |= v.get("xses").is_some() || v.get("sessionizer").is_some();
-        self.source = marker_source(v, "/xses/source")
-            .or_else(|| marker_source(v, "/sessionizer/source"))
+        self.source = marker_tool(v, "/xses/source")
+            .or_else(|| marker_tool(v, "/sessionizer/source"))
             .or(self.source);
         let kind = v.get("type").and_then(Value::as_str).unwrap_or_default();
         if matches!(kind, "summary" | "last-prompt") {
@@ -161,8 +161,8 @@ impl State {
                     v.pointer("/payload/cli_version").and_then(Value::as_str),
                     Some("0.0.0-xses" | "0.0.0-sessionizer")
                 );
-                self.source = marker_source(v, "/payload/xses/source")
-                    .or_else(|| marker_source(v, "/payload/sessionizer/source"));
+                self.source = marker_tool(v, "/payload/xses/source")
+                    .or_else(|| marker_tool(v, "/payload/sessionizer/source"));
             }
             Some("response_item")
                 if v.pointer("/payload/type").and_then(Value::as_str) == Some("message") =>
@@ -196,8 +196,8 @@ impl State {
                     .unwrap_or_default()
                     .into();
                 self.imported |= v.get("xses").is_some() || v.get("sessionizer").is_some();
-                self.source = marker_source(v, "/xses/source")
-                    .or_else(|| marker_source(v, "/sessionizer/source"))
+                self.source = marker_tool(v, "/xses/source")
+                    .or_else(|| marker_tool(v, "/sessionizer/source"))
                     .or(self.source);
             }
             Some("title") => {
@@ -206,7 +206,7 @@ impl State {
                     .and_then(Value::as_str)
                     .filter(|s| !s.trim().is_empty())
                 {
-                    self.title = Some(super::truncate(title, 120));
+                    self.title = Some(crate::text::shorten(title, 120));
                     if matches!(
                         v.get("source").and_then(Value::as_str),
                         Some("xses" | "sessionizer")

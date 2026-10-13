@@ -3,7 +3,10 @@
 //! Emits claude's own content blocks: `thinking`, `text`, `tool_use`, and
 //! `tool_result` (the latter in a `user` row, as claude does), plus image
 //! blocks for inline pictures and per-message `usage`.
-use super::{group_role, iso, manifest, push, synth_id};
+use super::{
+    args_json, fallback_text, group_role, iso, manifest, next_row_time, push, synth_id,
+    usage_of, uuid_like,
+};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -66,7 +69,7 @@ fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(Pa
             &mut buf,
             &json!({
                 "type": "system",
-                "message": {"role": "system", "content": super::pi::IMPORT_NOTE},
+                "message": {"role": "system", "content": super::IMPORT_NOTE},
                 "uuid": uuid,
                 "parentUuid": parent,
                 "timestamp": iso(&session.created),
@@ -87,11 +90,7 @@ fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(Pa
     // its result keep the same value.
     let mut ids = super::TargetIds::default();
     for (m, blocks) in session.grouped() {
-        let row_ts = match session.msg_times.get(&m).copied() {
-            Some(ts) if ts > prev_ts => ts,
-            _ => prev_ts + chrono::Duration::milliseconds(1),
-        };
-        prev_ts = row_ts;
+        let row_ts = next_row_time(session, m, &mut prev_ts);
         let role = group_role(&blocks, Role::Assistant);
         let mut content: Vec<Value> = Vec::new();
         let mut results: Vec<Value> = Vec::new();
@@ -109,7 +108,6 @@ fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(Pa
                     call_id,
                     ..
                 } => {
-                    let input: Value = serde_json::from_str(args).unwrap_or_else(|_| json!(args));
                     content.push(json!({
                         "type": "tool_use",
                         "id": call_id
@@ -117,7 +115,7 @@ fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(Pa
                             .map(|c| ids.get(&c))
                             .unwrap_or_else(|| format!("toolu_{}", uuid_like(&sid, cursor).replace('-', ""))),
                         "name": name,
-                        "input": input,
+                        "input": args_json(args),
                     }));
                 }
                 Block::ToolResult {
@@ -137,7 +135,7 @@ fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(Pa
                     "is_error": is_error,
                     "content": [{"type": "text", "text": output}],
                 })),
-                Block::Image { mime, data, path, bytes } => match data {
+                Block::Image { mime, data, .. } => match data {
                     Some(d) => content.push(json!({
                         "type": "image",
                         "source": {
@@ -146,64 +144,36 @@ fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(Pa
                             "data": d,
                         },
                     })),
-                    None => content.push(json!({
-                        "type": "text",
-                        "text": format!(
-                            "[image reference: {} ({bytes} bytes)]",
-                            path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()))
-                        ),
-                    })),
+                    // Anything else a target cannot hold rides as labelled text.
+                    None => {
+                        if let Some(text) = fallback_text(block) {
+                            content.push(json!({"type": "text", "text": text}));
+                        }
+                    }
                 },
-                Block::Context { kind, text, path } => {
-                    let body = text
-                        .clone()
-                        .or_else(|| path.as_ref().map(|p| p.display().to_string()))
-                        .unwrap_or_default();
-                    content.push(json!({"type": "text", "text": format!("[context: {kind}]\n{body}")}));
+                Block::Context { .. }
+                | Block::Patch { .. }
+                | Block::Compressed { .. }
+                | Block::Gap { .. } => {
+                    if let Some(text) = fallback_text(block) {
+                        content.push(json!({"type": "text", "text": text}));
+                    }
                 }
-                Block::Patch { files, .. } => content.push(json!({
-                    "type": "text",
-                    "text": format!(
-                        "[patch: {} file{}]\n{}",
-                        files.len(),
-                        if files.len() == 1 { "" } else { "s" },
-                        files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join("\n")
-                    ),
-                })),
-                Block::Compressed { text } => {
-                    content.push(json!({"type": "text", "text": format!("[compaction]\n{text}")}));
-                }
-                Block::Gap { detail, .. } => content.push(json!({
-                    "type": "text",
-                    "text": format!("[gap in imported history: {detail}]"),
-                })),
                 Block::Usage { .. } => {}
             }
         }
-        let usage = blocks.iter().find_map(|b| match b {
-            Block::Usage {
-                input,
-                output,
-                reasoning,
-                cache_read,
-                cache_write,
-                ..
-            } => Some((*input, *output, *reasoning, *cache_read, *cache_write)),
-            _ => None,
-        });
+        let usage = usage_of(&blocks);
 
         if !content.is_empty() {
             let uuid = next_uuid(&mut cursor, &uuids, &sid);
             let mut message = json!({"role": super::role_str(role), "content": content});
             if matches!(role, Role::Assistant) {
-                let (input, output, reasoning, cache_read, cache_write) =
-                    usage.unwrap_or((0, 0, 0, 0, 0));
                 message["usage"] = json!({
-                    "input_tokens": input,
-                    "output_tokens": output,
-                    "cache_read_input_tokens": cache_read,
-                    "cache_creation_input_tokens": cache_write,
-                    "output_tokens_details": {"thinking_tokens": reasoning},
+                    "input_tokens": usage.input,
+                    "output_tokens": usage.output,
+                    "cache_read_input_tokens": usage.cache_read,
+                    "cache_creation_input_tokens": usage.cache_write,
+                    "output_tokens_details": {"thinking_tokens": usage.reasoning},
                 });
             }
             push(
@@ -263,25 +233,6 @@ fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(Pa
         return None;
     }
     Some((target, sidecar))
-}
-
-/// Deterministic UUID-shaped id derived from the session id + index.
-fn uuid_like(seed: &str, i: usize) -> String {
-    let mut h = [0x811c9dc5u32; 4];
-    let key = format!("{seed}:{i}");
-    for (idx, b) in key.as_bytes().iter().enumerate() {
-        let b = *b as u32;
-        h[idx % 4] ^= b;
-        h[idx % 4] = h[idx % 4].wrapping_mul(0x01000193);
-    }
-    format!(
-        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
-        h[0],
-        h[1] & 0xffff,
-        h[2] & 0xfff,
-        h[3] & 0xfff,
-        (((h[1] as u64) << 32) | h[0] as u64) & 0xffff_ffff_ffff
-    )
 }
 
 #[cfg(test)]

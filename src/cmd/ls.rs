@@ -19,7 +19,7 @@ pub fn run(
     }
     let tools = tool
         .map(|t| vec![t])
-        .unwrap_or_else(|| Tool::write_targets().to_vec());
+        .unwrap_or_else(|| Tool::all_tools().to_vec());
     let mut sessions = crate::scan::scan_tools(scope::filter(all).as_deref(), &tools, true)?;
     let hidden = scope::noise_tally(&sessions);
     if !include_noise {
@@ -52,11 +52,7 @@ pub fn run(
         println!(
             "({} hidden: {}) — pass --include-noise to see them",
             hidden.iter().map(|(_, n)| n).sum::<usize>(),
-            hidden
-                .iter()
-                .map(|(k, n)| format!("{n} {k}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            scope::format_noise(&hidden)
         );
     }
     Ok(())
@@ -66,7 +62,7 @@ pub fn run(
 /// deliberately ignores the directory scope and the row cap).
 fn counts() -> anyhow::Result<()> {
     let sessions = crate::scan::scan_all(None)?;
-    for tool in Tool::write_targets() {
+    for tool in Tool::all_tools() {
         let n = sessions.iter().filter(|s| s.tool == *tool).count();
         if n > 0 || !tool.is_cli_backed() {
             println!("{:<8} {:>4} sessions", tool.as_str(), n);
@@ -77,11 +73,7 @@ fn counts() -> anyhow::Result<()> {
         println!(
             "hidden   {:>4} not worth resuming ({})",
             noise.iter().map(|(_, n)| n).sum::<usize>(),
-            noise
-                .iter()
-                .map(|(k, n)| format!("{n} {k}"))
-                .collect::<Vec<_>>()
-                .join(", ")
+            scope::format_noise(&noise)
         );
     }
     Ok(())

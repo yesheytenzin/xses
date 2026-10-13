@@ -36,7 +36,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     } = args;
     let plan = refs::resolve_items(&items, &from, &to)?;
     let tools = if plan.from_tools.is_empty() {
-        Tool::write_targets()
+        Tool::all_tools()
     } else {
         &plan.from_tools
     };
@@ -62,14 +62,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     let mut tool_targets = refs::tool_targets(&plan.dests);
     let format_targets = refs::format_targets(&plan.dests);
     if tool_targets.is_empty() && format_targets.is_empty() && !has_refs {
-        // bare `sync`: all-to-all (sync() expands empty to write_targets)
-        tool_targets = Tool::write_targets().to_vec();
+        // bare `sync`: all-to-all (sync() expands empty to all_tools)
+        tool_targets = Tool::all_tools().to_vec();
     }
     if tool_targets.is_empty() && format_targets.is_empty() {
         for s in &sources {
-            let canon = refs::canonicalize(s, &s.path)?;
+            let canon = crate::extract::canonicalize(s)?;
             let canon = match turn_scope {
-                Some(n) => crate::canonical::scope_last_n(canon, n),
+                Some(n) => crate::scope::last_n(canon, n),
                 None => canon,
             };
             if !canon.transfer_summary().0 {
@@ -144,9 +144,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         if format_targets.is_empty() {
             break;
         }
-        let mut canon = refs::canonicalize(s, &s.path)?;
+        let mut canon = crate::extract::canonicalize(s)?;
         if let Some(n) = turn_scope {
-            canon = crate::canonical::scope_last_n(canon, n);
+            canon = crate::scope::last_n(canon, n);
         }
         if !canon.transfer_summary().0 {
             eprintln!("skip {} {}: no transferable content", s.tool.as_str(), s.id);

@@ -1,5 +1,6 @@
 //! Scan the four native session stores into unified `Session` records.
 use crate::model::{Session, Tool};
+use crate::text::shorten;
 use anyhow::{Context, Result};
 use chrono::Utc;
 use std::collections::HashSet;
@@ -8,7 +9,7 @@ use std::path::{Path, PathBuf};
 mod files;
 
 pub fn scan_all(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
-    scan_tools(cwd_filter, Tool::write_targets(), true)
+    scan_tools(cwd_filter, Tool::all_tools(), true)
 }
 
 /// Cache files are per store: a filtered scan never evicts another store.
@@ -84,19 +85,8 @@ fn looks_like_error(text: &str) -> bool {
     MARKERS.iter().any(|m| lower.starts_with(m))
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
-    let s = normalized.trim();
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max).collect();
-        format!("{cut}…")
-    }
-}
-
 fn display_title(tool: Tool, title: &str) -> String {
-    let title = truncate(title, 120);
+    let title = shorten(title, 120);
     let known_agent_prefix = ["claude", "codex", "pi", "omp"]
         .iter()
         .any(|agent| title.starts_with(&format!("[{agent}] ")));
@@ -110,7 +100,7 @@ fn display_title(tool: Tool, title: &str) -> String {
     }
 }
 
-fn marker_source(v: &serde_json::Value, pointer: &str) -> Option<Tool> {
+fn marker_tool(v: &serde_json::Value, pointer: &str) -> Option<Tool> {
     v.pointer(pointer)
         .and_then(|s| s.as_str())
         .and_then(Tool::parse)
@@ -314,10 +304,10 @@ mod tests {
     #[test]
     fn imported_marker_preserves_source_agent() {
         let marker = serde_json::json!({"xses": {"source": "claude"}});
-        assert_eq!(marker_source(&marker, "/xses/source"), Some(Tool::Claude));
+        assert_eq!(marker_tool(&marker, "/xses/source"), Some(Tool::Claude));
         assert_eq!(
             display_title(
-                marker_source(&marker, "/xses/source").unwrap_or(Tool::Pi),
+                marker_tool(&marker, "/xses/source").unwrap_or(Tool::Pi),
                 "fix the parser"
             ),
             "[claude] fix the parser"

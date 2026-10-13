@@ -12,7 +12,6 @@
 use crate::canonical::{CanonicalSession, LossReport};
 use crate::index::{Index, Record};
 use crate::model::{Session, Tool};
-use crate::refs;
 use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs;
@@ -181,7 +180,7 @@ fn clean_impl(
                 continue;
             }
             let selected = only.is_none_or(|selected| {
-                marker_source(&marker_path).is_some_and(|source| selected.contains(&source))
+                import_provenance(&marker_path).is_some_and(|source| selected.contains(&source))
                     || selection_matcher(Some(selected))(&name)
             });
             if selected {
@@ -201,7 +200,7 @@ fn clean_impl(
     Ok(paths.len())
 }
 
-fn marker_source(path: &std::path::Path) -> Option<(Tool, String)> {
+fn import_provenance(path: &std::path::Path) -> Option<(Tool, String)> {
     let head = crate::jsonl::head_bytes(path, 64 * 1024)?;
     let row: serde_json::Value = serde_json::from_str(head.lines().next()?).ok()?;
     let marker = row
@@ -252,8 +251,8 @@ fn canonicalize_batch<'a>(
             .iter()
             .map(|&source| {
                 threads.spawn(move || {
-                    let canon = refs::canonicalize(source, &source.path).map(|c| match scope {
-                        Some(n) => crate::canonical::scope_last_n(c, n),
+                    let canon = crate::extract::canonicalize(source).map(|c| match scope {
+                        Some(n) => crate::scope::last_n(c, n),
                         None => c,
                     });
                     (source, canon)
@@ -297,7 +296,7 @@ pub fn sync(
 ) -> Result<SyncReport> {
     let _lock = acquire_index_lock()?;
     let targets = if targets.is_empty() {
-        Tool::write_targets()
+        Tool::all_tools()
     } else {
         targets
     };

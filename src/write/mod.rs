@@ -30,7 +30,172 @@ pub(super) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Mapping version recorded in every import. Bump it whenever the writers
 /// change what they emit, so `sync` can re-import and upgrade old copies.
-pub(crate) const MAPPING: u32 = 6;
+pub(crate) const MAPPING: u32 = 7;
+
+/// Shown as a system message at the top of every import: the transcript that
+/// follows already ran somewhere else and must not be treated as live state.
+pub(super) const IMPORT_NOTE: &str = "Imported history from another agent's session. \
+     The tool calls and results below already executed there; treat them as a transcript to \
+     read, never as pending state to continue.";
+
+/// Labelled text for blocks a target cannot hold natively. Every writer
+/// renders these identically so a transcript reads the same everywhere.
+/// Returns `None` for blocks the writer must handle structurally
+/// (text, thinking, tool calls/results, usage, inline images).
+pub(super) fn fallback_text(block: &Block) -> Option<String> {
+    match block {
+        Block::Image {
+            mime,
+            data: None,
+            path,
+            bytes,
+        } => Some(format!(
+            "[image reference: {} ({bytes} bytes)]",
+            path.as_ref().map(|p| p.display().to_string())
+                .unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()))
+        )),
+        Block::Context { kind, text, path } => {
+            let body = text
+                .clone()
+                .or_else(|| path.as_ref().map(|p| p.display().to_string()))
+                .unwrap_or_default();
+            Some(format!("[context: {kind}]\n{body}"))
+        }
+        Block::Patch { files, .. } => Some(format!(
+            "[patch: {} file{}]\n{}",
+            files.len(),
+            if files.len() == 1 { "" } else { "s" },
+            files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join("\n")
+        )),
+        Block::Compressed { text } => Some(format!("[compaction]\n{text}")),
+        Block::Gap { detail, .. } => {
+            Some(format!("[gap in imported history: {detail}]"))
+        }
+        _ => None,
+    }
+}
+
+/// Token/cost accounting for one message: every writer reads the same shape.
+#[derive(Default, Clone)]
+pub(super) struct Usage {
+    pub input: u64,
+    pub output: u64,
+    pub reasoning: u64,
+    pub cache_read: u64,
+    pub cache_write: u64,
+    pub cost: f64,
+    pub model: Option<String>,
+    pub provider: Option<String>,
+}
+
+impl Usage {
+    pub fn total_tokens(&self) -> u64 {
+        self.input + self.output + self.reasoning
+    }
+}
+
+/// The usage block of a message group, if it recorded one.
+pub(super) fn usage_of(blocks: &[&Block]) -> Usage {
+    blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::Usage {
+                input,
+                output,
+                reasoning,
+                cache_read,
+                cache_write,
+                cost,
+                model,
+                provider,
+            } => Some(Usage {
+                input: *input,
+                output: *output,
+                reasoning: *reasoning,
+                cache_read: *cache_read,
+                cache_write: *cache_write,
+                cost: *cost,
+                model: model.clone(),
+                provider: provider.clone(),
+            }),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Tool arguments as JSON, falling back to the raw string when the source
+/// did not record structured args.
+pub(super) fn args_json(args: &str) -> Value {
+    serde_json::from_str(args).unwrap_or_else(|_| serde_json::json!(args))
+}
+
+/// Tool arguments as a JSON object (for validators that reject non-objects).
+pub(super) fn args_json_object(args: &str) -> Value {
+    serde_json::from_str(args)
+        .ok()
+        .filter(|v: &Value| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({"raw": args}))
+}
+
+/// A row timestamp that never goes backwards: the source message's own time
+/// when it recorded one, else one millisecond past the previous row.
+pub(super) fn next_row_time(
+    session: &CanonicalSession,
+    msg: u32,
+    prev: &mut DateTime<Utc>,
+) -> DateTime<Utc> {
+    let next = match session.msg_times.get(&msg).copied() {
+        Some(ts) if ts > *prev => ts,
+        _ => *prev + chrono::Duration::milliseconds(1),
+    };
+    *prev = next;
+    next
+}
+
+/// Target-safe id for one side of a call/result pair: the mapped source id
+/// when recorded, else a minted value both sides of the pair share.
+pub(super) fn fallback_call_id(
+    ids: &mut TargetIds,
+    call_id: &Option<String>,
+    minted: &mut usize,
+    name: &str,
+) -> String {
+    match call_id {
+        Some(c) => ids.get(c),
+        None => {
+            *minted += 1;
+            format!("call-{minted}-{name}")
+        }
+    }
+}
+
+/// FNV-1a mix shared by every deterministic id below.
+fn hash128(key: &str) -> [u32; 4] {
+    let mut h = [0x811c9dc5u32; 4];
+    for (i, b) in key.as_bytes().iter().enumerate() {
+        let b = *b as u32;
+        h[i % 4] ^= b;
+        h[i % 4] = h[i % 4].wrapping_mul(0x01000193);
+    }
+    h
+}
+
+fn uuid_shape(h: [u32; 4]) -> String {
+    format!(
+        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
+        h[0],
+        h[1] & 0xffff,
+        h[2] & 0xfff,
+        h[3] & 0xfff,
+        (((h[1] as u64) << 32) | h[0] as u64) & 0xffff_ffff_ffff
+    )
+}
+
+/// Deterministic UUID-shaped id derived from a seed + index (claude's picker
+/// requires UUID-shaped leafUuid/parent chains).
+pub(super) fn uuid_like(seed: &str, i: usize) -> String {
+    uuid_shape(hash128(&format!("{seed}:{i}")))
+}
 
 /// Writers use immutable generation IDs. Source provenance remains unchanged
 /// in the manifest; only the destination's native identifier includes revision.
@@ -137,6 +302,9 @@ pub(super) fn role_str(role: Role) -> &'static str {
 }
 
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
+    // First backup wins: the `.bak` keeps the pre-xses original for human
+    // recovery, not a rotation — overwriting it on every re-import would
+    // leave only the previous import behind when it is needed most.
     if path.exists() {
         let bak = path.with_extension("bak");
         if !bak.exists() {
@@ -221,29 +389,11 @@ pub(super) fn push(buf: &mut Vec<u8>, v: &Value) {
 
 /// Deterministic synthetic session id (idempotent re-imports).
 pub(super) fn synth_id(tool: Tool, id: &str) -> String {
-    let mut h = [0x811c9dc5u32; 4];
-    let key = format!("{}:{}", tool.as_str(), id);
-    for (i, b) in key.as_bytes().iter().enumerate() {
-        let b = *b as u32;
-        h[i % 4] ^= b;
-        h[i % 4] = h[i % 4].wrapping_mul(0x01000193);
-    }
-    format!(
-        "{:08x}-{:04x}-4{:03x}-8{:03x}-{:012x}",
-        h[0],
-        h[1] & 0xffff,
-        h[2] & 0xfff,
-        h[3] & 0xfff,
-        (((h[1] as u64) << 32) | h[0] as u64) & 0xffff_ffff_ffff
-    )
+    uuid_shape(hash128(&format!("{}:{}", tool.as_str(), id)))
 }
 
 pub(super) fn import_id(tool: Tool, id: &str) -> String {
-    synth_id(tool, id)
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric())
-        .take(32)
-        .collect()
+    crate::model::slug_id(&synth_id(tool, id), 32)
 }
 
 pub(super) fn iso(t: &DateTime<Utc>) -> String {
@@ -274,7 +424,7 @@ pub(super) fn manifest(session: &CanonicalSession) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::{Event, Fidelity};
+    use crate::canonical::Event;
 
     fn session(events: Vec<Event>) -> CanonicalSession {
         CanonicalSession {
@@ -353,104 +503,5 @@ mod tests {
         assert_eq!(m["mapping"], MAPPING);
         assert_eq!(m["blocks"]["tool_call"], 1);
         assert_eq!(m["gaps"][0], "image");
-    }
-
-    #[test]
-    fn text_flattening_still_labels_history() {
-        let s = session(vec![ev(
-            0,
-            Block::ToolResult {
-                name: "bash".into(),
-                output: "ok".into(),
-                call_id: None,
-                is_error: false,
-                duration_ms: None,
-            },
-        )]);
-        let (msgs, report) = s.messages();
-        assert!(msgs[0].1.contains("transcript, not live"));
-        assert_eq!(report.normalized, 1);
-    }
-
-    #[test]
-    fn gaps_render_in_place_as_system_markers() {
-        let s = session(vec![
-            ev(
-                0,
-                Block::Text {
-                    role: Role::User,
-                    text: "before".into(),
-                },
-            ),
-            ev(
-                1,
-                Block::Gap {
-                    kind: "image".into(),
-                    detail: "image attachment not carried over".into(),
-                },
-            ),
-            ev(
-                2,
-                Block::Text {
-                    role: Role::User,
-                    text: "after".into(),
-                },
-            ),
-        ]);
-        let (msgs, report) = s.messages();
-        assert_eq!(msgs.len(), 3);
-        assert_eq!(msgs[1].0, Role::System);
-        assert!(msgs[1].1.contains("[gap in imported history:"));
-        assert_eq!(report.dropped, 1);
-        assert_eq!(s.gap_kinds(), vec!["image".to_string()]);
-    }
-
-    #[test]
-    fn empty_thinking_flattens_to_nothing() {
-        let s = session(vec![
-            ev(
-                0,
-                Block::Text {
-                    role: Role::User,
-                    text: "hi".into(),
-                },
-            ),
-            ev(
-                1,
-                Block::Thinking {
-                    text: "".into(),
-                    signature: None,
-                },
-            ),
-        ]);
-        let (msgs, report) = s.messages();
-        assert_eq!(msgs.len(), 1);
-        assert_eq!(report.downgraded, 0);
-    }
-
-    #[test]
-    fn fidelity_tally_counts_each_block() {
-        let s = session(vec![
-            ev(
-                0,
-                Block::Text {
-                    role: Role::User,
-                    text: "hi".into(),
-                },
-            ),
-            ev(
-                1,
-                Block::Image {
-                    mime: Some("image/png".into()),
-                    data: Some("qq==".into()),
-                    path: None,
-                    bytes: 3,
-                },
-            ),
-        ]);
-        let (_, report) = s.messages();
-        assert_eq!(report.preserved, 1);
-        assert_eq!(report.downgraded, 1);
-        let _ = Fidelity::Preserved;
     }
 }

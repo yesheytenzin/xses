@@ -3,17 +3,14 @@
 //! Emits native records: multi-part messages (`text`, `thinking`, `toolCall`,
 //! `image`), `toolResult` messages carrying their `toolCallId`, compaction
 //! records, and per-message usage so the TUI's stats still render.
-use super::{import_id, iso, iso_stamp, push, synth_id};
+use super::{
+    args_json, fallback_call_id, fallback_text, group_role, import_id, iso, iso_stamp,
+    next_row_time, push, role_str, synth_id, usage_of, IMPORT_NOTE,
+};
 use crate::canonical::{Block, CanonicalSession, Role};
 use crate::model::Tool;
 use serde_json::{json, Value};
 use std::path::PathBuf;
-
-/// Shown as a system message at the top of every import: the transcript that
-/// follows already ran somewhere else and must not be treated as live state.
-pub(super) const IMPORT_NOTE: &str = "Imported history from another agent's session. \
-     The tool calls and results below already executed there; treat them as a transcript to \
-     read, never as pending state to continue.";
 
 pub(super) fn write(
     target: Tool,
@@ -198,36 +195,11 @@ pub(super) fn write(
     for (m, blocks) in session.grouped() {
         // The source message's own time when it recorded one; the store takes
         // ISO times and only needs them not to go backwards.
-        let row_ts = match session.msg_times.get(&m).copied() {
-            Some(ts) if ts > prev_ts => ts,
-            _ => prev_ts + chrono::Duration::milliseconds(1),
-        };
-        prev_ts = row_ts;
+        let row_ts = next_row_time(session, m, &mut prev_ts);
         let row_ts_iso = iso(&row_ts);
         let row_ts_ms = row_ts.timestamp_millis();
-        let role = message_role(&blocks, Role::Assistant);
-        let usage = blocks.iter().find_map(|b| match b {
-            Block::Usage {
-                input,
-                output,
-                reasoning,
-                cache_read,
-                cache_write,
-                cost,
-                model,
-                provider,
-            } => Some((
-                *input,
-                *output,
-                *reasoning,
-                *cache_read,
-                *cache_write,
-                *cost,
-                model.clone(),
-                provider.clone(),
-            )),
-            _ => None,
-        });
+        let role = group_role(&blocks, Role::Assistant);
+        let usage = usage_of(&blocks);
         let mut parts: Vec<Value> = Vec::new();
         let mut results: Vec<Value> = Vec::new();
         for block in &blocks {
@@ -244,13 +216,11 @@ pub(super) fn write(
                     call_id,
                     ..
                 } => {
-                    let arguments: Value =
-                        serde_json::from_str(args).unwrap_or_else(|_| json!(args));
                     parts.push(json!({
                         "type": "toolCall",
-                        "id": call_id.clone().map(|c| ids.get(&c)).unwrap_or_else(|| format!("call-{minted}-{name}")),
+                        "id": fallback_call_id(&mut ids, call_id, &mut minted, name),
                         "name": name,
-                        "arguments": arguments,
+                        "arguments": args_json(args),
                     }));
                 }
                 Block::ToolResult {
@@ -261,50 +231,34 @@ pub(super) fn write(
                     duration_ms,
                 } => {
                     results.push(json!({
-                        "toolCallId": call_id.clone().map(|c| ids.get(&c)).unwrap_or_else(|| format!("call-{name}")),
+                        "toolCallId": fallback_call_id(&mut ids, call_id, &mut minted, name),
                         "toolName": name,
                         "isError": is_error,
                         "durationMs": duration_ms.unwrap_or(0),
                         "content": [{"type": "text", "text": output}],
                     }));
                 }
-                Block::Image { mime, data, path, bytes } => match data {
+                Block::Image { mime, data, .. } => match data {
                     Some(d) => parts.push(json!({
                         "type": "image",
                         "mimeType": mime.clone().unwrap_or_else(|| "image/png".into()),
                         "data": d,
                     })),
-                    None => parts.push(json!({
-                        "type": "text",
-                        "text": format!(
-                            "[image reference: {} ({bytes} bytes)]",
-                            path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()))
-                        ),
-                    })),
+                    // Anything else a target cannot hold rides as labelled text.
+                    None => {
+                        if let Some(text) = fallback_text(block) {
+                            parts.push(json!({"type": "text", "text": text}));
+                        }
+                    }
                 },
-                Block::Context { kind, text, path } => {
-                    let body = text
-                        .clone()
-                        .or_else(|| path.as_ref().map(|p| p.display().to_string()))
-                        .unwrap_or_default();
-                    parts.push(json!({"type": "text", "text": format!("[context: {kind}]\n{body}")}));
+                Block::Context { .. }
+                | Block::Patch { .. }
+                | Block::Compressed { .. }
+                | Block::Gap { .. } => {
+                    if let Some(text) = fallback_text(block) {
+                        parts.push(json!({"type": "text", "text": text}));
+                    }
                 }
-                Block::Patch { files, .. } => parts.push(json!({
-                    "type": "text",
-                    "text": format!(
-                        "[patch: {} file{}]\n{}",
-                        files.len(),
-                        if files.len() == 1 { "" } else { "s" },
-                        files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join("\n")
-                    ),
-                })),
-                Block::Compressed { text } => {
-                    parts.push(json!({"type": "text", "text": format!("[compaction]\n{text}")}));
-                }
-                Block::Gap { detail, .. } => parts.push(json!({
-                    "type": "text",
-                    "text": format!("[gap in imported history: {detail}]"),
-                })),
                 Block::Usage { .. } => {}
             }
         }
@@ -316,22 +270,20 @@ pub(super) fn write(
                 "timestamp": row_ts_ms,
             });
             if matches!(role, Role::Assistant) {
-                let (input, output, reasoning, cache_read, cache_write, cost, model, provider) =
-                    usage.clone().unwrap_or((0, 0, 0, 0, 0, 0.0, None, None));
-                let msg_provider = provider.as_deref().unwrap_or(&pi_provider);
+                let msg_provider = usage.provider.as_deref().unwrap_or(&pi_provider);
                 message["api"] = json!(msg_provider);
                 message["provider"] = json!(msg_provider);
-                message["model"] = json!(model.as_deref().unwrap_or(&pi_model_id));
+                message["model"] = json!(usage.model.as_deref().unwrap_or(&pi_model_id));
                 message["stopReason"] = json!("stop");
                 message["thinkingLevel"] = json!("off");
                 message["durationMs"] = json!(0);
                 message["usage"] = json!({
-                    "input": input,
-                    "output": output,
-                    "cacheRead": cache_read,
-                    "cacheWrite": cache_write,
-                    "totalTokens": input + output + reasoning,
-                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": cost},
+                    "input": usage.input,
+                    "output": usage.output,
+                    "cacheRead": usage.cache_read,
+                    "cacheWrite": usage.cache_write,
+                    "totalTokens": usage.total_tokens(),
+                    "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0, "total": usage.cost},
                 });
             }
             push(
@@ -377,25 +329,6 @@ pub(super) fn write(
         return None;
     }
     Some(target)
-}
-
-/// The role a group of blocks came from (its text blocks decide).
-fn message_role(blocks: &[&Block], fallback: Role) -> Role {
-    blocks
-        .iter()
-        .find_map(|b| match b {
-            Block::Text { role, .. } => Some(*role),
-            _ => None,
-        })
-        .unwrap_or(fallback)
-}
-
-fn role_str(role: Role) -> &'static str {
-    match role {
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::System => "system",
-    }
 }
 
 /// Model for a pi import, by provenance priority: the source transcript's
@@ -546,7 +479,7 @@ mod tests {
             detail: "gone".into(),
         };
         let blocks = vec![&gap, &user];
-        assert_eq!(message_role(&blocks, Role::Assistant), Role::User);
+        assert_eq!(group_role(&blocks, Role::Assistant), Role::User);
         let _ = Event { msg: 0, block: gap };
     }
 }

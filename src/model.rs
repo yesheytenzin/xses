@@ -34,8 +34,8 @@ impl Tool {
         }
     }
 
-    /// Every target we can write into.
-    pub fn write_targets() -> &'static [Tool] {
+    /// Every tool xses knows: all are readable stores and writable targets.
+    pub fn all_tools() -> &'static [Tool] {
         &[
             Tool::Claude,
             Tool::Codex,
@@ -49,6 +49,14 @@ impl Tool {
     pub fn is_cli_backed(&self) -> bool {
         matches!(self, Tool::Opencode)
     }
+}
+
+/// Filesystem-safe id slug: alphanumerics only, capped at `len` characters.
+pub fn slug_id(id: &str, len: usize) -> String {
+    id.chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(len)
+        .collect()
 }
 
 /// One session, tool-agnostic. `path` is the native transcript for file-backed

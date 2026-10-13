@@ -17,6 +17,7 @@ mod scan;
 mod scope;
 mod storage;
 mod sync;
+mod text;
 mod write;
 
 fn main() -> anyhow::Result<()> {

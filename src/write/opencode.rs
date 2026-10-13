@@ -1,5 +1,5 @@
 //! opencode writer: synthesize an export payload, pipe it through `opencode import`.
-use super::{group_role, import_id, manifest, role_str};
+use super::{args_json_object, fallback_call_id, fallback_text, group_role, import_id, manifest, role_str, usage_of};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::fs;
@@ -68,6 +68,9 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
     let mut folded: std::collections::HashMap<String, (String, bool, Option<u64>)> =
         std::collections::HashMap::new();
     let mut ids = super::TargetIds::default();
+    // Minted fallback ids are shared with the message loop below so an
+    // id-less call and its result still meet on the same value.
+    let mut minted = 0usize;
     for (_, blocks) in &groups {
         for block in blocks {
             if let Block::ToolResult {
@@ -79,16 +82,12 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
             } = block
             {
                 folded.insert(
-                    call_id
-                        .clone()
-                        .map(|c| ids.get(&c))
-                        .unwrap_or_else(|| format!("call-{name}")),
+                    fallback_call_id(&mut ids, call_id, &mut minted, name),
                     (output.clone(), *is_error, *duration_ms),
                 );
             }
         }
     }
-    let mut minted = 0usize;
     // Import note rides on the first message as assistant text: opencode's
     // import validator rejects `role: "system"` outright (verified).
     let mut note_pending = true;
@@ -112,28 +111,8 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         // ("Expected Message" on role=system, verified against the live CLI),
         // so transcript-context lines ride as assistant text.
         let is_assistant = matches!(role, Role::Assistant | Role::System);
-        let usage = blocks.iter().find_map(|b| match b {
-            Block::Usage {
-                input,
-                output,
-                reasoning,
-                cache_read,
-                cache_write,
-                cost,
-                ..
-            } => Some((
-                *input,
-                *output,
-                *reasoning,
-                *cache_read,
-                *cache_write,
-                *cost,
-            )),
-            _ => None,
-        });
+        let usage = usage_of(&blocks);
         let info = if is_assistant {
-            let (input, output, reasoning, cache_read, cache_write, cost) =
-                usage.unwrap_or((0, 0, 0, 0, 0, 0.0));
             json!({
                 "id": mid,
                 "sessionID": ses,
@@ -143,9 +122,9 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
                 "mode": "build",
                 "agent": "build",
                 "path": {"cwd": session.cwd, "root": session.cwd},
-                "cost": cost,
-                "tokens": {"input": input, "output": output, "reasoning": reasoning,
-                           "cache": {"read": cache_read, "write": cache_write}},
+                "cost": usage.cost,
+                "tokens": {"input": usage.input, "output": usage.output, "reasoning": usage.reasoning,
+                           "cache": {"read": usage.cache_read, "write": usage.cache_write}},
                 "providerID": provider_id,
                 "modelID": model_id,
             })
@@ -177,7 +156,7 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
                 "id": pid,
                 "sessionID": ses,
                 "messageID": mid,
-                "text": super::pi::IMPORT_NOTE,
+                "text": super::IMPORT_NOTE,
             }));
         }
         for block in &blocks {
@@ -206,16 +185,13 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
                     call_id,
                     status,
                 } => {
-                    let cid = call_id
-                        .clone()
-                        .unwrap_or_else(|| format!("call-{minted}-{name}"));
+                    // Same mapping the fold loop used, so the call meets its
+                    // folded result even when the source id needed remapping.
+                    let cid = fallback_call_id(&mut ids, call_id, &mut minted, name);
                     // The validator requires an object input and a mandatory
                     // `state.output`; a call whose result was never recorded
                     // keeps an empty output rather than failing the import.
-                    let input: serde_json::Value = serde_json::from_str(args)
-                        .ok()
-                        .filter(|v: &serde_json::Value| v.is_object())
-                        .unwrap_or_else(|| json!({"raw": args}));
+                    let input = args_json_object(args);
                     let (output, is_error, duration) = folded
                         .get(&cid)
                         .cloned()
@@ -251,31 +227,27 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
                 }
                 // Results were folded into their call's part above.
                 Block::ToolResult { .. } => {}
-                Block::Patch { hash, files } => {
+                Block::Patch { hash, files } if hash.as_deref().is_some_and(|h| !h.is_empty()) => {
                     let pid = part_id(&mut minted, "prt_");
-                    if hash.as_deref().is_some_and(|h| !h.is_empty()) {
-                        parts.push(json!({
-                            "type": "patch",
-                            "id": pid,
-                            "sessionID": ses,
-                            "messageID": mid,
-                            "hash": hash.clone().unwrap_or_default(),
-                            "files": files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
-                        }));
-                    } else {
-                        parts.push(json!({
-                            "type": "text",
-                            "id": pid,
-                            "sessionID": ses,
-                            "messageID": mid,
-                            "text": format!(
-                                "[patch: {} file{}]\n{}",
-                                files.len(),
-                                if files.len() == 1 { "" } else { "s" },
-                                files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join("\n")
-                            ),
-                        }));
-                    }
+                    parts.push(json!({
+                        "type": "patch",
+                        "id": pid,
+                        "sessionID": ses,
+                        "messageID": mid,
+                        "hash": hash.clone().unwrap_or_default(),
+                        "files": files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
+                    }));
+                }
+                // Hash-less patches ride as labelled text.
+                Block::Patch { .. } => {
+                    let pid = part_id(&mut minted, "prt_");
+                    parts.push(json!({
+                        "type": "text",
+                        "id": pid,
+                        "sessionID": ses,
+                        "messageID": mid,
+                        "text": fallback_text(block).unwrap_or_default(),
+                    }));
                 }
                 Block::Image {
                     mime,
@@ -321,29 +293,25 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
                         })),
                     }
                 }
-                Block::Context { kind, text, path } => {
-                    let body = text
-                        .clone()
-                        .or_else(|| path.as_ref().map(|p| p.display().to_string()))
-                        .unwrap_or_default();
+                Block::Context { .. } => {
                     let pid = part_id(&mut minted, "prt_");
                     parts.push(
                         json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid,
-                                      "text": format!("[context: {kind}]\n{body}")}),
+                                      "text": fallback_text(block).unwrap_or_default()}),
                     );
                 }
-                Block::Compressed { text } => {
+                Block::Compressed { .. } => {
                     let pid = part_id(&mut minted, "prt_");
                     parts.push(
                         json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid,
-                                      "text": format!("[compaction]\n{text}")}),
+                                      "text": fallback_text(block).unwrap_or_default()}),
                     );
                 }
-                Block::Gap { detail, .. } => {
+                Block::Gap { .. } => {
                     let pid = part_id(&mut minted, "prt_");
                     parts.push(
                         json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid,
-                                      "text": format!("[gap in imported history: {detail}]")}),
+                                      "text": fallback_text(block).unwrap_or_default()}),
                     );
                 }
                 Block::Usage { .. } => {}

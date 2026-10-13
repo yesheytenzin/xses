@@ -15,7 +15,7 @@ What a sync carries, where it lands, and what can never move. Statuses:
 | thinking (text) | `thinking` blocks | `reasoning` items | `thinking` parts | `reasoning` parts |
 | tool calls | `tool_use` (id, name, input) | `function_call` / `custom_tool_call` | `toolCall` (id, name, arguments) | `tool` part (`callID`, `state.input`) |
 | tool results | `tool_result` rows (`tool_use_id`, `is_error`) | `function_call_output` / `custom_tool_call_output` | `toolResult` messages (`toolCallId`, `toolName`, `isError`, `durationMs`) | `tool.state.output` / `state.error` |
-| images (≤5 MB each, 20 MB/session) | `image` base64 blocks | `input_image` data URLs | `image` parts (data + mimeType) | *gap* — no importable image part |
+| images (≤5 MB each, 20 MB/session) | `image` base64 blocks | `input_image` data URLs | `image` parts (data + mimeType) | `file` parts (data URL + filename) |
 | patches | *text* | *text* | *text* | `patch` parts (hash + files) |
 | compaction | *text* | `contextCompaction` projection | `message` text | *text* |
 | usage / cost / tokens | per-message `usage` | `token_count` events | per-message `usage` | `step-finish` tokens |
@@ -69,6 +69,9 @@ idempotency fingerprint).
 
 - `claude --resume` and `pi -r` list and open imports; `omp -r` lists them.
 - codex accepts the drop-in rollout and renders `commandExecution` rows.
-- `opencode import` accepts `tool`, `reasoning`, and `patch` parts, and requires
-  `state.output` **and** `state.error` on every tool part — a call with no
-  recorded output carries an empty one rather than failing the import.
+- `opencode import` accepts `tool`, `reasoning`, `patch`, **and `file` parts**
+  (data URL, mime, filename — the shape its own `-f/--file` flag builds).
+  It requires `state.output` **and** `state.error` on every tool part, rejects
+  `role: "system"`, and opens SQLite with `busy_timeout=0`, so xses imports are
+  serialized for that store: two writers never wait for each other, the loser
+  fails outright.

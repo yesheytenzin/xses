@@ -262,22 +262,48 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
                     }
                 }
                 Block::Image {
-                    mime, bytes, path, ..
+                    mime,
+                    data,
+                    path,
+                    bytes,
                 } => {
-                    // opencode has no importable image part; record the loss
-                    // inline so the transcript shows what is missing.
                     let pid = part_id(&mut minted, "prt_");
-                    parts.push(json!({
-                        "type": "text",
-                        "id": pid,
-                        "sessionID": ses,
-                        "messageID": mid,
-                        "text": format!(
-                            "[image: {} ({bytes} bytes) not carried]",
-                            path.as_ref().map(|p| p.display().to_string())
-                                .unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()))
-                        ),
-                    }));
+                    let mime = mime.clone().unwrap_or_else(|| "image/png".to_string());
+                    match data {
+                        // `file` parts take a data URL (schema: type, mime,
+                        // filename, url) — verified against the live importer.
+                        Some(d) => {
+                            let filename = path
+                                .as_ref()
+                                .and_then(|p| p.file_name())
+                                .and_then(|n| n.to_str())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| {
+                                    format!("image-{bytes}.{}", extension_for(&mime))
+                                });
+                            parts.push(json!({
+                                "type": "file",
+                                "id": pid,
+                                "sessionID": ses,
+                                "messageID": mid,
+                                "mime": mime,
+                                "filename": filename,
+                                "url": format!("data:{mime};base64,{d}"),
+                            }));
+                        }
+                        None => parts.push(json!({
+                            "type": "text",
+                            "id": pid,
+                            "sessionID": ses,
+                            "messageID": mid,
+                            "text": format!(
+                                "[image: {} ({bytes} bytes) not carried]",
+                                path.as_ref()
+                                    .map(|p| p.display().to_string())
+                                    .unwrap_or(mime)
+                            ),
+                        })),
+                    }
                 }
                 Block::Context { kind, text, path } => {
                     let body = text
@@ -349,11 +375,14 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
     // waits out the others before trying again.
     static RETRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let mut last = None;
-    for attempt in 0..2 {
+    for attempt in 0..3u32 {
         let _serial;
         if attempt > 0 {
+            // opencode opens SQLite with busy_timeout=0, so a competing writer
+            // fails immediately instead of waiting; retries back off and run
+            // one at a time so only external writers can still be in the way.
             _serial = Some(RETRY_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-            std::thread::sleep(Duration::from_millis(1000));
+            std::thread::sleep(Duration::from_millis(750 * 3u64.pow(attempt - 1)));
         }
         let mut command = Command::new("opencode");
         command
@@ -400,6 +429,17 @@ fn local_opencode_model() -> serde_json::Value {
     OPENCODE_MODEL.clone()
 }
 /// 24 random alphanumerics.
+/// File extension for an image mime type, for the `file` part filename.
+fn extension_for(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" | "image/jpg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/svg+xml" => "svg",
+        _ => "png",
+    }
+}
+
 fn mint_suffix() -> String {
     let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         .chars()

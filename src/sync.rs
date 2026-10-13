@@ -647,10 +647,13 @@ pub fn sync(
                 // independent of payload size), so those run concurrently.
                 let built: Vec<(crate::write::WriteOutcome, LossReport)> =
                     if target == Tool::Opencode && jobs.len() > 1 {
-                        let threads = std::thread::available_parallelism()
-                            .map(|n| n.get())
-                            .unwrap_or(4)
-                            .min(8);
+                        // opencode's CLI opens SQLite with `busy_timeout=0`, so
+                        // two writers never wait for each other — the loser
+                        // fails outright (verified against the shipped binary
+                        // and its issue tracker). Its imports are therefore
+                        // serialized; ~1s each, and parallelism stays the
+                        // file-store writers' advantage.
+                        let threads = 1;
                         let chunk = jobs.len().div_ceil(threads).max(1);
                         std::thread::scope(|s| {
                             let handles: Vec<_> = jobs

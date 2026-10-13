@@ -260,7 +260,31 @@ pub fn select(sessions: &[Session], r: Ref) -> anyhow::Result<&Session> {
             match matches.len() {
                 1 => Ok(matches[0]),
                 0 => anyhow::bail!("no session matching {id:?}"),
-                n => anyhow::bail!("ambiguous ref {id:?}: {n} matches"),
+                _ => {
+                    // The same id can exist in several stores once it has been
+                    // imported around. Prefer the original (a non-import),
+                    // then the newest, so `sync <id>` stays usable; only an
+                    // exact tie between two originals is ambiguous.
+                    let mut candidates: Vec<&Session> =
+                        matches.iter().copied().filter(|s| !s.is_import).collect();
+                    if candidates.is_empty() {
+                        candidates = matches.clone();
+                    }
+                    if candidates.len() == 1 {
+                        return Ok(candidates[0]);
+                    }
+                    let exact: Vec<&Session> =
+                        candidates.iter().copied().filter(|s| s.id == id).collect();
+                    let pick = if exact.len() == 1 {
+                        exact[0]
+                    } else {
+                        *candidates
+                            .iter()
+                            .max_by_key(|s| s.mtime)
+                            .expect("non-empty")
+                    };
+                    Ok(pick)
+                }
             }
         }
     }

@@ -19,6 +19,13 @@ target's constructs:
   `patch` parts plus `step-finish` tokens; claude gets per-message `usage`.
 - every import opens with a note that the transcript already ran elsewhere, so
   tool traffic is read as history, never continued as pending state.
+- images also reach opencode, as `file` parts carrying the data URL (verified
+  against the live importer; its schema is `type/mime/filename/url`).
+- opencode imports are serialized: its CLI opens SQLite with `busy_timeout=0`,
+  so a second writer fails instead of waiting. Retries back off three times for
+  the case where another app is writing.
+- `sync <id>` no longer reports "ambiguous" just because the id also exists in
+  stores it was imported into: the original session wins, then the newest.
 - import headers carry a manifest (`blocks`, `gaps`, `mapping`), the mapping
   version is part of the idempotency fingerprint (older copies re-import once),
   and `FEATURE.md` documents what is carried, text-only, or impossible.

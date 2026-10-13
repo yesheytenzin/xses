@@ -204,6 +204,27 @@ xses clean --dry-run
 xses doctor -n 20
 ```
 
+## Releasing
+
+Maintainers cut a release with the script, which keeps the version in one
+place across the project (`Cargo.toml`, `Cargo.lock`, `CHANGELOG.md`) and
+pushes the tag that CI turns into a release:
+
+```sh
+scripts/release.sh 0.5.0              # bump, gates, commit, tag, push
+scripts/release.sh 0.5.0 --dry-run    # print the plan, change nothing
+scripts/release.sh 0.5.0 --no-push    # everything except the pushes
+scripts/release.sh 0.5.0 --force      # push main with --force-with-lease
+                                      # (needed after a history rewrite)
+```
+
+Pushing the `vX.Y.Z` tag triggers `.github/workflows/release.yml`: it runs the
+`--locked` test and clippy gates, builds archives for `linux-x86_64`,
+`macos-x86_64`, `macos-aarch64`, and `windows-x86_64`, writes `SHA256SUMS`
+plus signed build provenance, and publishes the GitHub Release with notes
+diffed against the previous tag. The install step above downloads from the
+latest release, so nothing else in the repo needs editing.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

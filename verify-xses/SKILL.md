@@ -22,7 +22,7 @@ OpenCode checks need the local `opencode` binary, its SQLite store, and
 | Scoped cleanup | `target/debug/xses clean --dry-run` | Reports the newest synced session's artifacts only; other imports stay listed by `ls`. |
 | Full cleanup preview | `target/debug/xses clean --all --dry-run` | Reports every import; deletes nothing. |
 | Diagnostics | `target/debug/xses doctor` | Prints dependency status, per-store counts, index stats, and journal entries; exits 0. |
-| Lock contention | run two syncs at once | The second exits non-zero naming the lock file; a stale lock (dead PID) is removed automatically. |
+| Lock contention | run two syncs at once | The second exits non-zero naming the lock file; OS ownership releases on process exit or crash. The lock file persists and must not be deleted. |
 
 ## Regression gates
 
@@ -35,3 +35,17 @@ For import-path changes, exercise a real round trip in a scratch directory
 (import a session, confirm the native store lists it under its `[agent]`
 prefix, then `xses clean` removes it) because the writers depend on each
 agent's shipped formats, not on this repo's tests.
+
+## Automated CLI regression flows
+
+Run `python3 verify-xses/flows/regression.py target/debug/xses` on Linux after
+building. It creates disposable native-format source files and a real SQLite
+fixture, then drives the actual CLI through filtered listing, cache reuse,
+scoped/full re-sync, idempotency, failed replacement, concurrent lock ownership,
+OpenCode same-length edits/deletions, scoped cleanup, and full cleanup. It
+prints the path of a JSON transcript containing every command and raw output.
+It does not invoke real agent imports or make model requests.
+
+Run `python3 verify-xses/flows/benchmark.py` after a release build for real-store
+listing timings with isolated xses caches. `--baseline /path/to/old/xses` compares
+binaries on the same stores. These are application-cache, not cold-disk timings.

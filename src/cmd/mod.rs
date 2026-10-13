@@ -100,18 +100,22 @@ fn select_bulk_sources(
     sessions: Vec<Session>,
     all: bool,
     num: Option<usize>,
+    include_imports: bool,
 ) -> anyhow::Result<Vec<Session>> {
     if matches!(num, Some(0)) {
         anyhow::bail!("-n/--num requires N >= 1");
     }
     let Some(limit) = (if all { None } else { Some(num.unwrap_or(1)) }) else {
-        return Ok(sessions.into_iter().filter(|s| !s.is_import).collect());
+        return Ok(sessions
+            .into_iter()
+            .filter(|s| include_imports || !s.is_import)
+            .collect());
     };
     let mut selected = Vec::new();
     for tool in Tool::write_targets() {
         let mut per_tool: Vec<Session> = sessions
             .iter()
-            .filter(|s| s.tool == *tool && !s.is_import)
+            .filter(|s| s.tool == *tool && (include_imports || !s.is_import))
             .cloned()
             .collect();
         per_tool.sort_by_key(|s| std::cmp::Reverse(s.mtime));

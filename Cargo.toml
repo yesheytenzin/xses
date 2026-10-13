@@ -2,6 +2,7 @@
 name = "xses"
 version = "0.6.0"
 edition = "2021"
+rust-version = "1.89"
 description = "Unified picker and cross-importer for AI coding agent sessions"
 license = "MIT"
 

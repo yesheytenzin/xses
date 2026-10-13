@@ -45,48 +45,59 @@ pub fn resume_argv(s: &Session) -> Vec<String> {
 }
 
 /// TUI picker. Returns the session to resume, or None on quit.
-pub fn picker(sessions: &[Session], query: &str) -> Result<Option<Session>> {
+struct TerminalGuard;
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        let _ = disable_raw_mode();
+    }
+}
+
+pub fn picker(sessions: &[Session], query: &str, limit: Option<usize>) -> Result<Option<Session>> {
     enable_raw_mode()?;
+    let _guard = TerminalGuard;
     let mut stdout = stdout();
     crossterm::execute!(stdout, EnterAlternateScreen)?;
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend)?;
-
-    let res = run_ui(&mut term, sessions, query);
-
-    disable_raw_mode()?;
-    crossterm::execute!(term.backend_mut(), LeaveAlternateScreen)?;
-    res
+    run_ui(&mut term, sessions, query, limit)
 }
 
 fn run_ui(
     term: &mut Terminal<ratatui::backend::CrosstermBackend<std::io::Stdout>>,
     sessions: &[Session],
     initial_query: &str,
+    limit: Option<usize>,
 ) -> Result<Option<Session>> {
     let matcher = SkimMatcherV2::default();
     let mut query = initial_query.to_string();
     let mut selected = 0usize;
-    let mut list_state = ListState::default();
-
+    let search: Vec<String> = sessions
+        .iter()
+        .map(|s| format!("{} {} {}", s.summary, s.cwd.display(), s.tool.as_str()))
+        .collect();
+    let mut filtered = Vec::new();
+    let mut dirty = true;
     loop {
-        // Filter
-        let mut filtered: Vec<usize> = (0..sessions.len()).collect();
-        if !query.is_empty() {
-            filtered = sessions
+        if dirty {
+            filtered = search
                 .iter()
                 .enumerate()
-                .filter_map(|(i, s)| {
-                    let hay = format!("{} {} {}", s.summary, s.cwd.display(), s.tool.as_str());
-                    matcher.fuzzy_match(&hay, &query).map(|_| i)
+                .filter_map(|(i, hay)| {
+                    (query.is_empty() || matcher.fuzzy_match(hay, &query).is_some()).then_some(i)
                 })
                 .collect();
+            if let Some(limit) = limit {
+                filtered.truncate(limit);
+            }
+            selected = 0;
+            dirty = false;
         }
         if selected >= filtered.len() {
             selected = filtered.len().saturating_sub(1);
         }
 
-        term.draw(|f| ui(f, sessions, &filtered, &query, selected, &mut list_state))?;
+        term.draw(|f| ui(f, sessions, &filtered, &query, selected))?;
 
         if let event::Event::Key(key) = event::read()? {
             if key.kind != KeyEventKind::Press {
@@ -97,14 +108,16 @@ fn run_ui(
                     return Ok(None);
                 }
                 KeyCode::Esc => return Ok(None),
-                KeyCode::Down | KeyCode::Char('j') => {
-                    selected = (selected + 1).min(filtered.len().saturating_sub(1))
-                }
-                KeyCode::Up | KeyCode::Char('k') => selected = selected.saturating_sub(1),
+                KeyCode::Down => selected = (selected + 1).min(filtered.len().saturating_sub(1)),
+                KeyCode::Up => selected = selected.saturating_sub(1),
                 KeyCode::Backspace => {
                     query.pop();
+                    dirty = true;
                 }
-                KeyCode::Char(c) => query.push(c),
+                KeyCode::Char(c) => {
+                    query.push(c);
+                    dirty = true;
+                }
                 KeyCode::Enter => {
                     if let Some(&idx) = filtered.get(selected) {
                         return Ok(Some(sessions[idx].clone()));
@@ -116,14 +129,7 @@ fn run_ui(
     }
 }
 
-fn ui(
-    f: &mut Frame,
-    sessions: &[Session],
-    filtered: &[usize],
-    query: &str,
-    selected: usize,
-    _list_state: &mut ListState,
-) {
+fn ui(f: &mut Frame, sessions: &[Session], filtered: &[usize], query: &str, selected: usize) {
     let area = f.area();
     let chunks = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Length(1),
@@ -136,7 +142,10 @@ fn ui(
         Paragraph::new(format!("❯ {query}")).style(Style::default().add_modifier(Modifier::BOLD));
     f.render_widget(input, chunks[0]);
 
-    let items: Vec<ListItem> = filtered
+    let height = chunks[1].height as usize;
+    let start = selected.saturating_sub(height.saturating_sub(1));
+    let end = (start + height).min(filtered.len());
+    let items: Vec<ListItem> = filtered[start..end]
         .iter()
         .map(|&i| {
             let s = &sessions[i];
@@ -173,11 +182,11 @@ fn ui(
         );
     // manual selection via offset; render_stateful needs state
     let mut st = ListState::default();
-    st.select(Some(selected));
+    st.select((!filtered.is_empty()).then_some(selected - start));
     f.render_stateful_widget(list, chunks[1], &mut st);
 
     let help = Paragraph::new(format!(
-        "{} sessions · ↑/↓ or j/k move · type to filter · Enter resume · Esc quit",
+        "{} sessions · ↑/↓ move · type to filter · Enter resume · Esc quit",
         filtered.len()
     ))
     .style(Style::default().fg(Color::DarkGray));

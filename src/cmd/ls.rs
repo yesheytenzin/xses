@@ -17,9 +17,13 @@ pub fn run(
     if count {
         return counts();
     }
-    let mut sessions = scope::load(all, include_noise)?;
-    if let Some(t) = tool {
-        sessions.retain(|s| s.tool == t);
+    let tools = tool
+        .map(|t| vec![t])
+        .unwrap_or_else(|| Tool::write_targets().to_vec());
+    let mut sessions = crate::scan::scan_tools(scope::filter(all).as_deref(), &tools, true)?;
+    let hidden = scope::noise_tally(&sessions);
+    if !include_noise {
+        sessions.retain(|s| s.noise.is_none());
     }
     let sessions = scope::capped(sessions, scope::limit(all, limit));
     let stdout = std::io::stdout();
@@ -44,7 +48,6 @@ pub fn run(
     if include_noise {
         return Ok(());
     }
-    let hidden = scope::noise_tally(&crate::scan::scan_all(scope::filter(all).as_deref())?);
     if !hidden.is_empty() {
         println!(
             "({} hidden: {}) — pass --include-noise to see them",

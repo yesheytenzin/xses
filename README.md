@@ -67,9 +67,25 @@ visible `[gap in imported history: …]` marker. Sessions that were never useful
 transfers per data class is in [FEATURE.md](FEATURE.md).
 
 State lives in `~/.local/share/xses/`: `index.jsonl` (imports and their
-artifacts), `scan-cache.json`, `issues.jsonl`. Maintainers release with
+artifacts), `scan-cache-<tool>.json`, `issues.jsonl`. Scan caches are versioned and
+checkpoint complete JSONL records; unchanged listings do not rewrite them.
+Source-filtered commands only scan the requested stores. 
+Maintainers release with
 `scripts/release.sh --help`.
 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Development checks
+
+Rust 1.89 or newer is required. Run `cargo test --all-targets --locked`,
+`cargo clippy --all-targets --locked -- -D warnings`, and `cargo fmt --check`.
+PR CI runs these on Linux, macOS, and Windows. On Linux, run the isolated CLI
+regressions with `python3 verify-xses/flows/regression.py target/debug/xses`
+after `cargo build`; Python 3 and `sqlite3` must be on PATH.
+
+For repeatable listing timings, build with `cargo build --release --locked`
+and run `python3 verify-xses/flows/benchmark.py`. It reads native stores and
+writes only a disposable cache under `/tmp`; it does not measure cold disks.
+Pass `--baseline /path/to/old/xses` for a comparison.

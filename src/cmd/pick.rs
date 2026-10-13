@@ -9,12 +9,12 @@ pub fn run(
     limit: Option<usize>,
     include_noise: bool,
 ) -> anyhow::Result<()> {
-    let sessions = scope::capped(scope::load(all, include_noise)?, scope::limit(all, limit));
+    let sessions = scope::load(all, include_noise)?;
     if sessions.is_empty() {
         eprintln!("no sessions found (try --all)");
         return Ok(());
     }
-    if let Some(s) = picker::picker(&sessions, &query)? {
+    if let Some(s) = picker::picker(&sessions, &query, scope::limit(all, limit))? {
         exec_resume(&s);
     }
     Ok(())

@@ -8,18 +8,18 @@ use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
-pub(super) fn write(session: &CanonicalSession) -> Vec<Option<PathBuf>> {
-    let Some((rollout, sidecar)) = write_inner(session) else {
+pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Vec<Option<PathBuf>> {
+    let Some((rollout, sidecar)) = write_inner(session, revision) else {
         return vec![None];
     };
     // The sidecar is a second artifact clean() must remove.
     vec![Some(rollout), Some(sidecar)]
 }
 
-fn write_inner(session: &CanonicalSession) -> Option<(PathBuf, PathBuf)> {
+fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(PathBuf, PathBuf)> {
     let home = dirs::home_dir()?;
     let slug = session.cwd.to_string_lossy().replace('/', "-");
-    let sid = synth_id(session.tool, &session.id);
+    let sid = synth_id(session.tool, &super::artifact_key(session, revision));
     // Claude's /resume only lists files whose name == the session UUID. Its row
     // label is `agentName || customTitle || aiTitle || summary || firstPrompt`
     // (binary-verified): firstPrompt is the bare first user message, so the
@@ -257,6 +257,9 @@ fn write_inner(session: &CanonicalSession) -> Option<(PathBuf, PathBuf)> {
         }
     };
     if !super::atomic_write_journaled(&sidecar, &sidecar_bytes, &subject) {
+        if revision.is_some() {
+            let _ = std::fs::remove_file(&target);
+        }
         return None;
     }
     Some((target, sidecar))
@@ -336,7 +339,7 @@ mod tests {
 
         let previous = std::env::var_os("HOME");
         std::env::set_var("HOME", &scratch);
-        let produced = write(&session);
+        let produced = write(&session, None);
         match previous {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
@@ -423,7 +426,7 @@ mod tests {
 
         let previous = std::env::var_os("HOME");
         std::env::set_var("HOME", &scratch);
-        let produced = write(&session);
+        let produced = write(&session, None);
         match previous {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),

@@ -12,16 +12,15 @@ mod export;
 mod opencode;
 mod pi;
 
-pub(crate) use codex::codex_state_db_pub;
+pub(crate) use codex::retire_codex;
 pub(crate) use export::export_trace;
 
 use crate::canonical::{Block, CanonicalSession, LossReport, Role};
 use crate::model::Tool;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde_json::Value;
-use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Serializes tests that redirect `$HOME`: writers resolve their target
@@ -33,32 +32,34 @@ pub(super) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// change what they emit, so `sync` can re-import and upgrade old copies.
 pub(crate) const MAPPING: u32 = 6;
 
-/// What a writer produced for a session: the artifacts recorded in the index
-/// (and removed again by `clean`).
-pub struct WriteOutcome {
-    pub artifacts: Vec<PathBuf>,
+/// Writers use immutable generation IDs. Source provenance remains unchanged
+/// in the manifest; only the destination's native identifier includes revision.
+pub fn session_revision(
+    target: Tool,
+    session: &CanonicalSession,
+    revision: &str,
+) -> Result<(Vec<PathBuf>, LossReport)> {
+    let (_, report) = session.transfer_summary();
+    let files = match target {
+        Tool::Pi | Tool::Omp => vec![pi::write(target, session, Some(revision))],
+        Tool::Claude => claude::write(session, Some(revision)),
+        Tool::Codex => vec![codex::write(session, Some(revision))],
+        Tool::Opencode => vec![opencode::write(session, Some(revision))],
+    };
+    if files.is_empty() || files.iter().any(Option::is_none) {
+        anyhow::bail!(
+            "{} import failed; details are recorded by xses doctor",
+            target.as_str()
+        );
+    }
+    Ok((files.into_iter().flatten().collect(), report))
 }
 
-/// Write one session into one target store. Failures are journaled
-/// (`crate::issues`) so `xses doctor` can explain them later.
-pub fn session(target: Tool, session: &CanonicalSession) -> (WriteOutcome, LossReport) {
-    let mut report = LossReport::default();
-    for block in session.blocks() {
-        if let Some((_, fidelity)) = block.flatten() {
-            report.tally(fidelity);
-        }
+pub(super) fn artifact_key(session: &CanonicalSession, revision: Option<&str>) -> String {
+    match revision {
+        Some(revision) => format!("{}@{revision}", session.id),
+        None => session.id.clone(),
     }
-    let files = match target {
-        Tool::Pi | Tool::Omp => vec![pi::write(target, session)],
-        Tool::Claude => claude::write(session),
-        Tool::Codex => vec![codex::write(session)],
-        Tool::Opencode => vec![opencode::write(session)],
-    };
-    if files.iter().all(|f| f.is_none()) {
-        report.dropped += session.message_count();
-    }
-    let artifacts: Vec<PathBuf> = files.into_iter().flatten().collect();
-    (WriteOutcome { artifacts }, report)
 }
 
 /// Import artifact id for a source session; import filenames and opencode
@@ -136,32 +137,13 @@ pub(super) fn role_str(role: Role) -> &'static str {
 }
 
 pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    let parent = path.parent().context("no parent")?;
-    fs::create_dir_all(parent)?;
     if path.exists() {
         let bak = path.with_extension("bak");
         if !bak.exists() {
             fs::copy(path, &bak)?;
         }
     }
-    let tmp = parent.join(format!(
-        ".xses-{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("x")
-    ));
-    {
-        let mut f = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&tmp)?;
-        f.write_all(bytes)?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path)?;
-    if let Ok(dir) = File::open(parent) {
-        dir.sync_all().ok();
-    }
-    Ok(())
+    crate::storage::atomic_write(path, bytes)
 }
 
 /// Assigns ids a target will accept, keeping a call and its result on the same

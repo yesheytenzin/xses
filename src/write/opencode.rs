@@ -39,8 +39,11 @@ static OPENCODE_MODEL: std::sync::LazyLock<serde_json::Value> = std::sync::LazyL
     }
 });
 
-pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
-    let ses = format!("ses_{}", import_id(session.tool, &session.id));
+pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Option<PathBuf> {
+    let ses = format!(
+        "ses_{}",
+        import_id(session.tool, &super::artifact_key(session, revision))
+    );
     let now_ms = chrono::Utc::now().timestamp_millis();
     let model = local_opencode_model();
     let provider_id = model
@@ -373,7 +376,7 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
         },
         "messages": msgs_json,
     });
-    let tmp = std::env::temp_dir().join(format!("xses-{ses}.json"));
+    let tmp = std::env::temp_dir().join(format!("xses-{}-{ses}.json", std::process::id()));
     let subject = format!("{} {}", session.tool.as_str(), session.id);
     let bytes = match serde_json::to_vec_pretty(&payload) {
         Ok(b) => b,
@@ -386,16 +389,9 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
         super::journal_failure(&subject, &format!("{}: {e}", tmp.display()));
         return None;
     }
-    // Concurrent `opencode import` runs are safe (verified 8-way against the
-    // live store); only serial `export` truncated stdout, and xses never
-    // shells out to export. Imports therefore run parallel across sessions.
-    // The CLI's import cost is linear in payload size (~1.8s/MB measured up
-    // to 45MB) on top of ~1s of startup, so the deadline scales with it.
+    // Imports are serial per OpenCode store. The deadline scales with payload
+    // size; retries only contend with external OpenCode writers.
     let deadline = Duration::from_secs(60 + 3 * (bytes.len() as u64 / (1024 * 1024)));
-    // A failed import is almost always a lost SQLite lock race (the store's
-    // WAL grows into the hundreds of MB during a batch). First attempts run
-    // in parallel; retries take this lock so only one is in flight, and each
-    // waits out the others before trying again.
     static RETRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let mut last = None;
     for attempt in 0..3u32 {
@@ -443,6 +439,14 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
         Some(Err(e)) => e.to_string(),
         None => "unknown".into(),
     };
+    // A partially imported generation must not replace the last committed one.
+    if revision.is_some() {
+        if let Err(e) = crate::sync::retire_artifacts(&[PathBuf::from(format!("opencode://{ses}"))])
+        {
+            crate::issues::record("opencode-rollback", &ses, &e.to_string());
+        }
+    }
+    let _ = fs::remove_file(&tmp);
     crate::issues::record("opencode-import", &ses, &reason);
     eprintln!(
         "opencode import failed for {ses}: {}",
@@ -451,8 +455,12 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
     fs::remove_file(&tmp).ok();
     None
 }
-fn local_opencode_model() -> serde_json::Value {
+pub(crate) fn current_model() -> serde_json::Value {
     OPENCODE_MODEL.clone()
+}
+
+fn local_opencode_model() -> serde_json::Value {
+    current_model()
 }
 /// 24 random alphanumerics.
 /// File extension for an image mime type, for the `file` part filename.

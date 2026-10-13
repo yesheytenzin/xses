@@ -15,6 +15,7 @@ mod progress;
 mod refs;
 mod scan;
 mod scope;
+mod storage;
 mod sync;
 mod write;
 

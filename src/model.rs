@@ -64,6 +64,9 @@ pub struct Session {
     /// appends — used for import naming and timestamps.
     pub created: DateTime<Utc>,
     pub size: u64,
+    /// Native revision metadata or a content digest for database sources.
+    #[serde(default)]
+    pub revision: Option<String>,
     pub messages: u64,
     /// First user message text or native title, truncated.
     pub summary: String,

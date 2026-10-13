@@ -307,6 +307,19 @@ impl CanonicalSession {
         (msgs, report)
     }
 
+    /// Count fidelity without allocating a second copy of the entire history.
+    pub fn transfer_summary(&self) -> (bool, LossReport) {
+        let mut has_content = false;
+        let mut report = LossReport::default();
+        for block in self.blocks() {
+            if let Some((text, fidelity)) = block.flatten() {
+                has_content |= !text.trim().is_empty();
+                report.tally(fidelity);
+            }
+        }
+        (has_content, report)
+    }
+
     /// Blocks grouped by their source message, in order — the shape writers
     /// need to emit multi-part native messages.
     pub fn grouped(&self) -> Vec<(u32, Vec<&Block>)> {
@@ -393,7 +406,7 @@ impl LossReport {
 
 /// Apply `--scope last:N`: keep only the trailing N user turns (plus
 /// everything after the Nth-from-last user message).
-pub fn scope_last_n(session: CanonicalSession, n: usize) -> CanonicalSession {
+pub fn scope_last_n(mut session: CanonicalSession, n: usize) -> CanonicalSession {
     let users: Vec<usize> = session
         .events
         .iter()
@@ -412,11 +425,15 @@ pub fn scope_last_n(session: CanonicalSession, n: usize) -> CanonicalSession {
     } else {
         Some(users[users.len() - n])
     };
-    let events = match keep_from {
-        Some(start) => session.events[start..].to_vec(),
-        None => Vec::new(),
-    };
-    CanonicalSession { events, ..session }
+    match keep_from {
+        Some(start) => {
+            session.events.drain(..start);
+        }
+        None => session.events.clear(),
+    }
+    let retained: std::collections::HashSet<_> = session.events.iter().map(|e| e.msg).collect();
+    session.msg_times.retain(|msg, _| retained.contains(msg));
+    session
 }
 
 #[cfg(test)]

@@ -35,11 +35,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         include_noise,
     } = args;
     let plan = refs::resolve_items(&items, &from, &to)?;
-    let mut sessions = scope::load(all, include_noise)?;
-    // `--from <tool>` scopes which stores a ref may resolve against and which
-    // tools bulk mode draws from, so it must apply before selection.
-    if !plan.from_tools.is_empty() {
-        sessions.retain(|s| plan.from_tools.contains(&s.tool));
+    let tools = if plan.from_tools.is_empty() {
+        Tool::write_targets()
+    } else {
+        &plan.from_tools
+    };
+    let mut sessions = crate::scan::scan_tools(scope::filter(all).as_deref(), tools, !dry_run)?;
+    if !include_noise {
+        sessions.retain(|s| s.noise.is_none());
     }
     // Sources: explicit refs select; empty refs mean the newest per tool.
     // Explicit picks always resolve (even to imports); bulk mode skips
@@ -52,7 +55,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
         dedupe(picked)
     } else {
-        let mut bulk = select_bulk_sources(sessions, all, num)?;
+        let mut bulk = select_bulk_sources(sessions, all, num, include_imports)?;
         bulk.retain(|s| include_imports || !s.is_import);
         bulk
     };
@@ -69,13 +72,14 @@ pub fn run(args: Args) -> anyhow::Result<()> {
                 Some(n) => crate::canonical::scope_last_n(canon, n),
                 None => canon,
             };
-            if canon.messages().0.is_empty() {
+            if !canon.transfer_summary().0 {
                 continue;
             }
             preview(&canon);
         }
         return Ok(());
     }
+    let mut import_failed = false;
     if !tool_targets.is_empty() {
         // explicit refs bypass the import filter (bulk mode keeps it)
         let progress = if dry_run {
@@ -92,6 +96,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             &progress,
         )?;
         progress.finish();
+        import_failed = report.targets.iter().any(|t| !t.failed.is_empty());
         let (written, skipped, loss) = report.totals();
         println!(
             "{}: {} source sessions across {} targets → {} written, {} skipped | fidelity: {} preserved, {} normalized, {} downgraded, {} dropped",
@@ -135,16 +140,19 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
     }
     let multi_export = sources.len() > 1 || format_targets.len() > 1;
-    for fmt in format_targets {
-        for s in &sources {
-            let mut canon = refs::canonicalize(s, &s.path)?;
-            if let Some(n) = turn_scope {
-                canon = crate::canonical::scope_last_n(canon, n);
-            }
-            if canon.messages().0.is_empty() {
-                eprintln!("skip {} {}: no transferable content", s.tool.as_str(), s.id);
-                continue;
-            }
+    for s in &sources {
+        if format_targets.is_empty() {
+            break;
+        }
+        let mut canon = refs::canonicalize(s, &s.path)?;
+        if let Some(n) = turn_scope {
+            canon = crate::canonical::scope_last_n(canon, n);
+        }
+        if !canon.transfer_summary().0 {
+            eprintln!("skip {} {}: no transferable content", s.tool.as_str(), s.id);
+            continue;
+        }
+        for fmt in &format_targets {
             if dry_run {
                 preview_format(&canon, fmt);
                 continue;
@@ -160,5 +168,9 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             }
         }
     }
+    anyhow::ensure!(
+        !import_failed,
+        "one or more imports failed; previous imports were retained"
+    );
     Ok(())
 }

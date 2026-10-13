@@ -99,10 +99,16 @@ tally per reason, `ls --include-noise` lists them with a `!reason` marker, and
 
 ## Naming and updates
 
-Re-sync updates in place: a source session's artifact path (and opencode id)
-derives from its id, and a changed source rewrites that one artifact — the
-index keeps a single record per (target, source) pair, so pickers never grow a
-second row for the same session. Row titles come from the source agent's own
+Re-sync builds a new generation before retiring the previous import. Native
+artifact IDs include the source revision, mapping version, and requested turn
+scope; provenance still names the original source. The index durably records
+both generations until retirement succeeds, so a failed replacement preserves
+the previous import and interrupted retirement is retried on the next sync.
+Normally one committed generation remains per (target, source) pair. OpenCode
+sources use a digest of their session, message, and part content so edits and
+deletions are detected even when a client omits its timestamp update.
+
+Row titles come from the source agent's own
 title when it records one (pi/omp `title`, opencode `session.title`, or the
 title an earlier import carried), falling back to the first user ask; the
 first-ask fallback is why two *different* sessions that open with the same

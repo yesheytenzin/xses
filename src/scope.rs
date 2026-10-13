@@ -61,7 +61,6 @@ pub fn limit(all: bool, requested: Option<usize>) -> Option<usize> {
 
 /// Newest-first rows, capped when a limit applies.
 pub fn capped(mut sessions: Vec<Session>, cap: Option<usize>) -> Vec<Session> {
-    sessions.sort_by_key(|s| std::cmp::Reverse(s.mtime));
     if let Some(n) = cap {
         sessions.truncate(n);
     }

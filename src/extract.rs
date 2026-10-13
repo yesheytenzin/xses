@@ -44,6 +44,29 @@ pub fn extract(
     })
 }
 
+/// Hash the selected source's actual rows, not just session timestamps. This
+/// catches same-length edits and deletions by clients that omit revision bumps.
+pub fn opencode_revision(id: &str) -> Result<(String, u64)> {
+    use std::hash::Hasher;
+    let db =
+        crate::scan::opencode_db().ok_or_else(|| anyhow::anyhow!("opencode database not found"))?;
+    let id = id.replace('\'', "''");
+    let sql = format!("SELECT 'session' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session WHERE id='{id}'
+        UNION ALL SELECT 'message', id, json_object('data', data, 'created', time_created) FROM message WHERE session_id='{id}'
+        UNION ALL SELECT 'part', id, json_object('data', data, 'created', time_created) FROM part WHERE session_id='{id}' ORDER BY kind, id;");
+    let mut cmd = std::process::Command::new("sqlite3");
+    cmd.args(["-readonly", "-json"]).arg(db).arg(sql);
+    let out = crate::proc::output_with_timeout(cmd, std::time::Duration::from_secs(60))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "OpenCode revision read failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    hash.write(&out.stdout);
+    Ok((format!("{:016x}", hash.finish()), out.stdout.len() as u64))
+}
+
 /// opencode transcripts via read-only SQL (message + part `data` JSON).
 /// The runtime shapes are identical to `opencode export` output, but SQL is
 /// deterministic: the CLI truncates large stdout to 64KB multiples with exit 0.
@@ -65,10 +88,7 @@ fn opencode(id: &str) -> Result<Events> {
                 String::from_utf8_lossy(&q.stderr).trim()
             );
         }
-        Ok(
-            crate::proc::json_rows(&String::from_utf8_lossy(&q.stdout), "opencode transcript")
-                .unwrap_or_default(),
-        )
+        crate::proc::json_rows(&String::from_utf8_lossy(&q.stdout), "opencode transcript")
     };
     let msgs = run(&format!(
         "SELECT id, data FROM message WHERE session_id = '{esc}' ORDER BY time_created, id;"

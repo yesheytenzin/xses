@@ -25,9 +25,9 @@ struct Item {
     ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
+pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
-    let sid = synth_id(session.tool, &session.id);
+    let sid = synth_id(session.tool, &super::artifact_key(session, revision));
     // codex vets the filename: `rollout-<ts>-<full-uuid>.jsonl` ("canonical
     // rollout filename"), so the uuid must be in it, not a short id.
     let target = home
@@ -766,30 +766,14 @@ fn seed_codex_history(
     stmts.push(format!(
         "INSERT OR REPLACE INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES ('{sid}', {byte_len}, {next_ord});"
     ));
-    let script = stmts.join(";\n") + ";\n";
-    // pipe via stdin: large sessions exceed argv limits as a single arg
-    let mut child = match std::process::Command::new("sqlite3")
-        .args(["-cmd", ".timeout 5000"])
-        .arg(&db)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-    {
-        Ok(c) => c,
-        Err(e) => {
-            crate::issues::record("codex-seed", sid, &format!("spawn failed: {e}"));
-            return false;
-        }
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        use std::io::Write;
-        if stdin.write_all(script.as_bytes()).is_err() {
-            crate::issues::record("codex-seed", sid, "script write failed");
-            return false;
-        }
-    }
-    match child.wait_with_output() {
+    let script = "BEGIN IMMEDIATE;\n".to_owned() + &stmts.join(";\n") + ";\nCOMMIT;\n";
+    let mut command = std::process::Command::new("sqlite3");
+    command.args(["-bail", "-cmd", ".timeout 5000"]).arg(&db);
+    match crate::proc::output_with_input(
+        command,
+        script.into_bytes(),
+        std::time::Duration::from_secs(30),
+    ) {
         Ok(out) if out.status.success() => true,
         Ok(out) => {
             crate::issues::record(
@@ -922,9 +906,38 @@ fn remove_codex_metadata(home: &std::path::Path, sid: &str) {
     }
 }
 
-/// Find the codex state DB that carries the `threads` table.
-pub(crate) fn codex_state_db_pub(home: &std::path::Path) -> Option<PathBuf> {
-    codex_state_db(home)
+/// Remove an obsolete generation's picker and projection entries. The index
+/// retains failed retirements, so a locked database is retried on the next sync.
+pub(crate) fn retire_codex(path: &std::path::Path) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let home = dirs::home_dir().context("no home dir")?;
+    let name = path
+        .file_stem()
+        .and_then(|p| p.to_str())
+        .context("invalid rollout path")?;
+    let sid = name
+        .get(name.len().saturating_sub(36)..)
+        .context("invalid rollout id")?;
+    let sid = sid.replace('\'', "''");
+    let mut queries = Vec::new();
+    if let Some(db) = codex_state_db(&home) {
+        queries.push((db, format!("DELETE FROM threads WHERE id='{sid}';")));
+    }
+    let history = home.join(".codex/thread_history_1.sqlite");
+    if history.exists() {
+        queries.push((history, format!("BEGIN IMMEDIATE; DELETE FROM thread_items WHERE thread_id='{sid}'; DELETE FROM thread_turns WHERE thread_id='{sid}'; DELETE FROM thread_history_projection_state WHERE thread_id='{sid}'; COMMIT;")));
+    }
+    for (db, sql) in queries {
+        let mut command = std::process::Command::new("sqlite3");
+        command.args(["-cmd", ".timeout 5000"]).arg(db).arg(sql);
+        let out = crate::proc::output_with_timeout(command, std::time::Duration::from_secs(10))?;
+        anyhow::ensure!(
+            out.status.success(),
+            "Codex retirement failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    Ok(())
 }
 
 /// Find the codex state DB that carries the `threads` table.

@@ -15,7 +15,11 @@ pub(super) const IMPORT_NOTE: &str = "Imported history from another agent's sess
      The tool calls and results below already executed there; treat them as a transcript to \
      read, never as pending state to continue.";
 
-pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf> {
+pub(super) fn write(
+    target: Tool,
+    session: &CanonicalSession,
+    revision: Option<&str>,
+) -> Option<PathBuf> {
     let home = dirs::home_dir()?;
     let is_omp = matches!(target, Tool::Omp);
     // pi wraps the absolute path slug; omp strips home then wraps segments.
@@ -42,15 +46,15 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
         "{}_{}.jsonl",
         iso_stamp(session.created),
         if is_omp {
-            omp_id(session)
+            omp_id(session, revision)
         } else {
-            import_id(session.tool, &session.id)
+            import_id(session.tool, &super::artifact_key(session, revision))
         }
     ));
     let sid = if is_omp {
-        omp_id(session)
+        omp_id(session, revision)
     } else {
-        synth_id(session.tool, &session.id)
+        synth_id(session.tool, &super::artifact_key(session, revision))
     };
     let ts = iso(&session.created);
     let ts_ms = session.created.timestamp_millis();
@@ -117,6 +121,18 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
     // verified against a live session — missing usage crashes the renderer).
     let model_id = format!("{sid}-mdl");
     let think_id = format!("{sid}-thk");
+    // Model chain mirrors a native session, but reuses the model the user
+    // actually runs in opencode so the import opens on a real model instead
+    // of a placeholder (`xses/imported` broke model resolution in pi's TUI).
+    let oc_model = super::opencode::current_model();
+    let pi_provider = oc_model
+        .get("providerID")
+        .and_then(|v| v.as_str())
+        .unwrap_or("xses");
+    let pi_model_id = oc_model
+        .get("modelID")
+        .and_then(|v| v.as_str())
+        .unwrap_or("imported");
     let model_change = if is_omp {
         json!({
             "type": "model_change",
@@ -133,8 +149,8 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
             "id": model_id,
             "parentId": null,
             "timestamp": ts,
-            "provider": "xses",
-            "modelId": "imported",
+            "provider": pi_provider,
+            "modelId": pi_model_id,
         })
     };
     push(&mut buf, &model_change);
@@ -307,9 +323,9 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
             if matches!(role, Role::Assistant) {
                 let (input, output, reasoning, cache_read, cache_write, cost, model) =
                     usage.clone().unwrap_or((0, 0, 0, 0, 0, 0.0, None));
-                message["api"] = json!("xses");
-                message["provider"] = json!("xses");
-                message["model"] = json!(model.unwrap_or_else(|| "imported".into()));
+                message["api"] = json!(pi_provider);
+                message["provider"] = json!(pi_provider);
+                message["model"] = json!(model.unwrap_or_else(|| pi_model_id.into()));
                 message["stopReason"] = json!("stop");
                 message["thinkingLevel"] = json!("off");
                 message["durationMs"] = json!(0);
@@ -389,9 +405,9 @@ fn role_str(role: Role) -> &'static str {
 /// OMP validates session IDs as UUIDv7: the first 48 bits are the millisecond
 /// timestamp, followed by the version and RFC 9562 variant. The rest stays
 /// deterministic so repeated syncs keep identity.
-pub(super) fn omp_id(session: &CanonicalSession) -> String {
+pub(super) fn omp_id(session: &CanonicalSession, revision: Option<&str>) -> String {
     let ms = session.created.timestamp_millis().max(0) as u64;
-    let base: String = synth_id(session.tool, &session.id)
+    let base: String = synth_id(session.tool, &super::artifact_key(session, revision))
         .chars()
         .filter(|c| *c != '-')
         .collect();
@@ -423,7 +439,7 @@ mod tests {
             msg_times: Default::default(),
             events: vec![],
         };
-        let id = omp_id(&session);
+        let id = omp_id(&session, None);
         assert_eq!(id.len(), 36);
         assert_eq!(id.as_bytes()[14], b'7');
         assert_eq!(id.as_bytes()[19], b'8');

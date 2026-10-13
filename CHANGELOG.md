@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — CLI contract from TODO.md
+## 0.0.4 — CLI contract, diagnostics, and faster syncs
 
 - `doctor` reports what is installed (agent CLIs, `sqlite3`), what each store
   holds, how many imports the index records (including records whose artifacts
@@ -33,7 +33,6 @@
 - Commands are split into `src/cmd/` with `src/cli.rs` (flags) and
   `src/scope.rs` (cwd vs `--all`), so the CLI surface lives in one place.
 
-## Unreleased — visible import gaps
 
 - Imports now mark untransferable content in the transcript: images, redacted
   reasoning, code patches, compaction pointers, and tool calls whose output was

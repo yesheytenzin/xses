@@ -20,15 +20,13 @@ pub fn load(all: bool) -> anyhow::Result<Vec<Session>> {
     crate::scan::scan_all(f.as_deref())
 }
 
-/// Effective row cap: `--all` shows everything, `-n 0` means no cap.
+/// Effective row cap. An explicit `-n` always wins (`-n 0` = no cap);
+/// `--all` only drops the default cap, widening the view to every project.
 pub fn limit(all: bool, requested: Option<usize>) -> Option<usize> {
-    if all {
-        return None;
-    }
     match requested {
         Some(0) => None,
         Some(n) => Some(n),
-        None => Some(crate::cli::DEFAULT_LIMIT),
+        None => (!all).then_some(crate::cli::DEFAULT_LIMIT),
     }
 }
 
@@ -39,4 +37,23 @@ pub fn capped(mut sessions: Vec<Session>, cap: Option<usize>) -> Vec<Session> {
         sessions.truncate(n);
     }
     sessions
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_limit_beats_the_all_default() {
+        // default: newest few of this project
+        assert_eq!(limit(false, None), Some(crate::cli::DEFAULT_LIMIT));
+        // an explicit count always wins, with or without --all
+        assert_eq!(limit(false, Some(8)), Some(8));
+        assert_eq!(limit(true, Some(8)), Some(8));
+        // 0 means no cap
+        assert_eq!(limit(false, Some(0)), None);
+        assert_eq!(limit(true, Some(0)), None);
+        // --all alone drops the default cap
+        assert_eq!(limit(true, None), None);
+    }
 }

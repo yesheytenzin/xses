@@ -35,12 +35,14 @@ The command is `xses`.
 ## Quick start
 
 ```sh
-xses                     # pick one of the newest 5 sessions here
+xses pick                # newest 5 sessions here; Enter resumes the chosen one
 xses sync                # move the newest session from each agent
 xses ls                  # newest 5 sessions in this project
 xses clean               # remove the newest synced session's imports
 xses doctor              # what is installed, what failed
 ```
+
+`xses` on its own is `xses pick`.
 
 ## Commands
 

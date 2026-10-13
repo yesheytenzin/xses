@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -96,41 +96,72 @@ fn lock_still_held() -> bool {
 }
 
 /// Refuse an index mutation when the lock was lost mid-run.
+/// Take the lock over again when it vanished and nobody else holds it.
+///
+/// A lock file can disappear under a running sync (something outside xses
+/// removing it). Re-acquiring atomically keeps mutual exclusion: if another
+/// process has taken it since, freeing the file means two writers, so this
+/// refuses. Either way the index is never written without a lock we hold.
 fn require_lock() -> Result<()> {
     if lock_still_held() {
         return Ok(());
     }
+    let (Some(path), Some(pid)) = (HELD_LOCK.get(), HELD_PID.get()) else {
+        return Ok(()); // read-only path: no lock was ever taken
+    };
+    if try_create_lock(path, *pid) {
+        return Ok(());
+    }
     anyhow::bail!(
-        "index lock lost (file removed or replaced) — another xses is writing; refusing to touch the index"
+        "index lock lost (removed or replaced by another process) — refusing to touch the index"
     )
+}
+
+/// Create the lock atomically, writing `pid` into it. True when we own it now.
+fn try_create_lock(path: &Path, pid: u32) -> bool {
+    use std::io::Write as _;
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+    {
+        Ok(mut file) => {
+            let _ = writeln!(file, "{pid}");
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 impl Drop for IndexLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // Never remove a lock we no longer own: a takeover would have written
+        // its own PID, and deleting it would free the index for two writers.
+        let ours = fs::read_to_string(&self.path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .is_some_and(|pid| pid == std::process::id());
+        if ours {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
 fn acquire_index_lock() -> Result<IndexLock> {
-    use std::io::Write;
     let index = index_path()?;
     let path = index.with_extension("lock");
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
+    let pid = std::process::id();
     for _ in 0..100 {
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+        if try_create_lock(&path, pid) {
+            let _ = HELD_LOCK.set(path.clone());
+            let _ = HELD_PID.set(pid);
+            return Ok(IndexLock { path });
+        }
         {
-            Ok(mut file) => {
-                writeln!(file, "{}", std::process::id())?;
-                let _ = HELD_LOCK.set(path.clone());
-                let _ = HELD_PID.set(std::process::id());
-                return Ok(IndexLock { path });
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            {
                 let stale = fs::read_to_string(&path)
                     .ok()
                     .and_then(|s| s.trim().parse::<u32>().ok())
@@ -145,7 +176,6 @@ fn acquire_index_lock() -> Result<IndexLock> {
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(e.into()),
         }
     }
     anyhow::bail!(

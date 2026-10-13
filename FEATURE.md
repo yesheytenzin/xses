@@ -2,7 +2,7 @@
 
 What a sync carries, where it lands, and what can never move. Statuses:
 
-- **carried** — written as the target's own construct (mapping version 2).
+- **carried** — written as the target's own construct (mapping version 4).
 - **text** — preserved as labelled text because the target has no construct.
 - **gap** — recorded as `[gap in imported history: …]` and counted as dropped.
 - **impossible** — the data is not in the source file or has no equivalent.
@@ -15,10 +15,10 @@ What a sync carries, where it lands, and what can never move. Statuses:
 | thinking (text) | `thinking` blocks | `reasoning` items | `thinking` parts | `reasoning` parts |
 | tool calls | `tool_use` (id, name, input) | `function_call` / `custom_tool_call` | `toolCall` (id, name, arguments) | `tool` part (`callID`, `state.input`) |
 | tool results | `tool_result` rows (`tool_use_id`, `is_error`) | `function_call_output` / `custom_tool_call_output` | `toolResult` messages (`toolCallId`, `toolName`, `isError`, `durationMs`) | `tool.state.output` / `state.error` |
-| images (≤5 MB each, 20 MB/session) | `image` base64 blocks | `input_image` data URLs | `image` parts (data + mimeType) | `file` parts (data URL + filename) |
+| images (≤5 MB each) | `image` base64 blocks | `input_image` data URLs | `image` parts (data + mimeType) | `file` parts (data URL + filename) |
 | patches | *text* | *text* | *text* | `patch` parts (hash + files) |
 | compaction | *text* | `contextCompaction` projection | `message` text | *text* |
-| usage / cost / tokens | per-message `usage` | `token_count` events | per-message `usage` | `step-finish` tokens |
+| usage / cost / tokens | per-message `usage` | `token_count` events | per-message `usage` | message `tokens` / `cost` (read side parses its `step-finish` parts) |
 | injected context | *text* (`[context: kind]`) | *text* | *text* | *text* |
 
 Projections each target's own UI reads:

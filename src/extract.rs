@@ -509,6 +509,16 @@ fn codex(path: &Path) -> Result<Vec<Event>> {
             }
             // Lifecycle events carry accounting and free text; item content
             // mirrors the response_items above.
+            // codex records compaction as its own row (`compacted`), whose
+            // `replacement_history` is the retained context codex keeps
+            // sending. The conversation continues in later response_items, so
+            // only the compaction itself is carried.
+            Some("compacted") => {
+                out.boundary();
+                out.push(codex_compaction(
+                    &v.get("payload").cloned().unwrap_or(Value::Null),
+                ));
+            }
             Some("event_msg") => {
                 let payload = v.get("payload").cloned().unwrap_or(Value::Null);
                 match payload.get("type").and_then(|t| t.as_str()) {
@@ -679,11 +689,37 @@ fn content_has_image(content: &Value) -> bool {
     })
 }
 
+/// codex's compaction row → `Compressed`. Its `message` is usually empty, so
+/// the retained history's size is what tells the reader how much went away.
+fn codex_compaction(payload: &Value) -> Block {
+    let text = payload
+        .get("message")
+        .and_then(|m| m.as_str())
+        .filter(|t| !t.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            let retained = payload
+                .get("replacement_history")
+                .and_then(|h| h.as_array())
+                .map(Vec::len)
+                .unwrap_or(0);
+            format!("session was compacted; {retained} retained items summarized away")
+        });
+    Compressed { text }
+}
+
 /// Image part → `Image` block when it fits the inline cap, otherwise a gap.
 fn image_block(part: &Value, tool: Tool) -> Block {
+    // claude nests the payload one level down:
+    // `{type: image, source: {type: base64, media_type, data}}`.
+    let part = part
+        .get("source")
+        .filter(|source| source.is_object())
+        .unwrap_or(part);
     let mut mime = part
         .get("mimeType")
         .or_else(|| part.get("mime_type"))
+        .or_else(|| part.get("media_type"))
         .and_then(|m| m.as_str())
         .map(str::to_string);
     // pi/omp: {type:image, data, mimeType}; codex: {type:input_image, image_url:"data:…;base64,…"}.
@@ -1106,6 +1142,54 @@ mod tests {
                 assert_eq!(*bytes, 3u64);
             }
             other => panic!("want Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn claude_images_keep_bytes_and_media_type() {
+        // claude nests the payload: {type:image, source:{type:base64,
+        // media_type, data}} — the source object carries both fields.
+        let events = parts(json!([{
+            "type": "image",
+            "source": {"type": "base64", "media_type": "image/jpeg", "data": "qq=="}
+        }]));
+        match &events[0].block {
+            Block::Image {
+                mime, data, bytes, ..
+            } => {
+                assert_eq!(
+                    mime.as_deref(),
+                    Some("image/jpeg"),
+                    "claude's media_type must survive: labelling jpeg as png breaks the image"
+                );
+                assert_eq!(
+                    data.as_deref(),
+                    Some("qq=="),
+                    "claude's base64 must be read"
+                );
+                assert_eq!(*bytes, 3u64);
+            }
+            other => panic!("want Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_compaction_is_carried_not_dropped() {
+        let payload = json!({
+            "message": "",
+            "replacement_history": [{"type": "message"}, {"type": "message"}],
+        });
+        match codex_compaction(&payload) {
+            Block::Compressed { text } => {
+                assert!(text.contains("compacted"), "{text}");
+                assert!(text.contains('2'), "retained size gives the scale: {text}");
+            }
+            other => panic!("want Compressed, got {other:?}"),
+        }
+        let with_message = json!({"message": "earlier work summarized"});
+        match codex_compaction(&with_message) {
+            Block::Compressed { text } => assert_eq!(text, "earlier work summarized"),
+            other => panic!("want Compressed, got {other:?}"),
         }
     }
 

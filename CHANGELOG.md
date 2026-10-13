@@ -44,6 +44,14 @@ target's constructs:
   version is part of the idempotency fingerprint (older copies re-import once),
   and `FEATURE.md` documents what is carried, text-only, or impossible.
 
+- the remaining impossible rows are now evidence-backed rather than assumed:
+  claude's `signature` decodes to signed metadata (protobuf: model, block type,
+  a 64-byte signature, nonces — no reasoning), and claude's CLI documents that a
+  rejected signature makes it strip thinking and retry; codex's
+  `encrypted_content` is server-side encrypted state replayed verbatim to the
+  same organization, with no local key (`~/.codex/auth.json` holds only tokens)
+  and only its readable `summary` transfers. Both were checked with REA against
+  the shipped codex binary and claude's bundled CLI, plus vendor docs.
 - tool ids are mapped into the target's accepted class. Anthropic validates
   `tool_use.id` against `^[A-Za-z0-9_-]+$` and answers a stray character with a
   400, while sources compose ids (`call_…|fc_…` from codex/omp): 108 imported

@@ -75,8 +75,8 @@ session to move nor turns to carry.
 
 | Data class | Why |
 |---|---|
-| Redacted / encrypted reasoning | not in the source file (claude stores empty `thinking` with a signature; codex stores `reasoning` with null content) |
-| Provider-signed thinking replay | signatures are validated by the originating provider |
+| Redacted / encrypted reasoning | the text is not in the store. claude's `signature` decodes to signed metadata (a protobuf carrying model, block type, a 64-byte signature, nonces — no reasoning); 2 048 blocks here are empty-bodied against 21 065 readable ones. codex's `encrypted_content` is server-side encrypted state (`response.input` of the API's design: written to be replayed verbatim to the *same* organization, decrypted in-memory only by the service), and no local key material exists — `~/.codex/auth.json` holds only tokens. codex's readable counterpart, the `summary` array, does transfer (20 728 rows here) |
+| Provider-signed thinking replay | the signature is verified by the service, not by the client: claude's own CLI documents the failure mode — a rejected signature ("Invalid signature in thinking block", "…cannot be modified") makes it *strip the thinking blocks and retry*. Nothing local can re-sign or re-scope a blob, and xses never imports into the source's own store, so a signature never has a valid destination |
 | Live runtime state (running tools, queues, background tasks, permission prompts) | not representable as history in any target; only the import note can describe it |
 | Provider-local bookkeeping (latches, bridge ids, file-history snapshots, fork refs, cache keys, credential pins) | same-tool round-trips keep them in the source; other agents have no place for them |
 | Non-image attachments with no embedded payload | a claude `file` row that carries only a path has nothing to move: xses inlines on-disk images within the cap, and for anything else writes a note naming the file. Text files claude already embedded (`content.file.content`) do transfer as text |

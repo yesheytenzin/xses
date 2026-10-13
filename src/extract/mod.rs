@@ -45,6 +45,24 @@ pub fn canonicalize(s: &crate::model::Session) -> Result<CanonicalSession> {
     Ok(canon)
 }
 
+/// Assemble a session from already-read events (single-read sync path):
+/// same shape `extract` + title would have built, without re-querying.
+pub fn canonicalize_events(
+    s: &crate::model::Session,
+    events: crate::canonical::Events,
+) -> CanonicalSession {
+    let (events, msg_times) = events.into_parts();
+    CanonicalSession {
+        id: s.id.clone(),
+        tool: s.tool,
+        cwd: s.cwd.clone(),
+        created: s.created,
+        title: Some(s.summary.clone()).filter(|t| !t.trim().is_empty()),
+        events,
+        msg_times,
+    }
+}
+
 /// Hash the selected source's actual rows, not just session timestamps. This
 /// catches same-length edits and deletions by clients that omit revision bumps.
 /// Format-native content (string or typed-parts array) → plain text, for
@@ -111,7 +129,7 @@ use pi::pi_family;
 mod tests {
     use super::claude::{claude, claude_attachment};
     use super::common::{codex_compaction, collect_parts};
-    use super::opencode::{opencode_part, opencode_v2_content};
+    use super::opencode::{events_from_v1, events_from_v2, opencode_part, opencode_v2_content};
     use super::text_of;
     use crate::canonical::{Block, Event, Events, Role};
     use crate::model::Tool;
@@ -297,6 +315,48 @@ mod tests {
         let events = out.into_vec();
         assert!(matches!(&events[0].block, Block::Text { .. }));
         assert!(matches!(&events[1].block, Block::Thinking { .. }));
+    }
+
+    #[test]
+    fn opencode_v1_walk_keeps_times_and_pairs_parts() {
+        // Walk-shaped rows as the snapshot rebuilds them from the union:
+        // `{id, data, time_created}` messages, `{data, message_id}` parts.
+        let msgs = vec![
+            serde_json::json!({"id": "m1", "data": "{\"role\":\"user\",\"content\":\"hi\"}", "time_created": 1000}),
+            serde_json::json!({"id": "m2", "data": "{\"role\":\"assistant\",\"content\":[]}", "time_created": 2000}),
+        ];
+        let parts = vec![
+            serde_json::json!({
+                "data": "{\"type\":\"text\",\"text\":\"hi\"}",
+                "message_id": "m1",
+            }),
+            serde_json::json!({
+                "data": "{\"type\":\"text\",\"text\":\"hello\"}",
+                "message_id": "m2",
+            }),
+        ];
+        let events = events_from_v1(&msgs, &parts);
+        let (list, times) = events.into_parts();
+        // v1 message text lives in parts: one block per part.
+        assert_eq!(list.len(), 2);
+        // The union carries `created`: message times survive (the old
+        // per-table query never recorded them).
+        assert_eq!(times.len(), 2);
+        assert!(matches!(list[0].block, Block::Text { .. }));
+    }
+
+    #[test]
+    fn opencode_v2_walk_orders_by_caller_sequence() {
+        // events_from_v2 trusts caller order (the snapshot sorts by `seq`).
+        let rows = vec![
+            serde_json::json!({"type": "user", "data": "{\"text\":\"q\"}", "time_created": 3000}),
+            serde_json::json!({"type": "assistant", "data": "{\"content\":[{\"type\":\"text\",\"text\":\"a\"}]}", "time_created": 4000}),
+        ];
+        let events = events_from_v2(&rows);
+        let (list, times) = events.into_parts();
+        assert_eq!(list.len(), 2);
+        assert_eq!(times.len(), 2);
+        assert!(matches!(list[1].block, Block::Text { .. }));
     }
 
     /// Write a claude transcript and parse it through the real reader. Each

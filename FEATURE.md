@@ -107,9 +107,9 @@ scope; provenance still names the original source. The index durably records
 both generations until retirement succeeds, so a failed replacement preserves
 the previous import and interrupted retirement is retried on the next sync.
 Normally one committed generation remains per (target, source) pair. OpenCode
-sources use a digest of their session plus message/part (v1) or
-session_message (v2) content, so edits and deletions are detected even when
-a client omits its timestamp update.
+sources are read once per sync: a single revision UNION feeds both the
+content digest and the transcript parse, so edits and deletions are detected
+even when a client omits its timestamp update.
 
 Row titles come from the source agent's own
 title when it records one (pi/omp `title`, opencode `session.title`, or the

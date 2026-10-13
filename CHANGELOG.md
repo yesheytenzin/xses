@@ -1,5 +1,20 @@
 # Changelog
 
+## Unreleased
+
+- opencode reads are down to one SQLite query per session: the revision
+  UNION feeds both the content digest and the transcript parse (previously
+  the digest plus one query per table, plus a generation probe). Revision
+  digests for bulk syncs run in parallel.
+- The digest input gained `message_id` on part rows, so opencode sources
+  re-sync once; retirement replaces the old generations automatically.
+- v1 opencode transcripts keep their per-message times (the union carries
+  each row's `created`; the old per-table query never recorded them).
+- All SQLite access goes through shared `proc::sqlite_*` helpers with
+  timeouts; scans no longer hang on a wedged store.
+- Internal splits with no output change: codex `rollout_items` → per-block
+  methods, opencode `write()` → message builders, `sync()` → phases.
+
 ## 0.6.0 — mapping 6: tool ids, message times and restored outputs
 
 The transfer layer stopped assuming what a store *might* hold and started

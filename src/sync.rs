@@ -13,7 +13,7 @@ use crate::canonical::{CanonicalSession, LossReport};
 use crate::index::{Index, Record};
 use crate::model::{Session, Tool};
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -255,13 +255,32 @@ impl SyncReport {
 fn canonicalize_batch<'a>(
     sources: &[&'a Session],
     scope: Option<usize>,
+    snapshots: &mut std::collections::HashMap<String, crate::extract::opencode::Snapshot>,
 ) -> Result<Vec<(&'a Session, Result<CanonicalSession>)>> {
+    // Snapshots read in the refresh step are single-use: move them into the
+    // batch inputs here so a retry re-reads rather than replaying stale rows.
+    let inputs: Vec<(&Session, Option<crate::canonical::Events>)> = sources
+        .iter()
+        .map(|&source| {
+            let snapshot = (source.tool == Tool::Opencode)
+                .then(|| snapshots.remove(&source.id))
+                .flatten()
+                .map(|snap| snap.events);
+            (source, snapshot)
+        })
+        .collect();
     std::thread::scope(|threads| {
-        let workers: Vec<_> = sources
-            .iter()
-            .map(|&source| {
+        let workers: Vec<_> = inputs
+            .into_iter()
+            .map(|(source, snapshot)| {
                 threads.spawn(move || {
-                    let canon = crate::extract::canonicalize(source).map(|c| match scope {
+                    let canon = match snapshot {
+                        Some(events) => {
+                            Ok(crate::extract::canonicalize_events(source, events))
+                        }
+                        None => crate::extract::canonicalize(source),
+                    }
+                    .map(|c| match scope {
                         Some(n) => crate::scope::last_n(c, n),
                         None => c,
                     });
@@ -323,7 +342,7 @@ pub fn sync(
         .filter(|s| include_imports || !s.is_import)
         .cloned()
         .collect();
-    refresh_opencode_revisions(&mut sources, &targets)?;
+    let mut snapshots = refresh_opencode_revisions(&mut sources, &targets)?;
     let pending = plan_pending(&sources, &mut report, &seen, scope, dry_run, progress);
     progress.flush(&format!("{} transcripts need importing", pending.len()));
     let mut start = 0;
@@ -343,6 +362,7 @@ pub fn sync(
             dry_run,
             progress,
             &mut index,
+            &mut snapshots,
         )?;
         start = end;
     }
@@ -350,37 +370,44 @@ pub fn sync(
 }
 
 /// OpenCode's own content digest also catches edits/deletions where an
-/// upstream client forgot to advance session.time_updated. Digests run in
-/// parallel: each is its own full-table read, like the extract batch below.
-fn refresh_opencode_revisions(sources: &mut [Session], targets: &[Tool]) -> Result<()> {
+/// upstream client forgot to advance session.time_updated. Snapshots run in
+/// parallel and carry the parsed transcript with the digest, so the extract
+/// batch below reuses the same read instead of querying twice.
+fn refresh_opencode_revisions(
+    sources: &mut [Session],
+    targets: &[Tool],
+) -> Result<HashMap<String, crate::extract::opencode::Snapshot>> {
     let indexed: Vec<(usize, &str)> = sources
         .iter()
         .enumerate()
         .filter(|(_, s)| s.tool == Tool::Opencode && targets.iter().any(|t| *t != s.tool))
         .map(|(i, s)| (i, s.id.as_str()))
         .collect();
-    let digests: Vec<(usize, String, u64)> = std::thread::scope(|threads| -> Result<Vec<_>> {
-        let workers: Vec<_> = indexed
-            .into_iter()
-            .map(|(i, id)| {
-                threads.spawn(move || {
-                    crate::extract::opencode::opencode_revision(id).map(|(rev, size)| (i, rev, size))
+    let snaps: Vec<(usize, crate::extract::opencode::Snapshot)> =
+        std::thread::scope(|threads| -> Result<Vec<_>> {
+            let workers: Vec<_> = indexed
+                .into_iter()
+                .map(|(i, id)| {
+                    threads.spawn(move || {
+                        crate::extract::opencode::opencode_snapshot(id).map(|snap| (i, snap))
+                    })
                 })
-            })
-            .collect();
-        workers
-            .into_iter()
-            .map(|w| {
-                w.join()
-                    .map_err(|_| anyhow::anyhow!("revision worker panicked"))?
-            })
-            .collect()
-    })?;
-    for (i, revision, size) in digests {
-        sources[i].revision = Some(revision);
-        sources[i].size = size;
+                .collect();
+            workers
+                .into_iter()
+                .map(|w| {
+                    w.join()
+                        .map_err(|_| anyhow::anyhow!("revision worker panicked"))?
+                })
+                .collect()
+        })?;
+    let mut snapshots = HashMap::new();
+    for (i, snap) in snaps {
+        sources[i].revision = Some(snap.revision.clone());
+        sources[i].size = snap.size;
+        snapshots.insert(sources[i].id.clone(), snap);
     }
-    Ok(())
+    Ok(snapshots)
 }
 
 /// Split sources into already-synced (counted as skipped) and still pending,
@@ -426,8 +453,9 @@ fn sync_batch(
     dry_run: bool,
     progress: &crate::progress::Progress,
     index: &mut Index,
+    snapshots: &mut HashMap<String, crate::extract::opencode::Snapshot>,
 ) -> Result<()> {
-    let extracted = canonicalize_batch(batch, scope)?;
+    let extracted = canonicalize_batch(batch, scope, snapshots)?;
     let targets: Vec<Tool> = report.targets.iter().map(|t| t.target).collect();
     let completed = std::thread::scope(|threads| -> Result<Vec<_>> {
         let workers: Vec<_> = targets

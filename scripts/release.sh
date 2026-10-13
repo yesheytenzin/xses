@@ -14,7 +14,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 usage() {
-  sed -n '3,13p' "$0" | sed 's/^# \?//'
+  awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
   exit 2
 }
 
@@ -59,17 +59,28 @@ echo "release $tag  (project version $current, branch $branch)"
   echo "refusing to release from '$branch' (check out main first)" >&2
   exit 1
 }
-if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
-  echo "tag $tag already exists" >&2
-  exit 1
-fi
 if [ "$dry" = 0 ] && [ -n "$(git status --porcelain)" ]; then
   echo "working tree is dirty; commit or stash first" >&2
   exit 1
 fi
 
+# An existing tag at HEAD means the version placement is already committed
+# (for example after a `--no-push` run); such a run only pushes.
+prepared=0
+if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+  if [ "$current" = "$version" ] && [ "$(git rev-list -n1 "$tag")" = "$(git rev-parse HEAD)" ]; then
+    prepared=1
+    echo "  tag $tag already points at HEAD; will push it"
+  else
+    echo "tag $tag already exists at a different commit" >&2
+    exit 1
+  fi
+fi
+
 # 1. Version placement: manifest, lock, changelog heading.
-if [ "$current" != "$version" ]; then
+if [ "$prepared" = 1 ]; then
+  :
+elif [ "$current" != "$version" ]; then
   run sed -i "s/^version = \"$current\"/version = \"$version\"/" Cargo.toml
   run cargo check --quiet # refreshes the xses entry in Cargo.lock
   if grep -q '^## Unreleased' CHANGELOG.md; then
@@ -89,21 +100,27 @@ run cargo clippy --all-targets --locked -- -D warnings
 run cargo fmt --check
 
 # 3. Commit what the bump changed, then tag it.
-run git add -A
-if [ "$dry" = 1 ]; then
-  echo "+ git commit -m \"Release $version\"   # if anything changed"
-elif [ -n "$(git status --porcelain)" ]; then
-  git commit -m "Release $version"
-else
-  echo "  nothing to commit"
+if [ "$prepared" = 0 ]; then
+  run git add -A
+  if [ "$dry" = 1 ]; then
+    echo "+ git commit -m \"Release $version\"   # if anything changed"
+  elif [ -n "$(git status --porcelain)" ]; then
+    git commit -m "Release $version"
+  else
+    echo "  nothing to commit"
+  fi
+  run git tag -a "$tag" -m "xses $version"
 fi
-run git tag -a "$tag" -m "xses $version"
 
 # 4. Push: the tag builds the release, main carries the version placement.
+push_branch="git push origin main"
+if [ "$force" = 1 ]; then
+  push_branch="git push --force-with-lease origin main"
+fi
 if [ "$no_push" = 1 ]; then
   echo
   echo "skipped the pushes (--no-push). To release:"
-  echo "  git push ${force:+--force-with-lease }origin main"
+  echo "  $push_branch"
   echo "  git push origin $tag"
   exit 0
 fi

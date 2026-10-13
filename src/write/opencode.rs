@@ -5,7 +5,7 @@
 //! with inline content, `info.location` + `projectID`, and provenance in
 //! `info.metadata.xses` (slugs are server-generated, so the v1 slug marker
 //! cannot survive an import).
-use super::{args_json_object, fallback_call_id, fallback_text, group_role, import_id, manifest, usage_of};
+use super::{args_json_object, fallback_call_id, fallback_text, group_role, import_id, manifest, usage_of, Usage};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::fs;
@@ -35,15 +35,12 @@ static OPENCODE_MODEL: std::sync::LazyLock<serde_json::Value> = std::sync::LazyL
         let Some(db) = crate::scan::opencode_db() else {
             break;
         };
-        let Ok(out) = std::process::Command::new("sqlite3")
-            .args(["-readonly", "-json"])
-            .arg(&db)
-            .arg(query)
-            .output()
-        else {
-            continue;
-        };
-        let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
+        let Ok(rows) = crate::proc::sqlite_json(
+            &db,
+            query,
+            std::time::Duration::from_secs(30),
+            "opencode model lookup"
+        ) else {
             continue;
         };
         if let Some(r) = rows.first() {
@@ -55,6 +52,265 @@ static OPENCODE_MODEL: std::sync::LazyLock<serde_json::Value> = std::sync::LazyL
     }
     fallback
 });
+
+/// v2 message builder: folds tool results, then renders one flat row per
+/// source group. Carries the id mapping minted fallbacks share.
+/// One source group plus its row identity: what every message builder needs.
+#[derive(Clone, Copy)]
+struct Row<'a> {
+    mid: &'a str,
+    ts: i64,
+    end_ts: i64,
+    role: Role,
+    blocks: &'a [&'a Block],
+}
+
+struct Builder {
+    ids: super::TargetIds,
+    minted: usize,
+    folded: std::collections::HashMap<String, (String, bool, Option<u64>)>,
+    model_id: String,
+    provider_id: String,
+}
+
+impl Builder {
+    /// Calls and results meet in one `tool` block, so results fold by call
+    /// id before the message loop. Minted fallback ids are shared with the
+    /// loop so an id-less call and its result still meet.
+    fn fold(&mut self, groups: &[(u32, Vec<&Block>)]) {
+        for (_, blocks) in groups {
+            for block in blocks {
+                if let Block::ToolResult {
+                    call_id,
+                    output,
+                    is_error,
+                    duration_ms,
+                    name,
+                } = block
+                {
+                    self.folded.insert(
+                        fallback_call_id(&mut self.ids, call_id, &mut self.minted, name),
+                        (output.clone(), *is_error, *duration_ms),
+                    );
+                }
+            }
+        }
+    }
+
+    fn build_content(
+        &mut self,
+        row: Row,
+        take_note: bool,
+    ) -> (Vec<Value>, Vec<Value>, Option<Value>) {
+        let Row {
+            ts,
+            end_ts,
+            role,
+            blocks,
+            ..
+        } = row;
+        let mut content: Vec<Value> = Vec::new();
+        let mut files: Vec<Value> = Vec::new();
+        let mut note = None;
+        if take_note {
+            if matches!(role, Role::User) {
+                // The note is assistant speech: it gets its own row ahead of
+                // a leading user message so roles stay clean.
+                note = Some(json!({
+                    "id": "msg_000000-note",
+                    "type": "assistant",
+                    "agent": "build",
+                    "model": {"id": self.model_id, "providerID": self.provider_id},
+                    "content": [{"type": "text", "text": super::IMPORT_NOTE}],
+                    "time": {"created": ts, "completed": end_ts},
+                    "finish": "stop",
+                    "cost": 0,
+                    "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                               "cache": {"read": 0, "write": 0}},
+                }));
+            } else {
+                content.push(json!({"type": "text", "text": super::IMPORT_NOTE}));
+            }
+        }
+        for block in blocks {
+            match block {
+            Block::Text { text, .. } => {
+                content.push(json!({"type": "text", "text": text}));
+            }
+            Block::Thinking { text, .. } => {
+                if !text.trim().is_empty() {
+                    content.push(json!({
+                        "type": "reasoning",
+                        "text": text,
+                        "time": {"created": ts, "completed": end_ts},
+                    }));
+                }
+            }
+            Block::ToolCall {
+                name,
+                args,
+                call_id,
+                status,
+            } => {
+                // Same mapping the fold loop used, so the call meets its
+                // self.folded result even when the source id needed remapping.
+                let cid = fallback_call_id(&mut self.ids, call_id, &mut self.minted, name);
+                // Completed states carry `content[]`; error states carry
+                // `error.message` instead — each shape without the other
+                // key (verified against live rows and the validator).
+                let input = args_json_object(args);
+                let (output, is_error, duration) = self.folded
+                    .get(&cid)
+                    .cloned()
+                    .unwrap_or_else(|| (String::new(), false, None));
+                let is_error = is_error || status.as_deref() == Some("error");
+                let state = if is_error {
+                    json!({"status": "error", "input": input,
+                           "error": {"type": "tool.execution", "message": output}})
+                } else {
+                    json!({"status": "completed", "input": input,
+                           "content": [{"type": "text", "text": output}]})
+                };
+                let call_end = ts + duration.unwrap_or(1).max(1) as i64;
+                content.push(json!({
+                    "type": "tool",
+                    "id": cid,
+                    "name": name,
+                    "state": state,
+                    "time": {"created": ts, "completed": call_end.max(end_ts)},
+                }));
+            }
+            // Results were self.folded into their call's part above.
+            Block::ToolResult { .. } => {}
+            Block::Image {
+                mime,
+                data,
+                path,
+                bytes,
+            } => {
+                match data {
+                    // User rows carry pictures as file entries
+                    // (data/mime/source/name, verified live).
+                    Some(d) if matches!(role, Role::User) => {
+                        let mime = mime.clone().unwrap_or_else(|| "image/png".to_string());
+                        let filename = path
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .and_then(|n| n.to_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| {
+                                format!("image-{bytes}.{}", extension_for(&mime))
+                            });
+                        files.push(json!({
+                            "data": d,
+                            "mime": mime,
+                            "source": {"type": "inline"},
+                            "name": filename,
+                        }));
+                    }
+                    _ => {
+                        if let Some(text) = fallback_text(block) {
+                            content.push(json!({"type": "text", "text": text}));
+                        }
+                    }
+                }
+            }
+            Block::Context { .. }
+            | Block::Patch { .. }
+            | Block::Compressed { .. }
+            | Block::Gap { .. } => {
+                if let Some(text) = fallback_text(block) {
+                    content.push(json!({"type": "text", "text": text}));
+                }
+            }
+            Block::Usage { .. } => {}
+        }
+    }
+        (content, files, note)
+    }
+
+    fn assemble(
+        &self,
+        row: Row,
+        mut content: Vec<Value>,
+        files: Vec<Value>,
+        usage: &Usage,
+    ) -> Value {
+        let Row {
+            mid,
+            ts,
+            end_ts,
+            role,
+            blocks,
+        } = row;
+    // Plain-text view of this group's content, for message types that
+    // carry a single `text` instead of blocks.
+    let texts: Vec<&str> = content
+        .iter()
+        .filter_map(|c| {
+            if c.get("type").and_then(|t| t.as_str()) == Some("text") {
+                c.get("text").and_then(|t| t.as_str())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let joined = texts.join("\n\n");
+    let msg = if matches!(role, Role::User) {
+        let mut m = json!({
+            "id": mid,
+            "type": "user",
+            "text": if joined.is_empty() { "[empty message]".into() } else { joined },
+            "time": {"created": ts},
+        });
+        if !files.is_empty() {
+            m["files"] = json!(files);
+        }
+        m
+    } else if matches!(role, Role::System) {
+        json!({
+            "id": mid,
+            "type": "system",
+            "text": if joined.is_empty() { "[empty message]".into() } else { joined },
+            "time": {"created": ts},
+        })
+    } else if !content.is_empty()
+        && blocks
+            .iter()
+            .all(|b| matches!(b, Block::Compressed { .. }))
+    {
+        // A pure compaction group rides as a real compaction message.
+        json!({
+            "id": mid,
+            "type": "compaction",
+            "status": "completed",
+            "reason": "auto",
+            "summary": joined,
+            "recent": "",
+            "time": {"created": ts},
+        })
+    } else {
+        if content.is_empty() {
+            // Never emit an empty assistant: the validator drops it.
+            content.push(json!({"type": "text", "text": "[empty message]"}));
+        }
+        json!({
+            "id": mid,
+            "type": "assistant",
+            "agent": "build",
+            "model": {"id": self.model_id, "providerID": self.provider_id},
+            "content": content,
+            "time": {"created": ts, "completed": end_ts},
+            "finish": "stop",
+            "cost": usage.cost,
+            "tokens": {"input": usage.input, "output": usage.output,
+                       "reasoning": usage.reasoning,
+                       "cache": {"read": usage.cache_read, "write": usage.cache_write}},
+        })
+    };
+        msg
+    }
+}
 
 pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Option<PathBuf> {
     let ses = format!(
@@ -79,31 +335,14 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
     let mut msgs_json: Vec<serde_json::Value> = Vec::new();
     let groups = session.grouped();
     let total = groups.len().max(1);
-    // opencode keeps a call and its result in ONE `tool` part, so results are
-    // folded by call id before the message loop.
-    let mut folded: std::collections::HashMap<String, (String, bool, Option<u64>)> =
-        std::collections::HashMap::new();
-    let mut ids = super::TargetIds::default();
-    // Minted fallback ids are shared with the message loop below so an
-    // id-less call and its result still meet on the same value.
-    let mut minted = 0usize;
-    for (_, blocks) in &groups {
-        for block in blocks {
-            if let Block::ToolResult {
-                call_id,
-                output,
-                is_error,
-                duration_ms,
-                name,
-            } = block
-            {
-                folded.insert(
-                    fallback_call_id(&mut ids, call_id, &mut minted, name),
-                    (output.clone(), *is_error, *duration_ms),
-                );
-            }
-        }
-    }
+    let mut builder = Builder {
+        ids: super::TargetIds::default(),
+        minted: 0,
+        folded: std::collections::HashMap::new(),
+        model_id,
+        provider_id,
+    };
+    builder.fold(&groups);
     // Import note rides on the first message as assistant text, so a resumed
     // agent reads the transcript as history rather than live state.
     let mut note_pending = true;
@@ -125,191 +364,24 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         let role = group_role(&blocks, Role::Assistant);
         let usage = usage_of(&blocks);
         // Assistant rows require `time.completed`; without it the validator
-        // silently drops the message (verified live). +1ms stays ordered.
+        // silently drops the message (verified live). End-of-row + 1ms keeps
+        // times ordered without claiming false precision — it may equal the
+        // next row's `created`, which the import accepts.
         let end_ts = ts + 1;
-        let mut content: Vec<Value> = Vec::new();
-        let mut files: Vec<Value> = Vec::new();
-        if note_pending {
-            note_pending = false;
-            if matches!(role, Role::User) {
-                // The note is assistant speech: it gets its own row ahead of
-                // a leading user message so roles stay clean.
-                msgs_json.push(json!({
-                    "id": format!("msg_{:06}-note", 0),
-                    "type": "assistant",
-                    "agent": "build",
-                    "model": {"id": model_id, "providerID": provider_id},
-                    "content": [{"type": "text", "text": super::IMPORT_NOTE}],
-                    "time": {"created": ts, "completed": end_ts},
-                    "finish": "stop",
-                    "cost": 0,
-                    "tokens": {"input": 0, "output": 0, "reasoning": 0,
-                               "cache": {"read": 0, "write": 0}},
-                }));
-            } else {
-                content.push(json!({"type": "text", "text": super::IMPORT_NOTE}));
-            }
-        }
-        for block in &blocks {
-            match block {
-                Block::Text { text, .. } => {
-                    content.push(json!({"type": "text", "text": text}));
-                }
-                Block::Thinking { text, .. } => {
-                    if !text.trim().is_empty() {
-                        content.push(json!({
-                            "type": "reasoning",
-                            "text": text,
-                            "time": {"created": ts, "completed": end_ts},
-                        }));
-                    }
-                }
-                Block::ToolCall {
-                    name,
-                    args,
-                    call_id,
-                    status,
-                } => {
-                    // Same mapping the fold loop used, so the call meets its
-                    // folded result even when the source id needed remapping.
-                    let cid = fallback_call_id(&mut ids, call_id, &mut minted, name);
-                    // Completed states carry `content[]`; error states carry
-                    // `error.message` instead — each shape without the other
-                    // key (verified against live rows and the validator).
-                    let input = args_json_object(args);
-                    let (output, is_error, duration) = folded
-                        .get(&cid)
-                        .cloned()
-                        .unwrap_or_else(|| (String::new(), false, None));
-                    let is_error = is_error || status.as_deref() == Some("error");
-                    let state = if is_error {
-                        json!({"status": "error", "input": input,
-                               "error": {"type": "tool.execution", "message": output}})
-                    } else {
-                        json!({"status": "completed", "input": input,
-                               "content": [{"type": "text", "text": output}]})
-                    };
-                    let call_end = ts + duration.unwrap_or(1).max(1) as i64;
-                    content.push(json!({
-                        "type": "tool",
-                        "id": cid,
-                        "name": name,
-                        "state": state,
-                        "time": {"created": ts, "completed": call_end.max(end_ts)},
-                    }));
-                }
-                // Results were folded into their call's part above.
-                Block::ToolResult { .. } => {}
-                Block::Image {
-                    mime,
-                    data,
-                    path,
-                    bytes,
-                } => {
-                    match data {
-                        // User rows carry pictures as file entries
-                        // (data/mime/source/name, verified live).
-                        Some(d) if matches!(role, Role::User) => {
-                            let mime = mime.clone().unwrap_or_else(|| "image/png".to_string());
-                            let filename = path
-                                .as_ref()
-                                .and_then(|p| p.file_name())
-                                .and_then(|n| n.to_str())
-                                .map(str::to_string)
-                                .unwrap_or_else(|| {
-                                    format!("image-{bytes}.{}", extension_for(&mime))
-                                });
-                            files.push(json!({
-                                "data": d,
-                                "mime": mime,
-                                "source": {"type": "inline"},
-                                "name": filename,
-                            }));
-                        }
-                        _ => {
-                            if let Some(text) = fallback_text(block) {
-                                content.push(json!({"type": "text", "text": text}));
-                            }
-                        }
-                    }
-                }
-                Block::Context { .. }
-                | Block::Patch { .. }
-                | Block::Compressed { .. }
-                | Block::Gap { .. } => {
-                    if let Some(text) = fallback_text(block) {
-                        content.push(json!({"type": "text", "text": text}));
-                    }
-                }
-                Block::Usage { .. } => {}
-            }
-        }
-        // Plain-text view of this group's content, for message types that
-        // carry a single `text` instead of blocks.
-        let texts: Vec<&str> = content
-            .iter()
-            .filter_map(|c| {
-                if c.get("type").and_then(|t| t.as_str()) == Some("text") {
-                    c.get("text").and_then(|t| t.as_str())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        let joined = texts.join("\n\n");
-        let msg = if matches!(role, Role::User) {
-            let mut m = json!({
-                "id": mid,
-                "type": "user",
-                "text": if joined.is_empty() { "[empty message]".into() } else { joined },
-                "time": {"created": ts},
-            });
-            if !files.is_empty() {
-                m["files"] = json!(files);
-            }
-            m
-        } else if matches!(role, Role::System) {
-            json!({
-                "id": mid,
-                "type": "system",
-                "text": if joined.is_empty() { "[empty message]".into() } else { joined },
-                "time": {"created": ts},
-            })
-        } else if !content.is_empty()
-            && blocks
-                .iter()
-                .all(|b| matches!(b, Block::Compressed { .. }))
-        {
-            // A pure compaction group rides as a real compaction message.
-            json!({
-                "id": mid,
-                "type": "compaction",
-                "status": "completed",
-                "reason": "auto",
-                "summary": joined,
-                "recent": "",
-                "time": {"created": ts},
-            })
-        } else {
-            if content.is_empty() {
-                // Never emit an empty assistant: the validator drops it.
-                content.push(json!({"type": "text", "text": "[empty message]"}));
-            }
-            json!({
-                "id": mid,
-                "type": "assistant",
-                "agent": "build",
-                "model": {"id": model_id, "providerID": provider_id},
-                "content": content,
-                "time": {"created": ts, "completed": end_ts},
-                "finish": "stop",
-                "cost": usage.cost,
-                "tokens": {"input": usage.input, "output": usage.output,
-                           "reasoning": usage.reasoning,
-                           "cache": {"read": usage.cache_read, "write": usage.cache_write}},
-            })
+        let take_note = note_pending;
+        note_pending = false;
+        let row = Row {
+            mid: &mid,
+            ts,
+            end_ts,
+            role,
+            blocks: &blocks,
         };
-        msgs_json.push(msg);
+        let (content, files, note) = builder.build_content(row, take_note);
+        if let Some(note) = note {
+            msgs_json.push(note);
+        }
+        msgs_json.push(builder.assemble(row, content, files, &usage));
     }
     // v2 import shape (verified against a live `session export`): flat
     // messages with inline content; provenance in `metadata.xses` because
@@ -326,7 +398,7 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
             "tokens": {"input": 0, "output": 0, "reasoning": 0,
                        "cache": {"read": 0, "write": 0}},
             "agent": "build",
-            "model": {"id": model_id, "providerID": provider_id},
+            "model": {"id": builder.model_id, "providerID": builder.provider_id},
             "metadata": {"xses": manifest(session)},
         },
         "messages": msgs_json,
@@ -360,15 +432,12 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         }
         // The payload directory is ignored: the session lands in the
         // `--directory` cwd, so the source project must be passed outright.
-        let mut command = Command::new("opencode");
+        let mut command = session_cmd();
         command
-            .arg("session")
             .arg("import")
             .arg("--directory")
             .arg(&session.cwd)
-            .arg(&tmp)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
+            .arg(&tmp);
         let out = crate::proc::output_with_timeout(command, deadline);
         let stdout = out
             .as_ref()
@@ -378,12 +447,8 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         // already there: drop it and import fresh so a mapping bump or new
         // turns actually replace the stored copy.
         if stdout.contains("already exists") {
-            let mut del = Command::new("opencode");
-            del.arg("session")
-                .arg("delete")
-                .arg(&ses)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped());
+            let mut del = session_cmd();
+            del.arg("delete").arg(&ses);
             let del_out = crate::proc::output_with_timeout(del, Duration::from_secs(60));
             if del_out.is_ok_and(|o| o.status.success()) {
                 // Fall through to the attempt below, which re-runs the
@@ -439,6 +504,18 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
     fs::remove_file(&tmp).ok();
     None
 }
+/// One `opencode session …` invocation with piped output. Callers add
+/// their subcommand: imports also pass `--directory` (the payload directory
+/// is ignored by the CLI, so the project must be stated outright).
+fn session_cmd() -> Command {
+    let mut command = Command::new("opencode");
+    command
+        .arg("session")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    command
+}
+
 pub(crate) fn current_model() -> serde_json::Value {
     OPENCODE_MODEL.clone()
 }
@@ -458,20 +535,26 @@ fn extension_for(mime: &str) -> &'static str {
     }
 }
 
+/// 24 random alphanumerics. Counter-seeded: the clock alone repeats within
+/// a tick, and only the message index prefix would keep those ids unique.
+static MINT_SEED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 fn mint_suffix() -> String {
     let alphabet: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         .chars()
         .collect();
     let mut s = String::new();
-    let mut seed = std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
-        .unwrap_or(0) as usize;
+        .unwrap_or(0) as u64;
+    let mut seed =
+        nanos.wrapping_add(MINT_SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     for _ in 0..24 {
         seed = seed
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
-        s.push(alphabet[(seed >> 33) % alphabet.len()]);
+        s.push(alphabet[((seed >> 33) % alphabet.len() as u64) as usize]);
     }
     s
 }

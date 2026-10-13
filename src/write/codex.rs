@@ -124,20 +124,34 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
     Some(target)
 }
 
-/// Map the IR onto codex's item vocabulary, keeping one entry per rollout
-/// record so ordinals stay aligned with the projection.
-fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
-    let mut out: Vec<Item> = Vec::new();
-    let mut n = 0usize;
-    let mint = |prefix: &str, n: &mut usize| {
-        *n += 1;
-        format!("{prefix}{n:05}")
-    };
+/// Shell-ish tool names render as `custom_tool_call` rows; everything else
+/// becomes a `function_call`.
+fn is_shellish(name: &str) -> bool {
+    matches!(
+        name,
+        "exec" | "exec_command" | "bash" | "shell" | "sh" | "terminal"
+    )
+}
 
-    // Import note: the resumed agent must read the transcript as history.
-    {
-        let id = mint("msg_", &mut n);
-        out.push(Item {
+/// Turns one transcript block into rollout records, threading id state.
+struct Roller<'a> {
+    out: Vec<Item>,
+    n: usize,
+    pending: Vec<(Option<String>, String, ThreadTool)>,
+    ids: super::TargetIds,
+    cwd: &'a std::path::Path,
+}
+
+impl Roller<'_> {
+    fn mint(&mut self, prefix: &str) -> String {
+        self.n += 1;
+        format!("{prefix}{:05}", self.n)
+    }
+
+    /// Import note: the resumed agent must read the transcript as history.
+    fn push_import_note(&mut self) {
+        let id = self.mint("msg_");
+        self.out.push(Item {
             wrapper: "response_item",
             payload: json!({
                 "type": "message",
@@ -154,391 +168,378 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
         });
     }
 
-    // Pending shell calls, so a result can complete its item.
-    let mut pending: Vec<(Option<String>, String, ThreadTool)> = Vec::new();
-    let mut ids = super::TargetIds::default();
+    fn push_block(&mut self, block: &Block, ts: Option<chrono::DateTime<chrono::Utc>>) {
+        match block {
+            Block::Text { role, text, .. } => self.push_text(role, text, ts),
+            Block::Thinking { text, .. } => self.push_thinking(text, ts),
+            Block::ToolCall {
+                name,
+                args,
+                call_id,
+                ..
+            } => self.push_tool_call(name, args, call_id, ts),
+            Block::ToolResult {
+                name,
+                output,
+                call_id,
+                is_error,
+                duration_ms,
+            } => self.push_tool_result(name, output, call_id, *is_error, *duration_ms, ts),
+            Block::Image {
+                mime, data, path, ..
+            } => self.push_image(mime, data, path, ts),
+            Block::Context { .. } => self.push_fallback(block, "ctx_", "input_text", "developer", ts),
+            Block::Patch { .. } => self.push_fallback(block, "patch_", "output_text", "assistant", ts),
+            Block::Compressed { .. } => self.push_compaction(block, ts),
+            Block::Usage {
+                input,
+                output,
+                reasoning,
+                cache_read,
+                cache_write,
+                ..
+            } => self.push_usage(*input, *output, *reasoning, *cache_read, *cache_write, ts),
+            Block::Gap { .. } => self.push_fallback(block, "gap_", "input_text", "system", ts),
+        }
+    }
+
+    fn push_text(&mut self, role: &Role, text: &String, ts: Option<chrono::DateTime<chrono::Utc>>) {
+
+        let id = self.mint("msg_");
+        let (wrapper_role, text_type) = match role {
+            Role::User => ("user", "input_text"),
+            Role::System => ("system", "input_text"),
+            Role::Assistant => ("assistant", "output_text"),
+        };
+        self.out.push(Item {
+            wrapper: "response_item",
+            payload: json!({
+                "type": "message",
+                "id": id,
+                "role": wrapper_role,
+                "content": [{"type": text_type, "text": text}],
+            }),
+            thread: Some(if matches!(role, Role::User) {
+                (
+                    "userMessage".into(),
+                    json!({"type": "userMessage", "id": id,
+                           "content": [{"type": "text", "text": text}]}),
+                )
+            } else {
+                (
+                    "agentMessage".into(),
+                    json!({"type": "agentMessage", "id": id, "text": text}),
+                )
+            }),
+            item_id: id,
+            ts,
+        });
+    }
+    fn push_thinking(&mut self, text: &String, ts: Option<chrono::DateTime<chrono::Utc>>) {
+
+        if text.trim().is_empty() {
+            return;
+        }
+        let id = self.mint("rs_");
+        self.out.push(Item {
+            wrapper: "response_item",
+            payload: json!({
+                "type": "reasoning",
+                "id": id,
+                "summary": [{"type": "summary_text", "text": text}],
+                "content": [],
+            }),
+            // codex's own reasoning items project as empty, so the
+            // projection shows the text as an agent message.
+            thread: Some((
+                "agentMessage".into(),
+                json!({"type": "agentMessage", "id": id, "text": format!("[thinking]\n{text}")}),
+            )),
+            item_id: id,
+            ts,
+        });
+    }
+    fn push_tool_call(&mut self, name: &String, args: &String, call_id: &Option<String>, ts: Option<chrono::DateTime<chrono::Utc>>) {
+
+        let shellish = is_shellish(name);
+        let id = call_id
+            .clone()
+            .map(|c| self.ids.get(&c))
+            .unwrap_or_else(|| self.mint("call_"));
+        let payload = if shellish {
+            json!({
+                "type": "custom_tool_call",
+                "call_id": id,
+                "name": "exec",
+                "input": args,
+                "status": "completed",
+            })
+        } else {
+            json!({
+                "type": "function_call",
+                "call_id": id,
+                "name": name,
+                "arguments": args,
+            })
+        };
+        let tool = classify_tool(name, args);
+        self.pending.push((Some(id.clone()), name.clone(), tool.clone()));
+        let thread = match &tool {
+            ThreadTool::Shell(command) => (
+                "commandExecution",
+                json!({
+                    "type": "commandExecution",
+                    "id": id,
+                    "command": command,
+                    "cwd": self.cwd,
+                    "status": "in_progress",
+                    "aggregatedOutput": "",
+                    "exitCode": null,
+                    "durationMs": null,
+                    "source": "xses-import",
+                }),
+            ),
+            // codex's TUI draws a patch as a file change, not as a
+            // command; the diff lives in the call's arguments.
+            ThreadTool::FileChange(changes) => (
+                "fileChange",
+                json!({"type": "fileChange", "id": id, "changes": changes}),
+            ),
+            ThreadTool::Mcp { server, tool } => (
+                "mcpToolCall",
+                json!({
+                    "type": "mcpToolCall",
+                    "id": id,
+                    "server": server,
+                    "tool": tool,
+                    "status": "in_progress",
+                    "arguments": serde_json::from_str::<Value>(args).unwrap_or(Value::Null),
+                    "result": null,
+                }),
+            ),
+            ThreadTool::ImageView(path) => (
+                "imageView",
+                json!({"type": "imageView", "id": id, "path": path}),
+            ),
+        };
+        self.out.push(Item {
+            wrapper: "response_item",
+            payload,
+            thread: Some((thread.0.to_string(), thread.1)),
+            item_id: id,
+            ts,
+        });
+    }
+    fn push_tool_result(&mut self, name: &String, output: &String, call_id: &Option<String>, is_error: bool, duration_ms: Option<u64>, ts: Option<chrono::DateTime<chrono::Utc>>) {
+
+        let id = call_id
+            .clone()
+            .or_else(|| {
+                self.pending
+                    .iter()
+                    .rev()
+                    .find(|(c, n, _)| c.is_none() && n == name)
+                    .and_then(|(c, _, _)| c.clone())
+            })
+            .unwrap_or_else(|| self.mint("call_"));
+        let shellish = self.pending
+            .iter()
+            .any(|(c, n, _)| n == name && (c.as_deref() == Some(&id) || c.is_none()));
+        let wrapper_payload = if shellish && is_shellish(name) {
+            json!({
+                "type": "custom_tool_call_output",
+                "call_id": id,
+                "output": [{"type": "input_text", "text": output}],
+            })
+        } else {
+            json!({
+                "type": "function_call_output",
+                "call_id": id,
+                "output": output,
+            })
+        };
+        let tool = self.pending
+            .iter()
+            .rev()
+            .find(|(c, n, _)| *n == *name && (c.as_deref() == Some(&id) || c.is_none()))
+            .map(|(_, _, t)| t.clone())
+            .unwrap_or_else(|| classify_tool(name, ""));
+        let command = match &tool {
+            ThreadTool::Shell(command) => command.clone(),
+            _ => name.clone(),
+        };
+        // A successful patch already rendered as the file change
+        // itself; only its failure needs a row of its own.
+        let thread = match &tool {
+            ThreadTool::FileChange(_) if !is_error => None,
+            ThreadTool::ImageView(_) => None,
+            ThreadTool::Mcp { server, tool: mcp } => Some((
+                "mcpToolCall".to_string(),
+                json!({
+                    "type": "mcpToolCall",
+                    "id": id,
+                    "server": server,
+                    "tool": mcp,
+                    "status": if is_error { "failed" } else { "completed" },
+                    "arguments": Value::Null,
+                    "result": {"content": [{"type": "text", "text": output}]},
+                }),
+            )),
+            _ => Some((
+                "commandExecution".to_string(),
+                json!({
+                    "type": "commandExecution",
+                    "id": id,
+                    "command": command,
+                    "cwd": self.cwd,
+                    "status": if is_error { "failed" } else { "completed" },
+                    "aggregatedOutput": output,
+                    "exitCode": Value::Null,
+                    "durationMs": duration_ms,
+                    "source": "xses-import",
+                }),
+            )),
+        };
+        self.out.push(Item {
+            wrapper: "response_item",
+            payload: wrapper_payload,
+            thread,
+            item_id: id,
+            ts,
+        });
+    }
+    fn push_image(&mut self, mime: &Option<String>, data: &Option<String>, path: &Option<PathBuf>, ts: Option<chrono::DateTime<chrono::Utc>>) {
+
+        let id = self.mint("img_");
+        let payload = match data {
+            Some(d) => json!({
+                "type": "message",
+                "id": id,
+                "role": "user",
+                "content": [{
+                    "type": "input_image",
+                    "image_url": format!("data:{};base64,{d}", mime.clone().unwrap_or_else(|| "image/png".into())),
+                }],
+            }),
+            None => json!({
+                "type": "message",
+                "id": id,
+                "role": "user",
+                "content": [{"type": "input_text", "text": format!(
+                    "[image reference: {}]",
+                    path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()))
+                )}],
+            }),
+        };
+        let thread_text = path
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()));
+        self.out.push(Item {
+            wrapper: "response_item",
+            payload,
+            thread: Some(match path {
+                Some(p) => (
+                    "imageView".into(),
+                    json!({"type": "imageView", "id": id, "path": p}),
+                ),
+                None => (
+                    "agentMessage".into(),
+                    json!({"type": "agentMessage", "id": id, "text": format!("[image: {thread_text}]")}),
+                ),
+            }),
+            item_id: id,
+            ts,
+        });
+    }
+    fn push_fallback(&mut self, block: &Block, prefix: &str, content_type: &str, role: &str, ts: Option<chrono::DateTime<chrono::Utc>>) {
+
+        let id = self.mint(prefix);
+        let text = fallback_text(block).unwrap_or_default();
+        self.out.push(Item {
+            wrapper: "response_item",
+            payload: json!({
+                "type": "message",
+                "id": id,
+                "role": role,
+                "content": [{"type": content_type, "text": text}],
+            }),
+            thread: Some((
+                "agentMessage".into(),
+                json!({"type": "agentMessage", "id": id, "text": text}),
+            )),
+            item_id: id,
+            ts,
+        });
+    }
+    fn push_compaction(&mut self, block: &Block, ts: Option<chrono::DateTime<chrono::Utc>>) {
+
+        let id = self.mint("cmp_");
+        let text = fallback_text(block).unwrap_or_default();
+        self.out.push(Item {
+            wrapper: "response_item",
+            payload: json!({
+                "type": "message",
+                "id": id,
+                "role": "system",
+                "content": [{"type": "input_text", "text": text}],
+            }),
+            thread: Some((
+                "contextCompaction".into(),
+                json!({"type": "contextCompaction", "id": id}),
+            )),
+            item_id: id,
+            ts,
+        });
+    }
+    fn push_usage(&mut self, input: u64, output: u64, reasoning: u64, cache_read: u64, cache_write: u64, ts: Option<chrono::DateTime<chrono::Utc>>) {
+
+        let id = self.mint("usage_");
+        self.out.push(Item {
+            wrapper: "event_msg",
+            payload: json!({
+                "type": "token_count",
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": input,
+                        "cached_input_tokens": cache_read,
+                        "cache_write_input_tokens": cache_write,
+                        "output_tokens": output,
+                        "reasoning_output_tokens": reasoning,
+                        "total_tokens": input + output + reasoning,
+                    },
+                    "model_context_window": null,
+                },
+                "rate_limits": null,
+            }),
+            // The projection has no accounting row; skip it so the
+            // remaining ordinals still line up.
+            thread: None,
+            item_id: id,
+            ts,
+        });
+    }
+}
+
+/// Map the IR onto codex's item vocabulary, keeping one entry per rollout
+/// record so ordinals stay aligned with the projection.
+fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
+    let mut roller = Roller {
+        out: Vec::new(),
+        n: 0,
+        pending: Vec::new(),
+        ids: super::TargetIds::default(),
+        cwd: &session.cwd,
+    };
+    roller.push_import_note();
     let mut prev_ts = session.created;
     for (m, blocks) in session.grouped() {
         let group_ts = next_row_time(session, m, &mut prev_ts);
         for block in &blocks {
-            match block {
-                Block::Text { role, text, .. } => {
-                    let id = mint("msg_", &mut n);
-                    let (wrapper_role, text_type) = match role {
-                        Role::User => ("user", "input_text"),
-                        Role::System => ("system", "input_text"),
-                        Role::Assistant => ("assistant", "output_text"),
-                    };
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload: json!({
-                            "type": "message",
-                            "id": id,
-                            "role": wrapper_role,
-                            "content": [{"type": text_type, "text": text}],
-                        }),
-                        thread: Some(if matches!(role, Role::User) {
-                            (
-                                "userMessage".into(),
-                                json!({"type": "userMessage", "id": id,
-                                       "content": [{"type": "text", "text": text}]}),
-                            )
-                        } else {
-                            (
-                                "agentMessage".into(),
-                                json!({"type": "agentMessage", "id": id, "text": text}),
-                            )
-                        }),
-                        item_id: id,
-                        ts: Some(group_ts),
-                    });
-                }
-                Block::Thinking { text, .. } => {
-                    if text.trim().is_empty() {
-                        continue;
-                    }
-                    let id = mint("rs_", &mut n);
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload: json!({
-                            "type": "reasoning",
-                            "id": id,
-                            "summary": [{"type": "summary_text", "text": text}],
-                            "content": [],
-                        }),
-                        // codex's own reasoning items project as empty, so the
-                        // projection shows the text as an agent message.
-                        thread: Some((
-                            "agentMessage".into(),
-                            json!({"type": "agentMessage", "id": id, "text": format!("[thinking]\n{text}")}),
-                        )),
-                        item_id: id,
-                        ts: Some(group_ts),
-                    });
-                }
-                Block::ToolCall {
-                    name,
-                    args,
-                    call_id,
-                    ..
-                } => {
-                    let shellish = matches!(
-                        name.as_str(),
-                        "exec" | "exec_command" | "bash" | "shell" | "sh" | "terminal"
-                    );
-                    let id = call_id
-                        .clone()
-                        .map(|c| ids.get(&c))
-                        .unwrap_or_else(|| mint("call_", &mut n));
-                    let payload = if shellish {
-                        json!({
-                            "type": "custom_tool_call",
-                            "call_id": id,
-                            "name": "exec",
-                            "input": args,
-                            "status": "completed",
-                        })
-                    } else {
-                        json!({
-                            "type": "function_call",
-                            "call_id": id,
-                            "name": name,
-                            "arguments": args,
-                        })
-                    };
-                    let tool = classify_tool(name, args);
-                    pending.push((Some(id.clone()), name.clone(), tool.clone()));
-                    let thread = match &tool {
-                        ThreadTool::Shell(command) => (
-                            "commandExecution",
-                            json!({
-                                "type": "commandExecution",
-                                "id": id,
-                                "command": command,
-                                "cwd": session.cwd,
-                                "status": "in_progress",
-                                "aggregatedOutput": "",
-                                "exitCode": null,
-                                "durationMs": null,
-                                "source": "xses-import",
-                            }),
-                        ),
-                        // codex's TUI draws a patch as a file change, not as a
-                        // command; the diff lives in the call's arguments.
-                        ThreadTool::FileChange(changes) => (
-                            "fileChange",
-                            json!({"type": "fileChange", "id": id, "changes": changes}),
-                        ),
-                        ThreadTool::Mcp { server, tool } => (
-                            "mcpToolCall",
-                            json!({
-                                "type": "mcpToolCall",
-                                "id": id,
-                                "server": server,
-                                "tool": tool,
-                                "status": "in_progress",
-                                "arguments": serde_json::from_str::<Value>(args).unwrap_or(Value::Null),
-                                "result": null,
-                            }),
-                        ),
-                        ThreadTool::ImageView(path) => (
-                            "imageView",
-                            json!({"type": "imageView", "id": id, "path": path}),
-                        ),
-                    };
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload,
-                        thread: Some((thread.0.to_string(), thread.1)),
-                        item_id: id,
-                        ts: Some(group_ts),
-                    });
-                }
-                Block::ToolResult {
-                    name,
-                    output,
-                    call_id,
-                    is_error,
-                    duration_ms,
-                } => {
-                    let id = call_id
-                        .clone()
-                        .or_else(|| {
-                            pending
-                                .iter()
-                                .rev()
-                                .find(|(c, n, _)| c.is_none() && n == name)
-                                .and_then(|(c, _, _)| c.clone())
-                        })
-                        .unwrap_or_else(|| mint("call_", &mut n));
-                    let shellish = pending
-                        .iter()
-                        .any(|(c, n, _)| n == name && (c.as_deref() == Some(&id) || c.is_none()));
-                    let wrapper_payload = if shellish
-                        && matches!(
-                            name.as_str(),
-                            "exec" | "exec_command" | "bash" | "shell" | "sh" | "terminal"
-                        ) {
-                        json!({
-                            "type": "custom_tool_call_output",
-                            "call_id": id,
-                            "output": [{"type": "input_text", "text": output}],
-                        })
-                    } else {
-                        json!({
-                            "type": "function_call_output",
-                            "call_id": id,
-                            "output": output,
-                        })
-                    };
-                    let tool = pending
-                        .iter()
-                        .rev()
-                        .find(|(c, n, _)| *n == *name && (c.as_deref() == Some(&id) || c.is_none()))
-                        .map(|(_, _, t)| t.clone())
-                        .unwrap_or_else(|| classify_tool(name, ""));
-                    let command = match &tool {
-                        ThreadTool::Shell(command) => command.clone(),
-                        _ => name.clone(),
-                    };
-                    // A successful patch already rendered as the file change
-                    // itself; only its failure needs a row of its own.
-                    let thread = match &tool {
-                        ThreadTool::FileChange(_) if !*is_error => None,
-                        ThreadTool::ImageView(_) => None,
-                        ThreadTool::Mcp { server, tool: mcp } => Some((
-                            "mcpToolCall".to_string(),
-                            json!({
-                                "type": "mcpToolCall",
-                                "id": id,
-                                "server": server,
-                                "tool": mcp,
-                                "status": if *is_error { "failed" } else { "completed" },
-                                "arguments": Value::Null,
-                                "result": {"content": [{"type": "text", "text": output}]},
-                            }),
-                        )),
-                        _ => Some((
-                            "commandExecution".to_string(),
-                            json!({
-                                "type": "commandExecution",
-                                "id": id,
-                                "command": command,
-                                "cwd": session.cwd,
-                                "status": if *is_error { "failed" } else { "completed" },
-                                "aggregatedOutput": output,
-                                "exitCode": Value::Null,
-                                "durationMs": duration_ms,
-                                "source": "xses-import",
-                            }),
-                        )),
-                    };
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload: wrapper_payload,
-                        thread,
-                        item_id: id,
-                        ts: Some(group_ts),
-                    });
-                }
-                Block::Image {
-                    mime, data, path, ..
-                } => {
-                    let id = mint("img_", &mut n);
-                    let payload = match data {
-                        Some(d) => json!({
-                            "type": "message",
-                            "id": id,
-                            "role": "user",
-                            "content": [{
-                                "type": "input_image",
-                                "image_url": format!("data:{};base64,{d}", mime.clone().unwrap_or_else(|| "image/png".into())),
-                            }],
-                        }),
-                        None => json!({
-                            "type": "message",
-                            "id": id,
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": format!(
-                                "[image reference: {}]",
-                                path.as_ref().map(|p| p.display().to_string()).unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()))
-                            )}],
-                        }),
-                    };
-                    let thread_text = path
-                        .as_ref()
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()));
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload,
-                        thread: Some(match path {
-                            Some(p) => (
-                                "imageView".into(),
-                                json!({"type": "imageView", "id": id, "path": p}),
-                            ),
-                            None => (
-                                "agentMessage".into(),
-                                json!({"type": "agentMessage", "id": id, "text": format!("[image: {thread_text}]")}),
-                            ),
-                        }),
-                        item_id: id,
-                        ts: Some(group_ts),
-                    });
-                }
-                Block::Context { .. } => {
-                    let id = mint("ctx_", &mut n);
-                    let text = fallback_text(block).unwrap_or_default();
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload: json!({
-                            "type": "message",
-                            "id": id,
-                            "role": "developer",
-                            "content": [{"type": "input_text", "text": text}],
-                        }),
-                        thread: Some((
-                            "agentMessage".into(),
-                            json!({"type": "agentMessage", "id": id, "text": text}),
-                        )),
-                        item_id: id,
-                        ts: Some(group_ts),
-                    });
-                }
-                Block::Patch { .. } => {
-                    let id = mint("patch_", &mut n);
-                    let text = fallback_text(block).unwrap_or_default();
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload: json!({
-                            "type": "message",
-                            "id": id,
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": text}],
-                        }),
-                        thread: Some((
-                            "agentMessage".into(),
-                            json!({"type": "agentMessage", "id": id, "text": text}),
-                        )),
-                        item_id: id,
-                        ts: Some(group_ts),
-                    });
-                }
-                Block::Compressed { .. } => {
-                    let id = mint("cmp_", &mut n);
-                    let text = fallback_text(block).unwrap_or_default();
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload: json!({
-                            "type": "message",
-                            "id": id,
-                            "role": "system",
-                            "content": [{"type": "input_text", "text": text}],
-                        }),
-                        thread: Some((
-                            "contextCompaction".into(),
-                            json!({"type": "contextCompaction", "id": id}),
-                        )),
-                        item_id: id,
-                        ts: Some(group_ts),
-                    });
-                }
-                Block::Usage {
-                    input,
-                    output,
-                    reasoning,
-                    cache_read,
-                    cache_write,
-                    ..
-                } => {
-                    let id = mint("usage_", &mut n);
-                    out.push(Item {
-                        wrapper: "event_msg",
-                        payload: json!({
-                            "type": "token_count",
-                            "info": {
-                                "last_token_usage": {
-                                    "input_tokens": input,
-                                    "cached_input_tokens": cache_read,
-                                    "cache_write_input_tokens": cache_write,
-                                    "output_tokens": output,
-                                    "reasoning_output_tokens": reasoning,
-                                    "total_tokens": input + output + reasoning,
-                                },
-                                "model_context_window": null,
-                            },
-                            "rate_limits": null,
-                        }),
-                        // The projection has no accounting row; skip it so the
-                        // remaining ordinals still line up.
-                        thread: None,
-                        item_id: id,
-                        ts: Some(group_ts),
-                    });
-                }
-                Block::Gap { .. } => {
-                    let id = mint("gap_", &mut n);
-                    let text = fallback_text(block).unwrap_or_default();
-                    out.push(Item {
-                        wrapper: "response_item",
-                        payload: json!({
-                            "type": "message",
-                            "id": id,
-                            "role": "system",
-                            "content": [{"type": "input_text", "text": text}],
-                        }),
-                        thread: Some((
-                            "agentMessage".into(),
-                            json!({"type": "agentMessage", "id": id, "text": text}),
-                        )),
-                        item_id: id,
-                        ts: Some(group_ts),
-                    });
-                }
-            }
+            roller.push_block(block, Some(group_ts));
         }
     }
-    out
+    roller.out
 }
 
 /// The command a shell-ish tool actually ran, for the projection row.
@@ -750,30 +751,16 @@ fn seed_codex_history(
         "INSERT OR REPLACE INTO thread_history_projection_state (thread_id, next_rollout_byte_offset, next_rollout_ordinal) VALUES ('{sid}', {byte_len}, {next_ord});"
     ));
     let script = "BEGIN IMMEDIATE;\n".to_owned() + &stmts.join(";\n") + ";\nCOMMIT;\n";
-    let mut command = std::process::Command::new("sqlite3");
-    command.args(["-bail", "-cmd", ".timeout 5000"]).arg(&db);
-    match crate::proc::output_with_input(
-        command,
+    if let Err(e) = crate::proc::sqlite_exec_input(
+        &db,
         script.into_bytes(),
         std::time::Duration::from_secs(30),
+        "codex history seed",
     ) {
-        Ok(out) if out.status.success() => true,
-        Ok(out) => {
-            crate::issues::record(
-                "codex-seed",
-                sid,
-                &format!(
-                    "history seed failed: {}",
-                    String::from_utf8_lossy(&out.stderr).trim()
-                ),
-            );
-            false
-        }
-        Err(e) => {
-            crate::issues::record("codex-seed", sid, &format!("wait failed: {e}"));
-            false
-        }
+        crate::issues::record("codex-seed", sid, &format!("history seed failed: {e}"));
+        return false;
     }
+    true
 }
 
 /// Best-effort copy of the local codex account ids (from any native rollout).
@@ -852,26 +839,22 @@ fn register_codex_thread(
           '{title_sql}', '{title_sql}', {ts_ms}, {ts_ms}, {ts}, {ts_ms}, \
           'user', 'codex-tui', 'paginated', 'enabled', '{title_sql}');"
     );
-    let Ok(out) = std::process::Command::new("sqlite3")
-        .args(["-cmd", ".timeout 5000"])
-        .arg(&db)
-        .arg(&sql)
-        .output()
-    else {
-        return false;
-    };
-    out.status.success()
+    crate::proc::sqlite_exec(
+        &db,
+        &sql,
+        std::time::Duration::from_secs(30),
+        "codex thread registration",
+    )
+    .is_ok()
 }
 
 fn remove_codex_metadata(home: &std::path::Path, sid: &str) {
+    // Best effort: failures here are retried via the index on the next sync.
+    let timeout = std::time::Duration::from_secs(10);
     if let Some(db) = codex_state_db(home) {
         let sid_sql = sid.replace('\'', "''");
         let sql = format!("DELETE FROM threads WHERE id = '{sid_sql}';");
-        let _ = std::process::Command::new("sqlite3")
-            .args(["-cmd", ".timeout 5000"])
-            .arg(&db)
-            .arg(&sql)
-            .output();
+        crate::proc::sqlite_exec(&db, &sql, timeout, "codex metadata removal").ok();
     }
     let hist = home.join(".codex/thread_history_1.sqlite");
     if hist.exists() {
@@ -881,11 +864,7 @@ fn remove_codex_metadata(home: &std::path::Path, sid: &str) {
              DELETE FROM thread_turns WHERE thread_id = '{sid_sql}'; \
              DELETE FROM thread_history_projection_state WHERE thread_id = '{sid_sql}';"
         );
-        let _ = std::process::Command::new("sqlite3")
-            .args(["-cmd", ".timeout 5000"])
-            .arg(&hist)
-            .arg(&sql)
-            .output();
+        crate::proc::sqlite_exec(&hist, &sql, timeout, "codex history removal").ok();
     }
 }
 
@@ -911,14 +890,12 @@ pub(crate) fn retire_codex(path: &std::path::Path) -> anyhow::Result<()> {
         queries.push((history, format!("BEGIN IMMEDIATE; DELETE FROM thread_items WHERE thread_id='{sid}'; DELETE FROM thread_turns WHERE thread_id='{sid}'; DELETE FROM thread_history_projection_state WHERE thread_id='{sid}'; COMMIT;")));
     }
     for (db, sql) in queries {
-        let mut command = std::process::Command::new("sqlite3");
-        command.args(["-cmd", ".timeout 5000"]).arg(db).arg(sql);
-        let out = crate::proc::output_with_timeout(command, std::time::Duration::from_secs(10))?;
-        anyhow::ensure!(
-            out.status.success(),
-            "Codex retirement failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+        crate::proc::sqlite_exec(
+            &db,
+            &sql,
+            std::time::Duration::from_secs(10),
+            "Codex retirement",
+        )?;
     }
     Ok(())
 }
@@ -940,12 +917,13 @@ fn codex_state_db(home: &std::path::Path) -> Option<PathBuf> {
     candidates.sort();
     candidates.reverse();
     for db in candidates {
-        let probe = std::process::Command::new("sqlite3")
-            .arg(&db)
-            .arg("SELECT count(*) FROM sqlite_master WHERE type='table' AND name='threads';")
-            .output()
-            .ok()?;
-        if probe.status.success() && String::from_utf8_lossy(&probe.stdout).trim() == "1" {
+        let probe = crate::proc::sqlite_text(
+            &db,
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='threads';",
+            std::time::Duration::from_secs(10),
+            "codex state DB probe",
+        );
+        if probe.is_ok_and(|out| out == "1") {
             return Some(db);
         }
     }

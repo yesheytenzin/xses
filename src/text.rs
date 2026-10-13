@@ -16,6 +16,12 @@ pub fn shorten(s: &str, max: usize) -> String {
     format!("{}…", kept.trim_end())
 }
 
+/// Collapse to one line, cutting to `max` characters with no ellipsis.
+/// For titles and ids where the cut must be invisible.
+pub fn take(s: &str, max: usize) -> String {
+    collapse(s).chars().take(max).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

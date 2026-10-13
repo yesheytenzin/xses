@@ -22,19 +22,12 @@ pub(super) fn opencode(id: &str) -> Result<Events> {
     };
     let esc = id.replace('\'', "''");
     let run = |sql: &str| -> Result<Vec<serde_json::Value>> {
-        let q = std::process::Command::new("sqlite3")
-            .arg("-readonly")
-            .arg("-json")
-            .arg(&db)
-            .arg(sql)
-            .output()?;
-        if !q.status.success() {
-            anyhow::bail!(
-                "sqlite read failed: {}",
-                String::from_utf8_lossy(&q.stderr).trim()
-            );
-        }
-        crate::proc::json_rows(&String::from_utf8_lossy(&q.stdout), "opencode transcript")
+        crate::proc::sqlite_json(
+            &db,
+            sql,
+            std::time::Duration::from_secs(60),
+            "opencode transcript",
+        )
     };
     let msgs = run(&format!(
         "SELECT id, data FROM message WHERE session_id = '{esc}' ORDER BY time_created, id;"
@@ -83,6 +76,40 @@ pub(super) fn opencode(id: &str) -> Result<Events> {
     Ok(out)
 }
 
+/// Content digest of one session across both generations: the v2 rows
+/// plus the v1 rows when present. Catches same-length edits and deletions
+/// by clients that omit revision bumps.
+pub(crate) fn opencode_revision(id: &str) -> Result<(String, u64)> {
+    use std::hash::Hasher;
+    let db =
+        crate::scan::opencode_db().ok_or_else(|| anyhow::anyhow!("opencode database not found"))?;
+    let id = id.replace('\'', "''");
+    // Both generations; the absent one contributes no rows. `session_v2`
+    // probing keeps older stores (v1 tables only) working.
+    let v2 = if crate::scan::opencode_has_v2(&db) {
+        format!(" UNION ALL SELECT 'session_v2' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session_v2 WHERE id='{id}'
+        UNION ALL SELECT 'session_message', id, json_object('type', type, 'data', data, 'created', time_created) FROM session_message WHERE session_id='{id}'")
+    } else {
+        String::new()
+    };
+    let sql = format!("SELECT 'session' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session WHERE id='{id}'
+        UNION ALL SELECT 'message', id, json_object('data', data, 'created', time_created) FROM message WHERE session_id='{id}'
+        UNION ALL SELECT 'part', id, json_object('data', data, 'created', time_created) FROM part WHERE session_id='{id}'{v2} ORDER BY kind, id;");
+    let mut cmd = std::process::Command::new("sqlite3");
+    cmd.args(["-readonly", "-json"]).arg(db).arg(sql);
+    // Raw bytes are hashed (not parsed rows), so this stays on the raw
+    // output — with a timeout the bare spawn lacked.
+    let out = crate::proc::output_with_timeout(cmd, std::time::Duration::from_secs(60))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "OpenCode revision read failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    hash.write(&out.stdout);
+    Ok((format!("{:016x}", hash.finish()), out.stdout.len() as u64))
+}
+
 /// True when this session lives in the v2 generation. Any SQL failure
 /// (older store without the tables) means v1.
 fn opencode_is_v2(id: &str) -> bool {
@@ -90,15 +117,13 @@ fn opencode_is_v2(id: &str) -> bool {
         return false;
     };
     let esc = id.replace('\'', "''");
-    std::process::Command::new("sqlite3")
-        .arg("-readonly")
-        .arg(&db)
-        .arg(format!(
-            "SELECT 1 FROM session_v2 WHERE id = '{esc}' LIMIT 1;"
-        ))
-        .output()
-        .map(|q| String::from_utf8_lossy(&q.stdout).contains('1'))
-        .unwrap_or(false)
+    crate::proc::sqlite_text(
+        &db,
+        &format!("SELECT 1 FROM session_v2 WHERE id = '{esc}' LIMIT 1;"),
+        std::time::Duration::from_secs(30),
+        "opencode generation probe",
+    )
+    .is_ok_and(|out| out.contains('1'))
 }
 
 /// v2 transcripts: one row per message in `seq` order, content inline.
@@ -110,22 +135,15 @@ fn opencode_v2(id: &str) -> Result<Events> {
         anyhow::bail!("opencode database not found")
     };
     let esc = id.replace('\'', "''");
-    let q = std::process::Command::new("sqlite3")
-        .arg("-readonly")
-        .arg("-json")
-        .arg(&db)
-        .arg(format!(
+    let rows = crate::proc::sqlite_json(
+        &db,
+        &format!(
             "SELECT type, data, time_created FROM session_message \
              WHERE session_id = '{esc}' ORDER BY seq;"
-        ))
-        .output()?;
-    if !q.status.success() {
-        anyhow::bail!(
-            "sqlite read failed: {}",
-            String::from_utf8_lossy(&q.stderr).trim()
-        );
-    }
-    let rows = crate::proc::json_rows(&String::from_utf8_lossy(&q.stdout), "opencode transcript")?;
+        ),
+        std::time::Duration::from_secs(60),
+        "opencode transcript",
+    )?;
     let mut out = Events::default();
     for row in rows {
         let kind = row.get("type").and_then(|t| t.as_str()).unwrap_or("");

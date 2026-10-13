@@ -116,6 +116,87 @@ pub fn json_rows(text: &str, what: &str) -> Result<Vec<serde_json::Value>> {
     serde_json::from_str(text.trim()).with_context(|| format!("parse {what}"))
 }
 
+/// Read-only sqlite query (`-readonly -json`) with parsed rows. Bounded by
+/// `timeout` so a wedged store cannot hang a scan.
+pub fn sqlite_json(
+    db: &std::path::Path,
+    sql: &str,
+    timeout: Duration,
+    what: &str,
+) -> Result<Vec<serde_json::Value>> {
+    let mut command = Command::new("sqlite3");
+    command.args(["-readonly", "-json"]).arg(db).arg(sql);
+    let out = output_with_timeout(command, timeout)
+        .with_context(|| format!("launch sqlite3 for {what}"))?;
+    if !out.status.success() {
+        anyhow::bail!("{what} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    json_rows(&String::from_utf8_lossy(&out.stdout), what)
+}
+
+/// Read-only sqlite query returning trimmed text (probes like
+/// `SELECT 1 …`). Status-checked and bounded like [`sqlite_json`].
+pub fn sqlite_text(
+    db: &std::path::Path,
+    sql: &str,
+    timeout: Duration,
+    what: &str,
+) -> Result<String> {
+    let mut command = Command::new("sqlite3");
+    command.args(["-readonly"]).arg(db).arg(sql);
+    let out = output_with_timeout(command, timeout)
+        .with_context(|| format!("launch sqlite3 for {what}"))?;
+    if !out.status.success() {
+        anyhow::bail!("{what} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Write sqlite script passed as an argument: aborts on first error
+/// (`-bail`), bounded by `timeout`.
+pub fn sqlite_exec(
+    db: &std::path::Path,
+    sql: &str,
+    timeout: Duration,
+    what: &str,
+) -> Result<()> {
+    let mut command = Command::new("sqlite3");
+    command
+        .args(["-bail", "-cmd", ".timeout 5000"])
+        .arg(db)
+        .arg(sql);
+    let out = output_with_timeout(command, timeout)
+        .with_context(|| format!("launch sqlite3 for {what}"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "{what} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(())
+}
+
+/// Write sqlite script passed on stdin (for large generated batches).
+/// Aborts on first error, bounded by `timeout`.
+pub fn sqlite_exec_input(
+    db: &std::path::Path,
+    script: Vec<u8>,
+    timeout: Duration,
+    what: &str,
+) -> Result<()> {
+    let mut command = Command::new("sqlite3");
+    command
+        .args(["-bail", "-cmd", ".timeout 5000"])
+        .arg(db);
+    let out = output_with_input(command, script, timeout)
+        .with_context(|| format!("launch sqlite3 for {what}"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "{what} failed: {}",
+        String::from_utf8_lossy(&out.stderr).trim()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

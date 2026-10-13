@@ -36,7 +36,9 @@ Projections each target's own UI reads:
   `fileChange` (patch calls, with per-file kind and diff), `mcpToolCall`
   (server, tool, arguments, status and output), `imageView`, `contextCompaction`.
 - pi / omp: `session_info` (picker name), `parentId` chain, `title` record.
-- opencode: message parts as stored, `session.slug = xses-<id>`.
+- opencode (v1 `session`/`message`/`part`, v2 `session_v2`/`session_message`):
+  rows as stored; v1 imports mark `session.slug = xses-<id>`, v2 imports
+  carry `session.metadata.xses` (v2 slugs are server-generated).
 
 ## Text fallbacks, by design
 
@@ -47,9 +49,9 @@ Projections each target's own UI reads:
   are provider-bound; the reasoning *text* transfers, the signature does not.
 - **Patch bodies** have no home outside opencode, so they arrive as a labelled
   file list.
-- **Injected context** (AGENTS.md, environment, reminders) is text everywhere:
-  opencode rejects `role: "system"` on import (verified), so it rides as
-  assistant text there.
+- **Injected context** (AGENTS.md, environment, reminders) is text everywhere.
+  (v1 imports rode it as assistant text because that validator rejected
+  `role: "system"; v2 accepts real `system` rows, which the writer emits.)
 - **Non-shell tools in codex's projection** use codex's own item types where it
   has one (patch calls become `fileChange` with the diff taken from the call's
   arguments, MCP calls `mcpToolCall`, `view_image` an `imageView`); a tool with
@@ -105,8 +107,9 @@ scope; provenance still names the original source. The index durably records
 both generations until retirement succeeds, so a failed replacement preserves
 the previous import and interrupted retirement is retried on the next sync.
 Normally one committed generation remains per (target, source) pair. OpenCode
-sources use a digest of their session, message, and part content so edits and
-deletions are detected even when a client omits its timestamp update.
+sources use a digest of their session plus message/part (v1) or
+session_message (v2) content, so edits and deletions are detected even when
+a client omits its timestamp update.
 
 Row titles come from the source agent's own
 title when it records one (pi/omp `title`, opencode `session.title`, or the
@@ -127,9 +130,13 @@ idempotency fingerprint).
 
 - `claude --resume` and `pi -r` list and open imports; `omp -r` lists them.
 - codex accepts the drop-in rollout and renders `commandExecution` rows.
-- `opencode import` accepts `tool`, `reasoning`, `patch`, **and `file` parts**
-  (data URL, mime, filename — the shape its own `-f/--file` flag builds).
-  It requires `state.output` **and** `state.error` on every tool part, rejects
-  `role: "system"`, and opens SQLite with `busy_timeout=0`, so xses imports are
+- `opencode session import` (v2) takes the `session export` shape — flat
+  messages with inline `text`/`reasoning`/`tool` content, `files[]` image
+  entries, and `info.metadata.xses` provenance. Completed tools carry
+  `state.content[]`, error tools `state.error.message`; assistant rows
+  require `time.completed` (a row without it is silently dropped).
+  (v1 `opencode import` took `{info, parts}` with `state.output`/`state.error`
+  on every tool part and rejected `role: "system"`; reads still cover both.)
+  opencode opens SQLite with `busy_timeout=0`, so xses imports are
   serialized for that store: two writers never wait for each other, the loser
   fails outright.

@@ -16,7 +16,6 @@ use anyhow::{Context, Result};
 use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 /// Sessions deleted per sqlite3 invocation. Import rows are blob-heavy and
@@ -60,14 +59,15 @@ fn delete_opencode_imports(
              DELETE FROM message WHERE session_id IN ({quoted}); \
              DELETE FROM session WHERE id IN ({quoted});{v2} COMMIT;"
         );
-        let mut command = Command::new("sqlite3");
-        command.args(["-cmd", ".timeout 5000"]).arg(&db).arg(sql);
         // Generous per chunk: 128 sessions of imports measure at ~20-30s.
-        let output = crate::proc::output_with_timeout(command, Duration::from_secs(300))?;
-        if !output.status.success() {
+        if let Err(e) = crate::proc::sqlite_exec(
+            &db,
+            &sql,
+            Duration::from_secs(300),
+            "OpenCode bulk cleanup",
+        ) {
             anyhow::bail!(
-                "OpenCode bulk cleanup failed after {removed}/{total}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                "OpenCode bulk cleanup failed after {removed}/{total}: {e}"
             );
         }
         removed += chunk.len();
@@ -305,10 +305,10 @@ pub fn sync(
     progress: &crate::progress::Progress,
 ) -> Result<SyncReport> {
     let _lock = acquire_index_lock()?;
-    let targets = if targets.is_empty() {
-        Tool::all_tools()
+    let targets: Vec<Tool> = if targets.is_empty() {
+        Tool::all_tools().to_vec()
     } else {
-        targets
+        targets.to_vec()
     };
     let mut index = Index::load()?;
     if !dry_run {
@@ -316,33 +316,85 @@ pub fn sync(
     }
     let seen = index.keys();
     let mut report = SyncReport {
-        targets: targets
-            .iter()
-            .map(|&target| TargetReport {
-                target,
-                written: 0,
-                skipped: 0,
-                failed: Vec::new(),
-                loss: LossReport::default(),
-            })
-            .collect(),
+        targets: targets.iter().map(|&target| TargetReport::new(target)).collect(),
     };
-    // OpenCode's own content digest also catches edits/deletions where an
-    // upstream client forgot to advance session.time_updated.
     let mut sources: Vec<_> = sessions
         .iter()
         .filter(|s| include_imports || !s.is_import)
         .cloned()
         .collect();
-    for source in &mut sources {
-        if source.tool == Tool::Opencode && targets.iter().any(|t| *t != source.tool) {
-            let (revision, size) = crate::extract::opencode_revision(&source.id)?;
-            source.revision = Some(revision);
-            source.size = size;
-        }
+    refresh_opencode_revisions(&mut sources, &targets)?;
+    let pending = plan_pending(&sources, &mut report, &seen, scope, dry_run, progress);
+    progress.flush(&format!("{} transcripts need importing", pending.len()));
+    let mut start = 0;
+    while start < pending.len() {
+        let end = batch_end(&pending, start);
+        progress.status(&format!(
+            "reading transcripts {}–{} of {}",
+            start + 1,
+            end,
+            pending.len()
+        ));
+        sync_batch(
+            &pending[start..end],
+            &mut report,
+            &seen,
+            scope,
+            dry_run,
+            progress,
+            &mut index,
+        )?;
+        start = end;
     }
+    Ok(report)
+}
+
+/// OpenCode's own content digest also catches edits/deletions where an
+/// upstream client forgot to advance session.time_updated. Digests run in
+/// parallel: each is its own full-table read, like the extract batch below.
+fn refresh_opencode_revisions(sources: &mut [Session], targets: &[Tool]) -> Result<()> {
+    let indexed: Vec<(usize, &str)> = sources
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| s.tool == Tool::Opencode && targets.iter().any(|t| *t != s.tool))
+        .map(|(i, s)| (i, s.id.as_str()))
+        .collect();
+    let digests: Vec<(usize, String, u64)> = std::thread::scope(|threads| -> Result<Vec<_>> {
+        let workers: Vec<_> = indexed
+            .into_iter()
+            .map(|(i, id)| {
+                threads.spawn(move || {
+                    crate::extract::opencode::opencode_revision(id).map(|(rev, size)| (i, rev, size))
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| {
+                w.join()
+                    .map_err(|_| anyhow::anyhow!("revision worker panicked"))?
+            })
+            .collect()
+    })?;
+    for (i, revision, size) in digests {
+        sources[i].revision = Some(revision);
+        sources[i].size = size;
+    }
+    Ok(())
+}
+
+/// Split sources into already-synced (counted as skipped) and still pending,
+/// registering progress for the latter.
+fn plan_pending<'a>(
+    sources: &'a [Session],
+    report: &mut SyncReport,
+    seen: &HashSet<String>,
+    scope: Option<usize>,
+    dry_run: bool,
+    progress: &crate::progress::Progress,
+) -> Vec<&'a Session> {
     let mut pending = Vec::new();
-    for source in &sources {
+    for source in sources {
         let mut needed = false;
         for target in &mut report.targets {
             if source.tool == target.target {
@@ -361,108 +413,126 @@ pub fn sync(
             pending.push(source);
         }
     }
-    progress.flush(&format!("{} transcripts need importing", pending.len()));
-    let mut start = 0;
-    while start < pending.len() {
-        let end = batch_end(&pending, start);
-        progress.status(&format!(
-            "reading transcripts {}–{} of {}",
-            start + 1,
-            end,
-            pending.len()
-        ));
-        let extracted = canonicalize_batch(&pending[start..end], scope)?;
-        let completed = std::thread::scope(|threads| -> Result<Vec<_>> {
-            let workers: Vec<_> = targets
-                .iter()
-                .map(|&target| {
-                    let extracted = &extracted;
-                    let seen = &seen;
-                    threads.spawn(move || {
-                        let mut updates = Vec::new();
-                        let mut result = TargetReport {
-                            target,
-                            written: 0,
-                            skipped: 0,
-                            failed: Vec::new(),
-                            loss: LossReport::default(),
-                        };
-                        for (source, canonical) in extracted {
-                            if source.tool == target {
-                                continue;
-                            }
-                            let key = fingerprint(target, source, scope);
-                            if seen.contains(&key) {
-                                continue;
-                            }
-                            let canonical = match canonical {
-                                Ok(c) => c,
-                                Err(e) => {
-                                    result.failed.push(format!("{}: {e}", source.short()));
-                                    continue;
-                                }
-                            };
-                            let (has_content, loss) = canonical.transfer_summary();
-                            if !has_content {
-                                result.skipped += 1;
-                                continue;
-                            }
-                            if dry_run {
-                                result.written += 1;
-                                result.loss.merge(loss);
-                                continue;
-                            }
-                            // A new generation cannot overwrite the last working import.
-                            let outcome = crate::write::session_revision(target, canonical, &key);
-                            match outcome {
-                                Ok((artifacts, loss)) => {
-                                    updates.push(Record {
-                                        key,
-                                        paths: artifacts,
-                                    });
-                                    result.written += 1;
-                                    result.loss.merge(loss);
-                                    progress.inc(&format!("{} {}", target.as_str(), source.id));
-                                }
-                                Err(e) => {
-                                    let detail = format!("{}: {e}", source.short());
-                                    crate::issues::record("import-failed", &source.id, &detail);
-                                    result.failed.push(detail);
-                                    progress.fail(&format!("{} {}", target.as_str(), source.id));
-                                }
-                            }
-                        }
-                        (result, updates)
-                    })
-                })
-                .collect();
-            workers
-                .into_iter()
-                .map(|w| {
-                    w.join()
-                        .map_err(|_| anyhow::anyhow!("sync worker panicked"))
-                })
-                .collect()
-        })?;
-        let mut updates = Vec::new();
-        for (result, records) in completed {
-            let total = report
-                .targets
-                .iter_mut()
-                .find(|t| t.target == result.target)
-                .expect("known target");
-            total.written += result.written;
-            total.skipped += result.skipped;
-            total.failed.extend(result.failed);
-            total.loss.merge(result.loss);
-            updates.extend(records);
-        }
-        if !dry_run {
-            index.commit(updates)?;
-        }
-        start = end;
+    pending
+}
+
+/// One batch: extract transcripts, fan out per target, merge the reports.
+#[allow(clippy::too_many_arguments)]
+fn sync_batch(
+    batch: &[&Session],
+    report: &mut SyncReport,
+    seen: &HashSet<String>,
+    scope: Option<usize>,
+    dry_run: bool,
+    progress: &crate::progress::Progress,
+    index: &mut Index,
+) -> Result<()> {
+    let extracted = canonicalize_batch(batch, scope)?;
+    let targets: Vec<Tool> = report.targets.iter().map(|t| t.target).collect();
+    let completed = std::thread::scope(|threads| -> Result<Vec<_>> {
+        let workers: Vec<_> = targets
+            .iter()
+            .map(|&target| {
+                let extracted = &extracted;
+                threads.spawn(move || write_target(target, extracted, seen, scope, dry_run, progress))
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|w| {
+                w.join()
+                    .map_err(|_| anyhow::anyhow!("sync worker panicked"))
+            })
+            .collect()
+    })?;
+    let mut updates = Vec::new();
+    for (result, records) in completed {
+        let total = report
+            .targets
+            .iter_mut()
+            .find(|t| t.target == result.target)
+            .expect("known target");
+        total.written += result.written;
+        total.skipped += result.skipped;
+        total.failed.extend(result.failed);
+        total.loss.merge(result.loss);
+        updates.extend(records);
     }
-    Ok(report)
+    if !dry_run {
+        index.commit(updates)?;
+    }
+    Ok(())
+}
+
+/// One target's share of a batch: skip synced/empty rows, write the rest.
+fn write_target(
+    target: Tool,
+    extracted: &[(&Session, Result<CanonicalSession>)],
+    seen: &HashSet<String>,
+    scope: Option<usize>,
+    dry_run: bool,
+    progress: &crate::progress::Progress,
+) -> (TargetReport, Vec<Record>) {
+    let mut updates = Vec::new();
+    let mut result = TargetReport::new(target);
+    for (source, canonical) in extracted {
+        if source.tool == target {
+            continue;
+        }
+        let key = fingerprint(target, source, scope);
+        if seen.contains(&key) {
+            continue;
+        }
+        let canonical = match canonical {
+            Ok(c) => c,
+            Err(e) => {
+                result.failed.push(format!("{}: {e}", source.short()));
+                continue;
+            }
+        };
+        let (has_content, loss) = canonical.transfer_summary();
+        if !has_content {
+            result.skipped += 1;
+            continue;
+        }
+        if dry_run {
+            result.written += 1;
+            result.loss.merge(loss);
+            continue;
+        }
+        // A new generation cannot overwrite the last working import.
+        let outcome = crate::write::session_revision(target, canonical, &key);
+        match outcome {
+            Ok((artifacts, loss)) => {
+                updates.push(Record {
+                    key,
+                    paths: artifacts,
+                });
+                result.written += 1;
+                result.loss.merge(loss);
+                progress.inc(&format!("{} {}", target.as_str(), source.id));
+            }
+            Err(e) => {
+                let detail = format!("{}: {e}", source.short());
+                crate::issues::record("import-failed", &source.id, &detail);
+                result.failed.push(detail);
+                progress.fail(&format!("{} {}", target.as_str(), source.id));
+            }
+        }
+    }
+    (result, updates)
+}
+
+impl TargetReport {
+    fn new(target: Tool) -> Self {
+        Self {
+            target,
+            written: 0,
+            skipped: 0,
+            failed: Vec::new(),
+            loss: LossReport::default(),
+        }
+    }
 }
 
 /// Retire only paths belonging to obsolete generations. Missing files are

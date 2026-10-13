@@ -1,7 +1,7 @@
 //! Scan the four native session stores into unified `Session` records.
 use crate::model::{Session, Tool};
 use crate::text::shorten;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use chrono::Utc;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -134,23 +134,7 @@ pub fn opencode_import_ids(only: Option<&HashSet<(Tool, String)>>) -> Result<Has
         return Ok(HashSet::new());
     };
     let run = |sql: &str| -> Result<Vec<serde_json::Value>> {
-        let q = std::process::Command::new("sqlite3")
-            .arg("-readonly")
-            .arg("-json")
-            .arg(&db)
-            .arg(sql)
-            .output()
-            .context("scan OpenCode import markers")?;
-        if !q.status.success() {
-            anyhow::bail!(
-                "OpenCode import scan failed: {}",
-                String::from_utf8_lossy(&q.stderr).trim()
-            );
-        }
-        crate::proc::json_rows(
-            &String::from_utf8_lossy(&q.stdout),
-            "OpenCode import markers",
-        )
+        crate::proc::sqlite_json(&db, sql, std::time::Duration::from_secs(60), "OpenCode import markers")
     };
     let mut rows = run("SELECT id, slug, NULL AS src, NULL AS src_id FROM session WHERE slug LIKE 'xses-%' OR slug LIKE 'sessionizer-%';")?;
     if opencode_has_v2(&db) {
@@ -241,33 +225,24 @@ fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
 /// True when the store has the v2 generation (opencode ≥ 2.x); older stores
 /// carry v1 tables only.
 pub(crate) fn opencode_has_v2(db: &std::path::Path) -> bool {
-    std::process::Command::new("sqlite3")
-        .arg("-readonly")
-        .arg(db)
-        .arg("SELECT 1 FROM sqlite_master WHERE name='session_v2';")
-        .output()
-        .map(|q| String::from_utf8_lossy(&q.stdout).contains('1'))
-        .unwrap_or(false)
+    crate::proc::sqlite_text(
+        db,
+        "SELECT 1 FROM sqlite_master WHERE name='session_v2';",
+        std::time::Duration::from_secs(30),
+        "opencode generation probe",
+    )
+    .is_ok_and(|out| out.contains('1'))
 }
 
 /// One generation's session rows → [`Session`]s. Runs one aggregate query
 /// instead of four correlated scans.
 fn opencode_scan_generation(db: &std::path::Path, sql: &str) -> Result<Vec<Session>> {
-    let q = std::process::Command::new("sqlite3")
-        .arg("-readonly")
-        .arg("-json")
-        .arg(db)
-        .arg(sql)
-        .output();
-    let q = q.context("launch sqlite3 for OpenCode session scan")?;
-    if !q.status.success() {
-        anyhow::bail!(
-            "OpenCode session scan failed: {}",
-            String::from_utf8_lossy(&q.stderr).trim()
-        );
-    }
-    let text = String::from_utf8_lossy(&q.stdout);
-    let rows = crate::proc::json_rows(&text, "OpenCode session scan output")?;
+    let rows = crate::proc::sqlite_json(
+        db,
+        sql,
+        std::time::Duration::from_secs(60),
+        "OpenCode session scan output",
+    )?;
     let mut out = Vec::new();
     for obj in rows {
         let id = obj

@@ -268,16 +268,8 @@ pub(super) fn first_ask(session: &CanonicalSession) -> String {
             Block::Text {
                 role: Role::User,
                 text,
-            } => Some(text.as_str()),
+            } => Some(crate::text::take(text, 120)),
             _ => None,
-        })
-        .map(|t| {
-            t.split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .chars()
-                .take(120)
-                .collect::<String>()
         })
         .unwrap_or_else(|| "imported".into())
 }

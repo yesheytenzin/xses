@@ -37,7 +37,6 @@ pub fn extract(
     })
 }
 
-
 /// Turn a discovered session into its IR: extract the transcript, then keep
 /// the scan's title when the source had one.
 pub fn canonicalize(s: &crate::model::Session) -> Result<CanonicalSession> {
@@ -48,36 +47,6 @@ pub fn canonicalize(s: &crate::model::Session) -> Result<CanonicalSession> {
 
 /// Hash the selected source's actual rows, not just session timestamps. This
 /// catches same-length edits and deletions by clients that omit revision bumps.
-pub fn opencode_revision(id: &str) -> Result<(String, u64)> {
-    use std::hash::Hasher;
-    let db =
-        crate::scan::opencode_db().ok_or_else(|| anyhow::anyhow!("opencode database not found"))?;
-    let id = id.replace('\'', "''");
-    // Both generations; the absent one contributes no rows. `session_v2`
-    // probing keeps older stores (v1 tables only) working.
-    let v2 = if crate::scan::opencode_has_v2(&db) {
-        format!(" UNION ALL SELECT 'session_v2' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session_v2 WHERE id='{id}'
-        UNION ALL SELECT 'session_message', id, json_object('type', type, 'data', data, 'created', time_created) FROM session_message WHERE session_id='{id}'")
-    } else {
-        String::new()
-    };
-    let sql = format!("SELECT 'session' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session WHERE id='{id}'
-        UNION ALL SELECT 'message', id, json_object('data', data, 'created', time_created) FROM message WHERE session_id='{id}'
-        UNION ALL SELECT 'part', id, json_object('data', data, 'created', time_created) FROM part WHERE session_id='{id}'{v2} ORDER BY kind, id;");
-    let mut cmd = std::process::Command::new("sqlite3");
-    cmd.args(["-readonly", "-json"]).arg(db).arg(sql);
-    let out = crate::proc::output_with_timeout(cmd, std::time::Duration::from_secs(60))?;
-    anyhow::ensure!(
-        out.status.success(),
-        "OpenCode revision read failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    hash.write(&out.stdout);
-    Ok((format!("{:016x}", hash.finish()), out.stdout.len() as u64))
-}
-
-
 /// Format-native content (string or typed-parts array) → plain text, for
 /// first-message scanning and tool-output capture.
 pub fn text_of(v: &Value) -> Option<String> {
@@ -130,7 +99,7 @@ pub fn text_of(v: &Value) -> Option<String> {
 mod claude;
 mod codex;
 mod common;
-mod opencode;
+pub(crate) mod opencode;
 mod pi;
 
 use claude::claude;

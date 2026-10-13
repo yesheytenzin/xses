@@ -78,13 +78,20 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
     if !tool_targets.is_empty() {
         // explicit refs bypass the import filter (bulk mode keeps it)
+        let progress = if dry_run {
+            crate::progress::Progress::disabled()
+        } else {
+            crate::progress::Progress::new(0)
+        };
         let report = sync::sync(
             &tool_targets,
             &sources,
             dry_run,
             include_imports || has_refs,
             turn_scope,
+            &progress,
         )?;
+        progress.finish();
         let (written, skipped, loss) = report.totals();
         println!(
             "{}: {} source sessions across {} targets → {} written, {} skipped | fidelity: {} preserved, {} normalized, {} downgraded, {} dropped",

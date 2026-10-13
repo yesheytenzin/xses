@@ -5,6 +5,13 @@ Claude Code, Codex, Pi, oh-my-pi, and OpenCode.
 
 ![xses unified session picker](docs/images/xses-picker.png)
 
+Long syncs report progress as they write (stderr, terminals only; silence with
+`XSES_NO_PROGRESS=1`):
+
+```
+[█████████████░░░░░░░░░░░░] 128/472 2m10s · opencode 01a1349e-571e-727e
+```
+
 Sessions are scanned, normalized, synchronized, and made available through
 one searchable view:
 

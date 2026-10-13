@@ -27,7 +27,10 @@ use std::time::Duration;
 /// command bounded and make progress visible.
 const OPENCODE_DELETE_CHUNK: usize = 128;
 
-fn delete_opencode_imports(ids: &HashSet<String>) -> Result<usize> {
+fn delete_opencode_imports(
+    ids: &HashSet<String>,
+    progress: &crate::progress::Progress,
+) -> Result<usize> {
     if ids.is_empty() {
         return Ok(0);
     }
@@ -60,7 +63,7 @@ fn delete_opencode_imports(ids: &HashSet<String>) -> Result<usize> {
             );
         }
         removed += chunk.len();
-        eprintln!("clean: removed {removed} of {total} imported sessions");
+        progress.inc(&format!("opencode {removed}/{total} sessions"));
     }
     Ok(removed)
 }
@@ -72,6 +75,34 @@ fn index_path() -> Result<PathBuf> {
 
 struct IndexLock {
     path: PathBuf,
+}
+
+/// Path of the lock this process holds, plus the PID written into it: index
+/// mutations refuse to run when the lock file has been removed or replaced
+/// (the index is read-modify-written, so a lost lock means interleaved writes
+/// silently drop records).
+static HELD_LOCK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+static HELD_PID: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+/// True while our lock file still exists and still carries our PID.
+fn lock_still_held() -> bool {
+    let (Some(path), Some(pid)) = (HELD_LOCK.get(), HELD_PID.get()) else {
+        return true; // no lock taken (read-only path)
+    };
+    fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim() == pid.to_string())
+        .unwrap_or(false)
+}
+
+/// Refuse an index mutation when the lock was lost mid-run.
+fn require_lock() -> Result<()> {
+    if lock_still_held() {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "index lock lost (file removed or replaced) — another xses is writing; refusing to touch the index"
+    )
 }
 
 impl Drop for IndexLock {
@@ -95,6 +126,8 @@ fn acquire_index_lock() -> Result<IndexLock> {
         {
             Ok(mut file) => {
                 writeln!(file, "{}", std::process::id())?;
+                let _ = HELD_LOCK.set(path.clone());
+                let _ = HELD_PID.set(std::process::id());
                 return Ok(IndexLock { path });
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -137,6 +170,7 @@ pub fn fingerprint(target: Tool, src: &Session) -> String {
 }
 
 fn load_index() -> Result<HashSet<String>> {
+    require_lock()?;
     let p = index_path()?;
     if !p.exists() {
         return Ok(HashSet::new());
@@ -156,6 +190,7 @@ fn load_index() -> Result<HashSet<String>> {
 /// Record an idempotency key plus the concrete paths it produced, so `clean`
 /// can undo exactly what sync wrote (marked or not).
 pub fn remember(key: &str, files: Vec<PathBuf>) -> Result<()> {
+    require_lock()?;
     use std::io::Write;
     let p = index_path()?;
     if let Some(parent) = p.parent() {
@@ -181,17 +216,23 @@ fn decode_paths(raw: &str) -> Vec<String> {
 /// content markers), plus their codex `threads`/projection rows and opencode
 /// sessions. Truncates the index — keys can't be mapped back reliably after
 /// mass removal. Returns the number of artifacts removed.
-pub fn clean(dry_run: bool) -> Result<usize> {
-    clean_impl(dry_run, None)
+pub fn clean(dry_run: bool, progress: &crate::progress::Progress) -> Result<usize> {
+    progress.add_total(1);
+    clean_impl(dry_run, None, progress)
 }
 
 /// Remove only the imports of the given source sessions (their artifacts in
 /// every target). Keeps the rest of the index intact.
-pub fn clean_selected(dry_run: bool, selected: &HashSet<(Tool, String)>) -> Result<usize> {
+pub fn clean_selected(
+    dry_run: bool,
+    selected: &HashSet<(Tool, String)>,
+    progress: &crate::progress::Progress,
+) -> Result<usize> {
     if selected.is_empty() {
         return Ok(0);
     }
-    clean_impl(dry_run, Some(selected))
+    progress.add_total(1);
+    clean_impl(dry_run, Some(selected), progress)
 }
 
 /// Import artifact ids belonging to the selection; `None` matches everything.
@@ -205,7 +246,11 @@ fn selection_matcher(only: Option<&HashSet<(Tool, String)>>) -> impl Fn(&str) ->
     }
 }
 
-fn clean_impl(dry_run: bool, only: Option<&HashSet<(Tool, String)>>) -> Result<usize> {
+fn clean_impl(
+    dry_run: bool,
+    only: Option<&HashSet<(Tool, String)>>,
+    progress: &crate::progress::Progress,
+) -> Result<usize> {
     let _lock = acquire_index_lock()?;
     let p = index_path()?;
     let mut removed = 0usize;
@@ -461,7 +506,7 @@ fn clean_impl(dry_run: bool, only: Option<&HashSet<(Tool, String)>>) -> Result<u
         if dry_run {
             removed += import_ids.len();
         } else {
-            removed += delete_opencode_imports(&import_ids)?;
+            removed += delete_opencode_imports(&import_ids, progress)?;
         }
         // A full sweep can't map artifacts back to keys: drop the index so
         // future syncs re-import instead of trusting stale fingerprints.
@@ -514,7 +559,15 @@ impl SyncReport {
 
 /// Extract every source to IR in parallel (bounded by CPU count; CLI-backed
 /// sources are process-bound so threads still overlap their latency).
-fn canonicalize_all(sources: &[&Session]) -> Vec<(Tool, String, Result<CanonicalSession>)> {
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+fn canonicalize_all(
+    sources: &[&Session],
+    progress: &crate::progress::Progress,
+) -> Vec<(Tool, String, Result<CanonicalSession>)> {
+    let total = sources.len();
+    let done = AtomicUsize::new(0);
+    let done = &done;
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -527,7 +580,15 @@ fn canonicalize_all(sources: &[&Session]) -> Vec<(Tool, String, Result<Canonical
         for part in sources.chunks(chunk) {
             handles.push(s.spawn(move || {
                 part.iter()
-                    .map(|src| (src.tool, src.id.clone(), refs::canonicalize(src, &src.path)))
+                    .map(|src| {
+                        let out = (src.tool, src.id.clone(), refs::canonicalize(src, &src.path));
+                        let n = done.fetch_add(1, Ordering::Relaxed) + 1;
+                        progress.status(&format!(
+                            "reading {} transcripts ({n}/{total})",
+                            src.tool.as_str()
+                        ));
+                        out
+                    })
                     .collect::<Vec<_>>()
             }));
         }
@@ -548,6 +609,7 @@ pub fn sync(
     dry_run: bool,
     include_imports: bool,
     scope: Option<usize>,
+    progress: &crate::progress::Progress,
 ) -> Result<SyncReport> {
     let _lock = acquire_index_lock()?;
     let targets: Vec<Tool> = if targets.is_empty() {
@@ -575,7 +637,20 @@ pub fn sync(
         })
         .copied()
         .collect();
-    let extracted = canonicalize_all(&needed_sources);
+    // Queue size for the bar: every (source, target) pair that is not the
+    // source's own store. Skips and empty sessions just leave it short.
+    if !dry_run {
+        for target in &targets {
+            progress.add_total(
+                needed_sources
+                    .iter()
+                    .filter(|src| src.tool != *target)
+                    .count(),
+            );
+        }
+    }
+    progress.flush(&format!("reading {} transcripts", needed_sources.len()));
+    let extracted = canonicalize_all(&needed_sources, progress);
     // Target files are independent. Keep destructive/index mutations behind a
     // narrow mutex, while expensive serialization and external imports run in
     // parallel. The snapshot prevents target workers from racing on `seen`.
@@ -685,12 +760,16 @@ pub fn sync(
                         let what = format!("{} {}", src.tool.as_str(), src.id);
                         crate::issues::record("import-failed", &what, "target wrote nothing");
                         trep.failed.push(format!("{what}: no writer output"));
+                        progress.fail(&format!("{} {}", target.as_str(), src.id));
                         continue;
                     }
                     trep.loss.merge(r);
                     trep.written += 1;
-                    let _guard = mutation_lock.lock().expect("sync mutation lock");
-                    remember(&fingerprint(target, src), outcome.artifacts)?;
+                    {
+                        let _guard = mutation_lock.lock().expect("sync mutation lock");
+                        remember(&fingerprint(target, src), outcome.artifacts)?;
+                    }
+                    progress.inc(&format!("{} {}", target.as_str(), src.id));
                 }
                 Ok(trep)
             }));
@@ -764,6 +843,10 @@ fn sibling_has_marker(sidecar: &std::path::Path) -> bool {
 /// lines. This is what keeps re-syncs 1:1 instead of accumulating a stale
 /// copy per source change.
 pub fn prune_prev_copies(target: Tool, src_tool: Tool, src_id: &str) {
+    if !lock_still_held() {
+        eprintln!("xses: warning: index lock lost; skipping prune of previous copies");
+        return;
+    }
     let Ok(p) = index_path() else { return };
     let prefix = format!("{}|{}|{}|", target.as_str(), src_tool.as_str(), src_id);
     let Ok(f) = fs::File::open(&p) else { return };
@@ -788,7 +871,7 @@ pub fn prune_prev_copies(target: Tool, src_tool: Tool, src_id: &str) {
         }
     }
     if !opencode_ids.is_empty() {
-        let _ = delete_opencode_imports(&opencode_ids);
+        let _ = delete_opencode_imports(&opencode_ids, &crate::progress::Progress::disabled());
     }
     // rewrite the index without the pruned lines (best-effort)
     if let Ok(mut f) = fs::OpenOptions::new()

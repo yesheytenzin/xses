@@ -10,6 +10,7 @@ mod jsonl;
 mod model;
 mod picker;
 mod proc;
+mod progress;
 mod refs;
 mod scan;
 mod scope;

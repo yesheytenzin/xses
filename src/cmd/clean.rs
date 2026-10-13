@@ -8,8 +8,13 @@ use crate::sync;
 use std::collections::HashSet;
 
 pub fn run(all: bool, dry_run: bool) -> anyhow::Result<()> {
+    let progress = if dry_run {
+        crate::progress::Progress::disabled()
+    } else {
+        crate::progress::Progress::new(0)
+    };
     let removed = if all {
-        sync::clean(dry_run)?
+        sync::clean(dry_run, &progress)?
     } else {
         let Some(selected) = newest_synced_here()? else {
             println!(
@@ -18,8 +23,9 @@ pub fn run(all: bool, dry_run: bool) -> anyhow::Result<()> {
             );
             return Ok(());
         };
-        sync::clean_selected(dry_run, &selected)?
+        sync::clean_selected(dry_run, &selected, &progress)?
     };
+    progress.finish();
     println!(
         "{}: removed {} imported artifacts",
         if dry_run { "dry-run" } else { "clean" },

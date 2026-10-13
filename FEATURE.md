@@ -56,6 +56,17 @@ Projections each target's own UI reads:
 | Original tool-call ids | ids are provider-validated; xses re-mints deterministic ids so results still pair |
 | Exact per-message timing | ordering is preserved; timestamps are synthesized where the target requires monotonic values |
 
+## Naming and updates
+
+Re-sync updates in place: a source session's artifact path (and opencode id)
+derives from its id, and a changed source rewrites that one artifact — the
+index keeps a single record per (target, source) pair, so pickers never grow a
+second row for the same session. Row titles come from the source agent's own
+title when it records one (pi/omp `title`, opencode `session.title`, or the
+title an earlier import carried), falling back to the first user ask; the
+first-ask fallback is why two *different* sessions that open with the same
+message can still look alike in a list.
+
 ## Accounting
 
 Every import header carries a manifest — `xses: {source, srcId, mapping,

@@ -258,6 +258,11 @@ pub struct CanonicalSession {
     pub tool: Tool,
     pub cwd: PathBuf,
     pub created: DateTime<Utc>,
+    /// The source agent's own title for this session when it records one
+    /// (pi/omp `title`, opencode `session.title`, …), possibly carrying an
+    /// `[agent]` prefix from an earlier import. Titles derived from the first
+    /// ask collide whenever several sessions share that ask.
+    pub title: Option<String>,
     pub events: Vec<Event>,
 }
 
@@ -405,6 +410,7 @@ mod tests {
             tool: Tool::Pi,
             cwd: "/tmp".into(),
             created: Utc::now(),
+            title: None,
             events,
         }
     }

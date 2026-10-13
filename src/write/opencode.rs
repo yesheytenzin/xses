@@ -1,5 +1,5 @@
 //! opencode writer: synthesize an export payload, pipe it through `opencode import`.
-use super::{first_ask, group_role, import_id, manifest, role_str};
+use super::{group_role, import_id, manifest, role_str};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::fs;
@@ -348,7 +348,7 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
             "projectID": "global",
             "directory": session.cwd,
             "path": session.cwd.to_string_lossy().trim_start_matches('/'),
-            "title": format!("[{}] {}", session.tool.as_str(), first_ask(session)),
+            "title": super::title_for(session),
             "version": "1.0.0",
             "time": {"created": now_ms, "updated": now_ms},
             "agent": "build",

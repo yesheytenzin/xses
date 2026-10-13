@@ -3,7 +3,7 @@
 //! Emits native records: multi-part messages (`text`, `thinking`, `toolCall`,
 //! `image`), `toolResult` messages carrying their `toolCallId`, compaction
 //! records, and per-message usage so the TUI's stats still render.
-use super::{atomic_write, first_ask, import_id, iso, iso_stamp, push, synth_id};
+use super::{atomic_write, import_id, iso, iso_stamp, push, synth_id};
 use crate::canonical::{Block, CanonicalSession, Role};
 use crate::model::Tool;
 use serde_json::{json, Value};
@@ -54,7 +54,7 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
     };
     let ts = iso(&session.created);
     let ts_ms = session.created.timestamp_millis();
-    let title = format!("[{}] {}", session.tool.as_str(), first_ask(session));
+    let title = super::title_for(session);
     let mut buf = Vec::new();
     let mut title_event = json!({
         "type": "title",
@@ -402,6 +402,7 @@ mod tests {
             tool: Tool::Pi,
             cwd: "/tmp".into(),
             created,
+            title: None,
             events: vec![],
         };
         let id = omp_id(&session);

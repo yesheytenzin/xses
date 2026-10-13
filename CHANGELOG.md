@@ -34,6 +34,12 @@ target's constructs:
   the case where another app is writing.
 - `sync <id>` no longer reports "ambiguous" just because the id also exists in
   stores it was imported into: the original session wins, then the newest.
+- imports are titled with the source agent's own session title when it has one
+  (pi/omp `title`, opencode `session.title`, a previous import's title), and
+  only fall back to the first ask when the agent recorded none. Re-syncing
+  already updated a session in place — a source that changes rewrites its one
+  artifact — but titles built from the first ask made distinct sessions with
+  the same opening line look like duplicates in the other agents' pickers.
 - import headers carry a manifest (`blocks`, `gaps`, `mapping`), the mapping
   version is part of the idempotency fingerprint (older copies re-import once),
   and `FEATURE.md` documents what is carried, text-only, or impossible.

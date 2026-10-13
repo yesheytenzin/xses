@@ -230,7 +230,9 @@ mod tests {
 
 /// Turn a discovered session into its IR.
 pub fn canonicalize(s: &Session, _path: &Path) -> Result<CanonicalSession> {
-    crate::extract::extract(s.tool, &s.id, &s.cwd, s.created, &s.path)
+    let mut canon = crate::extract::extract(s.tool, &s.id, &s.cwd, s.created, &s.path)?;
+    canon.title = Some(s.summary.clone()).filter(|t| !t.trim().is_empty());
+    Ok(canon)
 }
 
 /// Pick a session from the discovered list by ref.

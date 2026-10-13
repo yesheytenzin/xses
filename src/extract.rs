@@ -37,6 +37,7 @@ pub fn extract(
         tool,
         cwd: cwd.to_path_buf(),
         created,
+        title: None,
         events,
     })
 }

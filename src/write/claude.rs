@@ -3,7 +3,7 @@
 //! Emits claude's own content blocks: `thinking`, `text`, `tool_use`, and
 //! `tool_result` (the latter in a `user` row, as claude does), plus image
 //! blocks for inline pictures and per-message `usage`.
-use super::{atomic_write, first_ask, group_role, iso, manifest, push, synth_id};
+use super::{atomic_write, group_role, iso, manifest, push, synth_id};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ fn write_inner(session: &CanonicalSession) -> Option<(PathBuf, PathBuf)> {
     // (binary-verified): firstPrompt is the bare first user message, so the
     // [agent] prefix must live in the customTitle sidecar:
     // `<slug>/<sid>/custom-title.json` = `{"customTitle": ...}`.
-    let title = format!("[{}] {}", session.tool.as_str(), first_ask(session));
+    let title = super::title_for(session);
     let target = home
         .join(".claude/projects")
         .join(slug)

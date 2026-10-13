@@ -140,7 +140,9 @@ gone), and the newest failures from the issue journal.
   markers, counted as `dropped` in the fidelity report.
 - Skips empty sessions, and skips xses-made imports unless `--include-imports`.
 - Avoids duplicate imports (idempotent per session content) and reports what
-  survived each conversion.
+  survived each conversion; re-syncing a session that changed updates the same
+  entry instead of adding another, and imports carry the source agent's own
+  session title when it has one.
 - Retries opencode imports once, serialized, and journals what still fails.
 
 What transfers, what is planned, and what can never move is documented per

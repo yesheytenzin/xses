@@ -62,6 +62,33 @@ pub fn import_id_for(tool: Tool, id: &str) -> String {
     import_id(tool, id)
 }
 
+/// Title every store shows: the source agent's own title when it has one
+/// (preserving a provenance prefix an earlier import added), else the first
+/// user ask.
+pub(super) fn title_for(session: &CanonicalSession) -> String {
+    let store = session.tool.as_str();
+    let raw = session
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| first_ask(session));
+    // `[claude] fix the parser` → agent `claude`, body `fix the parser`.
+    let (agent, body) = match raw.strip_prefix('[') {
+        Some(rest) => match rest.find(']') {
+            Some(end) if Tool::parse(&rest[..end]).is_some() => {
+                let body = rest[end + 1..].trim();
+                (rest[..end].to_string(), body.to_string())
+            }
+            _ => (store.to_string(), raw.clone()),
+        },
+        None => (store.to_string(), raw.clone()),
+    };
+    let body = if body.is_empty() { "imported" } else { &body };
+    format!("[{agent}] {body}")
+}
+
 /// First user ask, for the session title every store shows.
 pub(super) fn first_ask(session: &CanonicalSession) -> String {
     session
@@ -200,12 +227,36 @@ mod tests {
             tool: Tool::Claude,
             cwd: "/tmp/project".into(),
             created: Utc::now(),
+            title: None,
             events,
         }
     }
 
     fn ev(msg: u32, block: Block) -> Event {
         Event { msg, block }
+    }
+
+    #[test]
+    fn titles_use_the_source_title_and_keep_provenance() {
+        let mut s = session(vec![ev(
+            0,
+            Block::Text {
+                role: Role::User,
+                text: "a long first ask".into(),
+            },
+        )]);
+        // no source title → first ask, prefixed with the store it came from
+        s.title = None;
+        assert_eq!(title_for(&s), "[claude] a long first ask");
+        // source title wins over the first ask
+        s.title = Some("Fix the parser".into());
+        assert_eq!(title_for(&s), "[claude] Fix the parser");
+        // an imported source keeps the agent it originally came from
+        s.title = Some("[omp] Fix the parser".into());
+        assert_eq!(title_for(&s), "[omp] Fix the parser");
+        // empty titles fall back
+        s.title = Some("  ".into());
+        assert_eq!(title_for(&s), "[claude] a long first ask");
     }
 
     #[test]

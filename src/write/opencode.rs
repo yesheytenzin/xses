@@ -314,7 +314,37 @@ impl Builder {
     }
 }
 
+/// Installed opencode major version (`opencode --version` → `v2.0.28`).
+/// `None` means undetectable — callers proceed as before.
+static OPENCODE_MAJOR: std::sync::LazyLock<Option<u32>> = std::sync::LazyLock::new(|| {
+    let mut cmd = std::process::Command::new("opencode");
+    cmd.arg("--version");
+    let out = crate::proc::output_with_timeout(cmd, std::time::Duration::from_secs(10)).ok()?;
+    parse_cli_major(&String::from_utf8_lossy(&out.stdout))
+});
+
+/// First version-like token wins: `v2.0.28` → 2, `1.12.4` → 1.
+fn parse_cli_major(out: &str) -> Option<u32> {
+    out.split_whitespace().find_map(|tok| {
+        tok.strip_prefix('v')
+            .unwrap_or(tok)
+            .split('.')
+            .next()?
+            .parse()
+            .ok()
+    })
+}
+
 pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Option<PathBuf> {
+    if *OPENCODE_MAJOR == Some(1) {
+        // The v1 CLI cannot take v2 payloads; say so instead of failing
+        // inside its schema validator.
+        let detail =
+            "opencode 1.x detected: imports need opencode 2+, or xses 0.6.0 for 1.x stores";
+        super::journal_failure(&format!("{} {}", session.tool.as_str(), session.id), detail);
+        eprintln!("opencode import skipped: {detail}");
+        return None;
+    }
     let ses = format!(
         "ses_{}",
         import_id(session.tool, &super::artifact_key(session, revision))
@@ -558,4 +588,18 @@ fn mint_suffix() -> String {
         s.push(alphabet[((seed >> 33) % alphabet.len() as u64) as usize]);
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_major_reads_both_version_styles() {
+        assert_eq!(parse_cli_major("opencode v2.0.28\n"), Some(2));
+        assert_eq!(parse_cli_major("1.12.4"), Some(1));
+        assert_eq!(parse_cli_major("opencode version 2.1.0"), Some(2));
+        assert_eq!(parse_cli_major(""), None);
+        assert_eq!(parse_cli_major("no version here"), None);
+    }
 }

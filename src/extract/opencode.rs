@@ -27,6 +27,20 @@ pub(crate) struct Snapshot {
     pub events: Events,
 }
 
+/// One revision-UNION read, raw bytes. Shared by the snapshot (digest +
+/// transcript) and the legacy digest (digest only): both hash stdout.
+fn union_bytes(db: &std::path::Path, sql: &str) -> Result<Vec<u8>> {
+    let mut cmd = std::process::Command::new("sqlite3");
+    cmd.args(["-readonly", "-json"]).arg(db).arg(sql);
+    let out = crate::proc::output_with_timeout(cmd, std::time::Duration::from_secs(60))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "OpenCode revision read failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Ok(out.stdout)
+}
+
 pub(crate) fn opencode_snapshot(id: &str) -> Result<Snapshot> {
     use std::hash::Hasher;
     let Some(db) = crate::scan::opencode_db() else {
@@ -42,30 +56,44 @@ pub(crate) fn opencode_snapshot(id: &str) -> Result<Snapshot> {
     let sql = format!("SELECT 'session' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session WHERE id='{esc}'\
         UNION ALL SELECT 'message', id, json_object('data', data, 'created', time_created) FROM message WHERE session_id='{esc}'\
         UNION ALL SELECT 'part', id, json_object('data', data, 'created', time_created, 'message_id', message_id) FROM part WHERE session_id='{esc}'{v2} ORDER BY kind, id;");
-    let mut cmd = std::process::Command::new("sqlite3");
-    cmd.args(["-readonly", "-json"]).arg(&db).arg(&sql);
-    // Raw bytes are hashed, so this stays on the raw output — with a timeout
-    // the bare spawn lacked.
-    let out = crate::proc::output_with_timeout(cmd, std::time::Duration::from_secs(60))?;
-    anyhow::ensure!(
-        out.status.success(),
-        "OpenCode revision read failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let stdout = union_bytes(&db, &sql)?;
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    hash.write(&out.stdout);
+    hash.write(&stdout);
     let rows: Vec<Value> =
-        crate::proc::json_rows(&String::from_utf8_lossy(&out.stdout), "opencode transcript")?;
+        crate::proc::json_rows(&String::from_utf8_lossy(&stdout), "opencode transcript")?;
     let events = events_from_union(&rows);
     Ok(Snapshot {
         revision: format!("{:016x}", hash.finish()),
-        size: out.stdout.len() as u64,
+        size: stdout.len() as u64,
         events,
     })
 }
 
-/// Split union rows by generation and parse. v2 wins when its session row
-/// (or any message) is present — the same preference the old probe gave.
+/// Pre-snapshot digest shape (no `message_id` on part rows, no `seq` on v2
+/// rows): byte-identical to what older xses computed. Used once per source
+/// by the key migration — a hit means "already synced under the old digest",
+/// so the import is skipped and the new key recorded.
+pub(crate) fn legacy_revision(id: &str) -> Result<String> {
+    use std::hash::Hasher;
+    let Some(db) = crate::scan::opencode_db() else {
+        anyhow::bail!("opencode database not found")
+    };
+    let esc = id.replace('\'', "''");
+    let v2 = if crate::scan::opencode_has_v2(&db) {
+        format!(" UNION ALL SELECT 'session_v2' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session_v2 WHERE id='{esc}'\
+        UNION ALL SELECT 'session_message', id, json_object('type', type, 'data', data, 'created', time_created) FROM session_message WHERE session_id='{esc}'")
+    } else {
+        String::new()
+    };
+    let sql = format!("SELECT 'session' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session WHERE id='{esc}'\
+        UNION ALL SELECT 'message', id, json_object('data', data, 'created', time_created) FROM message WHERE session_id='{esc}'\
+        UNION ALL SELECT 'part', id, json_object('data', data, 'created', time_created) FROM part WHERE session_id='{esc}'{v2} ORDER BY kind, id;");
+    let stdout = union_bytes(&db, &sql)?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    hash.write(&stdout);
+    Ok(format!("{:016x}", hash.finish()))
+}
+
 /// Split union rows by generation and parse. v2 wins when its session row
 /// (or any message) is present — the same preference the old probe gave.
 /// The union wraps each row's columns in `json_object`, which sqlite

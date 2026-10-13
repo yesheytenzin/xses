@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- Pre-snapshot opencode digest keys migrate without re-importing: a
+  fingerprint miss that hits the legacy digest records the new key over
+  the same artifacts. Legacy digest queries run only on misses and taper
+  to zero as sources migrate.
+- opencode 1.x installs get a clear error at write time (imports need
+  opencode 2+, or xses 0.6.0 for 1.x stores) instead of failing inside
+  the v2 schema validator.
+
 ## 0.7.0
 
 - opencode v2 stores are fully supported alongside v1: `session_v2` +

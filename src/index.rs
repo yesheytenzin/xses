@@ -61,8 +61,8 @@ impl Record {
 /// Keep previous generations durably recorded until retirement succeeds.
 /// A crash between publication and retirement is recovered on the next sync.
 pub struct Index {
-    path: PathBuf,
-    records: Vec<Record>,
+    pub(crate) path: PathBuf,
+    pub(crate) records: Vec<Record>,
 }
 
 impl Index {

@@ -326,7 +326,6 @@ pub fn sync(
     if !dry_run {
         index.commit(Vec::new())?;
     }
-    let seen = index.keys();
     let mut report = SyncReport {
         targets: targets
             .iter()
@@ -339,6 +338,15 @@ pub fn sync(
         .cloned()
         .collect();
     let mut snapshots = refresh_opencode_revisions(&mut sources, &targets)?;
+    // Pre-snapshot keys migrate without re-importing (below); merged into
+    // `seen` either way so dry runs report what a real run would skip.
+    let migrated = migrate_opencode_keys(&index, &sources, &targets, scope)?;
+    let migrated_keys: HashSet<String> = migrated.iter().map(|r| r.key.clone()).collect();
+    if !dry_run && !migrated.is_empty() {
+        index.commit(migrated)?;
+    }
+    let mut seen = index.keys();
+    seen.extend(migrated_keys);
     let pending = plan_pending(&sources, &mut report, &seen, scope, dry_run, progress);
     progress.flush(&format!("{} transcripts need importing", pending.len()));
     let mut start = 0;
@@ -404,6 +412,53 @@ fn refresh_opencode_revisions(
         snapshots.insert(sources[i].id.clone(), snap);
     }
     Ok(snapshots)
+}
+
+/// Migrate pre-snapshot digest keys without re-importing: a new-key miss
+/// that hits the legacy key means "already synced" — the new key is recorded
+/// over the old artifacts, so the next sync hits directly. Legacy queries run
+/// only on new-key misses and taper to zero as sources migrate; a legacy
+/// failure just means "not migrated", i.e. a genuine re-sync.
+/// Returns index records for the migrated keys; the caller commits them
+/// (honoring dry-run) and merges the keys into its seen set.
+fn migrate_opencode_keys(
+    index: &Index,
+    sources: &[Session],
+    targets: &[Tool],
+    scope: Option<usize>,
+) -> Result<Vec<Record>> {
+    let seen = index.keys();
+    let mut updates = Vec::new();
+    for source in sources {
+        if source.tool != Tool::Opencode {
+            continue;
+        }
+        for target in targets {
+            if source.tool == *target {
+                continue;
+            }
+            let new_key = fingerprint(*target, source, scope);
+            if seen.contains(&new_key) || updates.iter().any(|r: &Record| r.key == new_key) {
+                continue;
+            }
+            let Ok(legacy_rev) = crate::extract::opencode::legacy_revision(&source.id) else {
+                continue;
+            };
+            let mut legacy_source = source.clone();
+            legacy_source.revision = Some(legacy_rev);
+            let legacy_key = fingerprint(*target, &legacy_source, scope);
+            if !seen.contains(&legacy_key) {
+                continue;
+            }
+            if let Some(old) = index.records().iter().find(|r| r.key == legacy_key) {
+                updates.push(Record {
+                    key: new_key,
+                    paths: old.paths.clone(),
+                });
+            }
+        }
+    }
+    Ok(updates)
 }
 
 /// Split sources into already-synced (counted as skipped) and still pending,
@@ -647,5 +702,100 @@ mod tests {
             "2026-10-12T10-20-30_0123456789abcdef0123456789abcdef.jsonl"
         ));
         assert!(!is_import_filename("2026-10-12T10-20-30-native.jsonl"));
+    }
+
+    /// Needs a live opencode store; CI machines skip it. Exercises the
+    /// whole migration: legacy-key record in, new-key record over the same
+    /// artifacts out, no re-import needed.
+    /// Fabricates a v1-only opencode store (a session with one part, so the
+    /// two digest shapes differ) and exercises the whole migration:
+    /// legacy-key record in, new-key record over the same artifacts out.
+    /// Skips when `sqlite3` is unavailable.
+    #[test]
+    fn legacy_digest_keys_migrate_without_reimport() {
+        if std::process::Command::new("sqlite3")
+            .arg("--version")
+            .output()
+            .is_err()
+        {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("xses-mig-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("opencode.db");
+        let sql = "CREATE TABLE session(id TEXT PRIMARY KEY, title TEXT, directory TEXT, \
+            time_created INTEGER); \
+            CREATE TABLE message(id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT); \
+            CREATE TABLE part(id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, \
+            time_created INTEGER, data TEXT); \
+            INSERT INTO session VALUES('ses_probe1', 't', '/tmp', 1000); \
+            INSERT INTO message VALUES('m1', 'ses_probe1', 1001, '{\"role\":\"user\"}'); \
+            INSERT INTO part VALUES('p1', 'm1', 'ses_probe1', 1002, '{\"type\":\"text\",\"text\":\"hi\"}');";
+        let status = std::process::Command::new("sqlite3")
+            .arg(&db)
+            .arg(sql)
+            .status()
+            .expect("run sqlite3");
+        assert!(status.success());
+        let prev = std::env::var_os("OPENCODE_DATA_DIR");
+        std::env::set_var("OPENCODE_DATA_DIR", &dir);
+        let result = legacy_migration_against(&dir);
+        match prev {
+            Some(v) => std::env::set_var("OPENCODE_DATA_DIR", v),
+            None => std::env::remove_var("OPENCODE_DATA_DIR"),
+        }
+        let (new_key, legacy_key, updates, artifact) = result.expect("migrate");
+        // The part row's `message_id` separates the two digest shapes.
+        assert_ne!(new_key, legacy_key);
+        assert_eq!(updates.len(), 1);
+        assert_eq!(updates[0].key, new_key);
+        assert_eq!(updates[0].paths, vec![artifact]);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn legacy_migration_against(
+        dir: &std::path::Path,
+    ) -> anyhow::Result<(
+        String,
+        String,
+        Vec<crate::index::Record>,
+        std::path::PathBuf,
+    )> {
+        let id = "ses_probe1";
+        let new_rev = crate::extract::opencode::opencode_snapshot(id)?.revision;
+        let legacy_rev = crate::extract::opencode::legacy_revision(id)?;
+        let now = chrono::Utc::now();
+        let source = crate::model::Session {
+            id: id.to_string(),
+            tool: Tool::Opencode,
+            cwd: std::path::PathBuf::from("/tmp"),
+            mtime: now,
+            created: now,
+            size: 7,
+            revision: Some(new_rev),
+            messages: 1,
+            summary: String::new(),
+            path: std::path::PathBuf::from("opencode://x"),
+            is_import: false,
+            noise: None,
+        };
+        let target = Tool::Codex;
+        let new_key = fingerprint(target, &source, None);
+        let mut legacy_source = source.clone();
+        legacy_source.revision = Some(legacy_rev);
+        let legacy_key = fingerprint(target, &legacy_source, None);
+        let artifact = dir.join("rollout.jsonl");
+        std::fs::write(&artifact, b"x")?;
+        // The in-memory index only carries the legacy key, as recorded
+        // before the snapshot change.
+        let index = Index {
+            path: dir.join("index.jsonl"),
+            records: vec![crate::index::Record {
+                key: legacy_key.clone(),
+                paths: vec![artifact.clone()],
+            }],
+        };
+        let updates = migrate_opencode_keys(&index, &[source], &[target], None)?;
+        Ok((new_key, legacy_key, updates, artifact))
     }
 }

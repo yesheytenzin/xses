@@ -2,7 +2,7 @@
 
 What a sync carries, where it lands, and what can never move. Statuses:
 
-- **carried** — written as the target's own construct (mapping version 4).
+- **carried** — written as the target's own construct (mapping version 5).
 - **text** — preserved as labelled text because the target has no construct.
 - **gap** — recorded as `[gap in imported history: …]` and counted as dropped.
 - **impossible** — the data is not in the source file or has no equivalent.
@@ -20,6 +20,7 @@ What a sync carries, where it lands, and what can never move. Statuses:
 | compaction | *text* | `contextCompaction` projection | `message` text | *text* |
 | usage / cost / tokens | per-message `usage` | `token_count` events | per-message `usage` | message `tokens` / `cost` (read side parses its `step-finish` parts) |
 | injected context | *text* (`[context: kind]`) | *text* | *text* | *text* |
+| per-message time | row `timestamp` | item `timestamp` | row + `message.timestamp` | `time.created` |
 
 Sources are read symmetrically, in each store's own encoding: claude nests an
 image as `source.data` + `source.media_type`, codex uses `input_image` data
@@ -79,8 +80,8 @@ session to move nor turns to carry.
 | Live runtime state (running tools, queues, background tasks, permission prompts) | not representable as history in any target; only the import note can describe it |
 | Provider-local bookkeeping (latches, bridge ids, file-history snapshots, fork refs, cache keys, credential pins) | same-tool round-trips keep them in the source; other agents have no place for them |
 | Non-image attachments with no embedded payload | a claude `file` row that carries only a path has nothing to move: xses inlines on-disk images within the cap, and for anything else writes a note naming the file. Text files claude already embedded (`content.file.content`) do transfer as text |
-| Original tool-call ids | ids are provider-validated; xses re-mints deterministic ids so results still pair |
-| Exact per-message timing | ordering is preserved; timestamps are synthesized where the target requires monotonic values |
+| Original tool-call ids verbatim | Anthropic validates the *shape* (`^[A-Za-z0-9_-]+$`) and rejects a stray `|` with a 400, and sources compose ids (`call_…|fc_…`). xses therefore maps every id it writes into the target's accepted class, keeping both sides of a pair on the same value; the source id stays in the source |
+| Sub-second precision of a message time | stores record milliseconds, but a target that stores whole seconds (where its own schema does) keeps the second; ordering and the date are exact |
 
 ## Sessions that are not worth resuming
 

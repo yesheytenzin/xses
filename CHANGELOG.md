@@ -44,6 +44,19 @@ target's constructs:
   version is part of the idempotency fingerprint (older copies re-import once),
   and `FEATURE.md` documents what is carried, text-only, or impossible.
 
+- tool ids are mapped into the target's accepted class. Anthropic validates
+  `tool_use.id` against `^[A-Za-z0-9_-]+$` and answers a stray character with a
+  400, while sources compose ids (`call_…|fc_…` from codex/omp): 108 imported
+  claude transcripts here carried 36 011 such ids, so continuing them would
+  have failed at the API. Both sides of a pair now share one mapped value, and
+  the mapping is applied by every writer so a target never depends on another
+  provider's id space.
+- every message keeps the time its source recorded: the IR carries the time per
+  source message and the writers emit it (claude row `timestamp`, codex item
+  `timestamp`, pi/omp row + `message.timestamp`, opencode `time.created`),
+  stepping forward a millisecond only when a target needs strictly increasing
+  values. Previously every imported row carried the session's creation time.
+  Mapping version 5 re-imports existing copies once so old rows pick this up.
 - sessions that were never useful are hidden from `ls`, `pick` and `sync`:
   `empty` (no turns), `unanswered` (nothing ever answered the user) and
   `failed` (assistant turns that are only API/abort errors), each detected from

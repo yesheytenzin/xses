@@ -137,17 +137,26 @@ pub struct Event {
 }
 
 /// Builder handed to extractors: tracks message boundaries and keeps the
-/// event stream in transcript order.
+/// event stream in transcript order, with the source's own timestamp per
+/// message when the store records one.
 #[derive(Debug, Default)]
 pub struct Events {
     list: Vec<Event>,
     msg: u32,
+    /// Source message index -> the time the source itself recorded.
+    times: std::collections::BTreeMap<u32, DateTime<Utc>>,
 }
 
 impl Events {
     /// Start a new source message.
     pub fn boundary(&mut self) {
         self.msg += 1;
+    }
+
+    /// Record the source's timestamp for the message being built. Called after
+    /// `boundary()`, so it lands on that message.
+    pub fn at(&mut self, ts: DateTime<Utc>) {
+        self.times.insert(self.msg, ts);
     }
 
     pub fn push(&mut self, block: Block) {
@@ -157,8 +166,14 @@ impl Events {
         });
     }
 
+    #[cfg(test)]
     pub fn into_vec(self) -> Vec<Event> {
         self.list
+    }
+
+    /// Events plus the per-message timestamps the source recorded.
+    pub fn into_parts(self) -> (Vec<Event>, std::collections::BTreeMap<u32, DateTime<Utc>>) {
+        (self.list, self.times)
     }
 }
 
@@ -264,6 +279,10 @@ pub struct CanonicalSession {
     /// ask collide whenever several sessions share that ask.
     pub title: Option<String>,
     pub events: Vec<Event>,
+    /// Source message index -> the timestamp the source recorded, when it
+    /// records one. Writers carry these so an import keeps the session's real
+    /// timeline instead of one synthetic time for every row.
+    pub msg_times: std::collections::BTreeMap<u32, DateTime<Utc>>,
 }
 
 impl CanonicalSession {
@@ -412,6 +431,7 @@ mod tests {
             created: Utc::now(),
             title: None,
             events,
+            msg_times: Default::default(),
         }
     }
 

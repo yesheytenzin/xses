@@ -31,7 +31,7 @@ pub(super) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Mapping version recorded in every import. Bump it whenever the writers
 /// change what they emit, so `sync` can re-import and upgrade old copies.
-pub(crate) const MAPPING: u32 = 4;
+pub(crate) const MAPPING: u32 = 5;
 
 /// What a writer produced for a session: the artifacts recorded in the index
 /// (and removed again by `clean`).
@@ -164,6 +164,56 @@ pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Assigns ids a target will accept, keeping a call and its result on the same
+/// value. Anthropic validates `tool_use.id` against `^[A-Za-z0-9_-]+$` (a 400
+/// otherwise), and source ids can carry more — codex/omp compose
+/// `call_…|fc_…` — while the other stores take any string. One mapping keeps
+/// every target consistent, so an id never has to be rewritten per target.
+#[derive(Default)]
+pub(super) struct TargetIds {
+    assigned: std::collections::HashMap<String, String>,
+    used: std::collections::HashSet<String>,
+}
+
+impl TargetIds {
+    /// The target-safe id for a source id (stable within one session).
+    pub fn get(&mut self, original: &str) -> String {
+        if let Some(existing) = self.assigned.get(original) {
+            return existing.clone();
+        }
+        let base = safe_id(original);
+        let mut candidate = base.clone();
+        let mut n = 2;
+        while !self.used.insert(candidate.clone()) {
+            candidate = format!("{base}_{n}");
+            n += 1;
+        }
+        self.assigned
+            .insert(original.to_string(), candidate.clone());
+        candidate
+    }
+}
+
+/// `call_x|fc_y` keeps the call id itself; anything else outside the allowed
+/// class becomes `_`, so the result never depends on a provider's id space.
+fn safe_id(id: &str) -> String {
+    let head = id.split('|').next().unwrap_or(id);
+    let mut out: String = head
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() {
+        out.push_str("call");
+    }
+    out
+}
+
 /// Atomic write that journals the reason on failure: writers signal "nothing
 /// produced" with `None`, so without this the OS error would vanish and
 /// `doctor` could only say "target wrote nothing".
@@ -252,6 +302,7 @@ mod tests {
             created: Utc::now(),
             title: None,
             events,
+            msg_times: Default::default(),
         }
     }
 

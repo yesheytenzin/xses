@@ -79,7 +79,19 @@ fn write_inner(session: &CanonicalSession) -> Option<(PathBuf, PathBuf)> {
         parent = Some(uuid);
     }
 
-    for (_, blocks) in session.grouped() {
+    // Real time when the source recorded one, so the imported timeline is the
+    // session's own; rows must not go backwards, so equal-or-older times step
+    // forward by a millisecond.
+    let mut prev_ts = session.created;
+    // Anthropic rejects an id outside `[A-Za-z0-9_-]`; map once so a call and
+    // its result keep the same value.
+    let mut ids = super::TargetIds::default();
+    for (m, blocks) in session.grouped() {
+        let row_ts = match session.msg_times.get(&m).copied() {
+            Some(ts) if ts > prev_ts => ts,
+            _ => prev_ts + chrono::Duration::milliseconds(1),
+        };
+        prev_ts = row_ts;
         let role = group_role(&blocks, Role::Assistant);
         let mut content: Vec<Value> = Vec::new();
         let mut results: Vec<Value> = Vec::new();
@@ -100,7 +112,10 @@ fn write_inner(session: &CanonicalSession) -> Option<(PathBuf, PathBuf)> {
                     let input: Value = serde_json::from_str(args).unwrap_or_else(|_| json!(args));
                     content.push(json!({
                         "type": "tool_use",
-                        "id": call_id.clone().unwrap_or_else(|| format!("toolu_{}", uuid_like(&sid, cursor).replace('-', ""))),
+                        "id": call_id
+                            .clone()
+                            .map(|c| ids.get(&c))
+                            .unwrap_or_else(|| format!("toolu_{}", uuid_like(&sid, cursor).replace('-', ""))),
                         "name": name,
                         "input": input,
                     }));
@@ -112,7 +127,10 @@ fn write_inner(session: &CanonicalSession) -> Option<(PathBuf, PathBuf)> {
                     ..
                 } => results.push(json!({
                     "type": "tool_result",
-                    "tool_use_id": call_id.clone().unwrap_or_default(),
+                    "tool_use_id": call_id
+                        .clone()
+                        .map(|c| ids.get(&c))
+                        .unwrap_or_default(),
                     "is_error": is_error,
                     "content": [{"type": "text", "text": output}],
                 })),
@@ -192,7 +210,7 @@ fn write_inner(session: &CanonicalSession) -> Option<(PathBuf, PathBuf)> {
                     "message": message,
                     "uuid": uuid,
                     "parentUuid": parent,
-                    "timestamp": iso(&session.created),
+                    "timestamp": iso(&row_ts),
                     "cwd": session.cwd,
                     "sessionId": sid,
                     "isSidechain": false,
@@ -211,7 +229,7 @@ fn write_inner(session: &CanonicalSession) -> Option<(PathBuf, PathBuf)> {
                     "message": {"role": "user", "content": results},
                     "uuid": uuid,
                     "parentUuid": parent,
-                    "timestamp": iso(&session.created),
+                    "timestamp": iso(&row_ts),
                     "cwd": session.cwd,
                     "sessionId": sid,
                     "isSidechain": false,
@@ -267,6 +285,103 @@ mod tests {
     use crate::model::Tool;
     use chrono::{TimeZone, Utc};
 
+    /// Anthropic validates `tool_use.id` against `^[A-Za-z0-9_-]+$` and 400s
+    /// otherwise; sources compose ids like `call_x|fc_y`, so the writer must
+    /// map both sides of a pair onto the same accepted value.
+    #[test]
+    fn composite_tool_ids_are_mapped_for_the_api() {
+        let _serial = super::super::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let scratch = std::env::temp_dir().join(format!("xses-claude-ids-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let composite =
+            "call_01a1349e7cfa7468a35787224ed8fc45|fc_01a1349e7cfa7468a35787224ed8fc45".to_string();
+        let source_time = Utc.with_ymd_and_hms(2026, 10, 13, 9, 31, 0).unwrap();
+        let mut session = CanonicalSession {
+            id: "01a1349e-571e-727e-b6e4-221162373935".into(),
+            tool: Tool::Omp,
+            cwd: "/tmp/project".into(),
+            created: Utc.with_ymd_and_hms(2026, 10, 13, 9, 30, 0).unwrap(),
+            title: None,
+            msg_times: Default::default(),
+            events: vec![
+                Event {
+                    msg: 0,
+                    block: Block::ToolCall {
+                        name: "bash".into(),
+                        args: r#"{"command":"ls"}"#.into(),
+                        call_id: Some(composite.clone()),
+                        status: None,
+                    },
+                },
+                Event {
+                    msg: 1,
+                    block: Block::ToolResult {
+                        name: "bash".into(),
+                        output: "ok".into(),
+                        call_id: Some(composite.clone()),
+                        is_error: false,
+                        duration_ms: Some(5),
+                    },
+                },
+            ],
+        };
+        session.msg_times.insert(1, source_time);
+
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", &scratch);
+        let produced = write(&session);
+        match previous {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let files: Vec<&PathBuf> = produced.iter().flatten().collect();
+        let rollout = std::fs::read_to_string(files[0]).unwrap();
+        let mut seen_call = None;
+        let mut seen_result = None;
+        let mut result_ts = None;
+        for line in rollout.lines() {
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let content = v.pointer("/message/content");
+            let Some(items) = content.and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for item in items {
+                match item.get("type").and_then(|t| t.as_str()) {
+                    Some("tool_use") => seen_call = item["id"].as_str().map(str::to_string),
+                    Some("tool_result") => {
+                        seen_result = item["tool_use_id"].as_str().map(str::to_string);
+                        result_ts = v["timestamp"].as_str().map(str::to_string);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let call = seen_call.expect("tool_use written");
+        assert_eq!(
+            Some(call.as_str()),
+            seen_result.as_deref(),
+            "both sides of the pair must agree"
+        );
+        assert!(
+            call.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'),
+            "id must satisfy Anthropic's character class: {call}"
+        );
+        assert_eq!(
+            result_ts.as_deref(),
+            Some("2026-10-13T09:31:00.000Z"),
+            "the row keeps the source message's own time"
+        );
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+
     /// The claude writer's failure mode used to be a silent `None`, which sync
     /// reported as "target wrote nothing". Prove both artifacts land on disk.
     #[test]
@@ -284,6 +399,7 @@ mod tests {
             cwd: "/tmp/project".into(),
             created: Utc.with_ymd_and_hms(2026, 10, 13, 9, 30, 0).unwrap(),
             title: Some("[omp] fix the picker".into()),
+            msg_times: Default::default(),
             events: vec![
                 Event {
                     msg: 0,

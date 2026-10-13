@@ -5,7 +5,7 @@
 //! reasoning (with its signature when present), injected context, images,
 //! patches, compaction summaries, and token/cost accounting. Anything that
 //! cannot be captured becomes a named gap rather than disappearing.
-use crate::canonical::{Block, Block::*, CanonicalSession, Event, Events, Role};
+use crate::canonical::{Block, Block::*, CanonicalSession, Events, Role};
 use crate::model::Tool;
 use anyhow::Result;
 use serde_json::Value;
@@ -25,13 +25,14 @@ pub fn extract(
     created: chrono::DateTime<chrono::Utc>,
     path: &Path,
 ) -> Result<CanonicalSession> {
-    let events = match tool {
+    let collected = match tool {
         Tool::Claude => claude(path)?,
         Tool::Codex => codex(path)?,
         Tool::Pi => pi_family(path, Tool::Pi)?,
         Tool::Omp => pi_family(path, Tool::Omp)?,
         Tool::Opencode => opencode(id)?,
     };
+    let (events, msg_times) = collected.into_parts();
     Ok(CanonicalSession {
         id: id.to_string(),
         tool,
@@ -39,13 +40,14 @@ pub fn extract(
         created,
         title: None,
         events,
+        msg_times,
     })
 }
 
 /// opencode transcripts via read-only SQL (message + part `data` JSON).
 /// The runtime shapes are identical to `opencode export` output, but SQL is
 /// deterministic: the CLI truncates large stdout to 64KB multiples with exit 0.
-fn opencode(id: &str) -> Result<Vec<Event>> {
+fn opencode(id: &str) -> Result<Events> {
     let Some(db) = crate::scan::opencode_db() else {
         anyhow::bail!("opencode database not found")
     };
@@ -102,13 +104,17 @@ fn opencode(id: &str) -> Result<Vec<Event>> {
         };
         let mid = m.get("id").and_then(|i| i.as_str()).unwrap_or("");
         out.boundary();
+        // opencode stores the message time in ms.
+        if let Some(ts) = ms_time(&m) {
+            out.at(ts);
+        }
         if let Some(items) = by_msg.get(mid) {
             for part in items {
                 opencode_part(part, role, &mut out);
             }
         }
     }
-    Ok(out.into_vec())
+    Ok(out)
 }
 
 /// One opencode part → blocks. Kept separate from the message walk so the part
@@ -260,6 +266,23 @@ fn opencode_part(part: &Value, role: Role, out: &mut Events) {
     }
 }
 
+/// A source row's own timestamp, when it records one.
+fn row_time(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    v.get("timestamp")
+        .and_then(|t| t.as_str())
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// opencode keeps milliseconds since the epoch on the message, not a string.
+fn ms_time(v: &Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    let ms = v
+        .pointer("/time/created")
+        .or_else(|| v.get("time_created"))
+        .and_then(|t| t.as_i64())?;
+    chrono::DateTime::from_timestamp_millis(ms)
+}
+
 fn num(v: &Value, pointer: &str) -> u64 {
     v.pointer(pointer).and_then(|n| n.as_u64()).unwrap_or(0)
 }
@@ -283,7 +306,7 @@ fn parse_record(line_no: usize, line: &str, out: &mut Events) -> Option<Value> {
     }
 }
 
-fn claude(path: &Path) -> Result<Vec<Event>> {
+fn claude(path: &Path) -> Result<Events> {
     let mut out = Events::default();
     // Dedupes repeated meta injections (claude re-sends the same skill body on
     // every turn it applies to).
@@ -315,6 +338,9 @@ fn claude(path: &Path) -> Result<Vec<Event>> {
                 let text = text.trim();
                 if !text.is_empty() && seen_meta.insert(text.to_string()) {
                     out.boundary();
+                    if let Some(ts) = row_time(&v) {
+                        out.at(ts);
+                    }
                     out.push(Context {
                         kind: "meta".into(),
                         text: Some(text.to_string()),
@@ -333,6 +359,9 @@ fn claude(path: &Path) -> Result<Vec<Event>> {
                     .unwrap_or(false) =>
             {
                 out.boundary();
+                if let Some(ts) = row_time(&v) {
+                    out.at(ts);
+                }
                 let summary = v
                     .pointer("/message/content")
                     .and_then(text_of)
@@ -349,6 +378,9 @@ fn claude(path: &Path) -> Result<Vec<Event>> {
                     _ => Role::Assistant,
                 };
                 out.boundary();
+                if let Some(ts) = row_time(&v) {
+                    out.at(ts);
+                }
                 if let Some(content) = v.pointer("/message/content") {
                     collect_parts(content, role, Tool::Claude, &mut out);
                 }
@@ -364,7 +396,7 @@ fn claude(path: &Path) -> Result<Vec<Event>> {
             _ => {}
         }
     }
-    Ok(out.into_vec())
+    Ok(out)
 }
 
 fn usage_from_claude(u: &Value) -> Block {
@@ -427,7 +459,7 @@ fn claude_attachment(a: Option<&Value>) -> Option<Block> {
     }
 }
 
-fn codex(path: &Path) -> Result<Vec<Event>> {
+fn codex(path: &Path) -> Result<Events> {
     let mut out = Events::default();
     for (line_no, line) in lines(path)?.enumerate() {
         let line = line?;
@@ -448,12 +480,18 @@ fn codex(path: &Path) -> Result<Vec<Event>> {
                             _ => Role::Assistant,
                         };
                         out.boundary();
+                        if let Some(ts) = row_time(&v) {
+                            out.at(ts);
+                        }
                         if let Some(c) = payload.get("content") {
                             collect_parts(c, role, Tool::Codex, &mut out);
                         }
                     }
                     Some("reasoning") => {
                         out.boundary();
+                        if let Some(ts) = row_time(&v) {
+                            out.at(ts);
+                        }
                         let text = payload
                             .get("content")
                             .and_then(|c| c.as_str())
@@ -479,6 +517,9 @@ fn codex(path: &Path) -> Result<Vec<Event>> {
                     }
                     Some("function_call") => {
                         out.boundary();
+                        if let Some(ts) = row_time(&v) {
+                            out.at(ts);
+                        }
                         out.push(ToolCall {
                             name: payload
                                 .get("name")
@@ -518,6 +559,9 @@ fn codex(path: &Path) -> Result<Vec<Event>> {
                     }
                     Some("custom_tool_call") => {
                         out.boundary();
+                        if let Some(ts) = row_time(&v) {
+                            out.at(ts);
+                        }
                         out.push(ToolCall {
                             name: payload
                                 .get("name")
@@ -566,6 +610,9 @@ fn codex(path: &Path) -> Result<Vec<Event>> {
             // only the compaction itself is carried.
             Some("compacted") => {
                 out.boundary();
+                if let Some(ts) = row_time(&v) {
+                    out.at(ts);
+                }
                 out.push(codex_compaction(
                     &v.get("payload").cloned().unwrap_or(Value::Null),
                 ));
@@ -601,10 +648,10 @@ fn codex(path: &Path) -> Result<Vec<Event>> {
             _ => {}
         }
     }
-    Ok(out.into_vec())
+    Ok(out)
 }
 
-fn pi_family(path: &Path, tool: Tool) -> Result<Vec<Event>> {
+fn pi_family(path: &Path, tool: Tool) -> Result<Events> {
     let mut out = Events::default();
     for (line_no, line) in lines(path)?.enumerate() {
         let line = line?;
@@ -622,6 +669,9 @@ fn pi_family(path: &Path, tool: Tool) -> Result<Vec<Event>> {
                     continue;
                 };
                 out.boundary();
+                if let Some(ts) = row_time(&v) {
+                    out.at(ts);
+                }
                 match msg_role {
                     Some("toolResult") => {
                         let name = msg
@@ -726,7 +776,7 @@ fn pi_family(path: &Path, tool: Tool) -> Result<Vec<Event>> {
             _ => {}
         }
     }
-    Ok(out.into_vec())
+    Ok(out)
 }
 
 fn content_has_image(content: &Value) -> bool {
@@ -1383,7 +1433,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("");
         std::fs::write(&path, body).unwrap();
-        let events = claude(&path).expect("parse");
+        let events = claude(&path).expect("parse").into_vec();
         let _ = std::fs::remove_file(&path);
         events
     }
@@ -1422,6 +1472,33 @@ mod tests {
             }
             other => panic!("want Context, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn source_message_times_are_read() {
+        let rows = [
+            json!({"type": "user", "timestamp": "2026-10-13T09:30:00.500Z",
+                   "message": {"role": "user", "content": "hi"}}),
+            json!({"type": "assistant", "timestamp": "2026-10-13T09:31:12.250Z",
+                   "message": {"role": "assistant", "content": "there"}}),
+        ];
+        let dir = std::env::temp_dir().join(format!("xses-times-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("times.jsonl");
+        let body: String = rows.iter().map(|r| format!("{r}\n")).collect();
+        std::fs::write(&path, body).unwrap();
+        let (events, times) = claude(&path).expect("parse").into_parts();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(events.len(), 2);
+        let stamps: Vec<String> = times
+            .values()
+            .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+            .collect();
+        assert_eq!(
+            stamps,
+            vec!["2026-10-13T09:30:00.500Z", "2026-10-13T09:31:12.250Z"],
+            "each message keeps the time the source recorded"
+        );
     }
 
     #[test]

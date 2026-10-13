@@ -184,7 +184,18 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
         parent = Some(mid);
     }
 
-    for (_, blocks) in session.grouped() {
+    let mut ids = super::TargetIds::default();
+    let mut prev_ts = session.created;
+    for (m, blocks) in session.grouped() {
+        // The source message's own time when it recorded one; the store takes
+        // ISO times and only needs them not to go backwards.
+        let row_ts = match session.msg_times.get(&m).copied() {
+            Some(ts) if ts > prev_ts => ts,
+            _ => prev_ts + chrono::Duration::milliseconds(1),
+        };
+        prev_ts = row_ts;
+        let row_ts_iso = iso(&row_ts);
+        let row_ts_ms = row_ts.timestamp_millis();
         let role = message_role(&blocks, Role::Assistant);
         let usage = blocks.iter().find_map(|b| match b {
             Block::Usage {
@@ -226,7 +237,7 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
                         serde_json::from_str(args).unwrap_or_else(|_| json!(args));
                     parts.push(json!({
                         "type": "toolCall",
-                        "id": call_id.clone().unwrap_or_else(|| format!("call-{minted}-{name}")),
+                        "id": call_id.clone().map(|c| ids.get(&c)).unwrap_or_else(|| format!("call-{minted}-{name}")),
                         "name": name,
                         "arguments": arguments,
                     }));
@@ -239,7 +250,7 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
                     duration_ms,
                 } => {
                     results.push(json!({
-                        "toolCallId": call_id.clone().unwrap_or_else(|| format!("call-{name}")),
+                        "toolCallId": call_id.clone().map(|c| ids.get(&c)).unwrap_or_else(|| format!("call-{name}")),
                         "toolName": name,
                         "isError": is_error,
                         "durationMs": duration_ms.unwrap_or(0),
@@ -291,7 +302,7 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
             let mut message = json!({
                 "role": role_str(role),
                 "content": parts,
-                "timestamp": ts_ms,
+                "timestamp": row_ts_ms,
             });
             if matches!(role, Role::Assistant) {
                 let (input, output, reasoning, cache_read, cache_write, cost, model) =
@@ -317,7 +328,7 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
                     "type": "message",
                     "id": mid,
                     "parentId": parent,
-                    "timestamp": ts,
+                    "timestamp": row_ts_iso,
                     "message": message,
                 }),
             );
@@ -331,10 +342,10 @@ pub(super) fn write(target: Tool, session: &CanonicalSession) -> Option<PathBuf>
                     "type": "message",
                     "id": mid,
                     "parentId": parent,
-                    "timestamp": ts,
+                    "timestamp": row_ts_iso,
                     "message": {
                         "role": "toolResult",
-                        "timestamp": ts_ms,
+                        "timestamp": row_ts_ms,
                         "toolCallId": result["toolCallId"],
                         "toolName": result["toolName"],
                         "isError": result["isError"],
@@ -409,6 +420,7 @@ mod tests {
             cwd: "/tmp".into(),
             created,
             title: None,
+            msg_times: Default::default(),
             events: vec![],
         };
         let id = omp_id(&session);

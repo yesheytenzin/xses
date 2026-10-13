@@ -64,6 +64,7 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
     // folded by call id before the message loop.
     let mut folded: std::collections::HashMap<String, (String, bool, Option<u64>)> =
         std::collections::HashMap::new();
+    let mut ids = super::TargetIds::default();
     for (_, blocks) in &groups {
         for block in blocks {
             if let Block::ToolResult {
@@ -75,7 +76,10 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
             } = block
             {
                 folded.insert(
-                    call_id.clone().unwrap_or_else(|| format!("call-{name}")),
+                    call_id
+                        .clone()
+                        .map(|c| ids.get(&c))
+                        .unwrap_or_else(|| format!("call-{name}")),
                     (output.clone(), *is_error, *duration_ms),
                 );
             }
@@ -85,12 +89,21 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
     // Import note rides on the first message as assistant text: opencode's
     // import validator rejects `role: "system"` outright (verified).
     let mut note_pending = true;
-    for (i, (_, blocks)) in groups.into_iter().enumerate() {
+    let mut prev_ms = 0i64;
+    for (i, (m, blocks)) in groups.into_iter().enumerate() {
         // opencode orders messages by (time_created, id): ids must sort in
         // transcript order and timestamps must increase, or the import shows
         // up scrambled.
         let mid = format!("msg_{i:06}-{}", mint_suffix());
-        let ts = now_ms - ((total - i) as i64);
+        // The session's own time when the source recorded one; opencode
+        // orders by (time_created, id), so times must increase.
+        let ts = session
+            .msg_times
+            .get(&m)
+            .map(|t| t.timestamp_millis())
+            .filter(|ms| *ms > prev_ms)
+            .unwrap_or_else(|| (now_ms - ((total - i) as i64)).max(prev_ms + 1));
+        prev_ms = ts;
         let role = group_role(&blocks, Role::Assistant);
         // opencode's import validator only accepts user/assistant messages
         // ("Expected Message" on role=system, verified against the live CLI),

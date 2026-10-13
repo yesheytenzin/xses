@@ -21,6 +21,8 @@ struct Item {
     /// projection (ordinals may have gaps — the projection index allows it).
     thread: Option<(String, Value)>,
     item_id: String,
+    /// The source message's own time, when it recorded one.
+    ts: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
@@ -84,13 +86,16 @@ pub(super) fn write(session: &CanonicalSession) -> Option<PathBuf> {
         }),
     );
     for (i, item) in items.iter().enumerate() {
+        // Each record carries the source message's own time when there is one,
+        // so a resumed session shows the timeline it actually had.
+        let item_ts = item.ts.map(|t| iso(&t));
         push(
             &mut buf,
             &json!({
                 "ordinal": i + 2,
                 "type": item.wrapper,
                 "payload": item.payload,
-                "timestamp": ts,
+                "timestamp": item_ts.unwrap_or_else(|| ts.clone()),
             }),
         );
     }
@@ -145,12 +150,20 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                 json!({"type": "agentMessage", "id": id, "text": super::pi::IMPORT_NOTE}),
             )),
             item_id: id,
+            ts: None,
         });
     }
 
     // Pending shell calls, so a result can complete its item.
     let mut pending: Vec<(Option<String>, String, ThreadTool)> = Vec::new();
-    for (_, blocks) in session.grouped() {
+    let mut ids = super::TargetIds::default();
+    let mut prev_ts = session.created;
+    for (m, blocks) in session.grouped() {
+        let group_ts = match session.msg_times.get(&m).copied() {
+            Some(ts) if ts > prev_ts => ts,
+            _ => prev_ts + chrono::Duration::milliseconds(1),
+        };
+        prev_ts = group_ts;
         for block in &blocks {
             match block {
                 Block::Text { role, text, .. } => {
@@ -181,6 +194,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                             )
                         }),
                         item_id: id,
+                        ts: Some(group_ts),
                     });
                 }
                 Block::Thinking { text, .. } => {
@@ -203,6 +217,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                             json!({"type": "agentMessage", "id": id, "text": format!("[thinking]\n{text}")}),
                         )),
                         item_id: id,
+                        ts: Some(group_ts),
                     });
                 }
                 Block::ToolCall {
@@ -215,7 +230,10 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                         name.as_str(),
                         "exec" | "exec_command" | "bash" | "shell" | "sh" | "terminal"
                     );
-                    let id = call_id.clone().unwrap_or_else(|| mint("call_", &mut n));
+                    let id = call_id
+                        .clone()
+                        .map(|c| ids.get(&c))
+                        .unwrap_or_else(|| mint("call_", &mut n));
                     let payload = if shellish {
                         json!({
                             "type": "custom_tool_call",
@@ -277,6 +295,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                         payload,
                         thread: Some((thread.0.to_string(), thread.1)),
                         item_id: id,
+                        ts: Some(group_ts),
                     });
                 }
                 Block::ToolResult {
@@ -363,6 +382,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                         payload: wrapper_payload,
                         thread,
                         item_id: id,
+                        ts: Some(group_ts),
                     });
                 }
                 Block::Image {
@@ -407,6 +427,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                             ),
                         }),
                         item_id: id,
+                        ts: Some(group_ts),
                     });
                 }
                 Block::Context { kind, text, path } => {
@@ -429,6 +450,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                             json!({"type": "agentMessage", "id": id, "text": text}),
                         )),
                         item_id: id,
+                        ts: Some(group_ts),
                     });
                 }
                 Block::Patch { files, .. } => {
@@ -456,6 +478,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                             json!({"type": "agentMessage", "id": id, "text": text}),
                         )),
                         item_id: id,
+                        ts: Some(group_ts),
                     });
                 }
                 Block::Compressed { text } => {
@@ -474,6 +497,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                             json!({"type": "contextCompaction", "id": id}),
                         )),
                         item_id: id,
+                        ts: Some(group_ts),
                     });
                 }
                 Block::Usage {
@@ -506,6 +530,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                         // remaining ordinals still line up.
                         thread: None,
                         item_id: id,
+                        ts: Some(group_ts),
                     });
                 }
                 Block::Gap { detail, .. } => {
@@ -524,6 +549,7 @@ fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
                             json!({"type": "agentMessage", "id": id, "text": text}),
                         )),
                         item_id: id,
+                        ts: Some(group_ts),
                     });
                 }
             }
@@ -945,6 +971,7 @@ mod tests {
             created: Utc::now(),
             title: None,
             events,
+            msg_times: Default::default(),
         }
     }
 

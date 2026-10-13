@@ -45,9 +45,10 @@ target's constructs:
   and `FEATURE.md` documents what is carried, text-only, or impossible.
 
 - the remaining impossible rows are now evidence-backed rather than assumed:
-  claude's `signature` decodes to signed metadata (protobuf: model, block type,
-  a 64-byte signature, nonces — no reasoning), and claude's CLI documents that a
-  rejected signature makes it strip thinking and retry; codex's
+  claude documents its `signature` as an encrypted copy of the full reasoning
+  that only its servers decrypt (the decoded envelope here is protobuf metadata
+  with no plaintext), and its CLI documents that a rejected signature makes it
+  strip thinking and retry; codex's
   `encrypted_content` is server-side encrypted state replayed verbatim to the
   same organization, with no local key (`~/.codex/auth.json` holds only tokens)
   and only its readable `summary` transfers. Both were checked with REA against
@@ -64,7 +65,14 @@ target's constructs:
   `timestamp`, pi/omp row + `message.timestamp`, opencode `time.created`),
   stepping forward a millisecond only when a target needs strictly increasing
   values. Previously every imported row carried the session's creation time.
-  Mapping version 5 re-imports existing copies once so old rows pick this up.
+  Mapping version 6 re-imports existing copies once so old rows pick this up.
+- claude's truncated tool outputs are restored: when a transcript row only
+  holds a preview plus a `toolUseResult.persistedOutputPath`, the full text is
+  read from claude's `tool-results/` sidecar (10 rows, 0.72 MB here) and
+  carried as a labelled `[context: tool-output]` block. Context rather than a
+  tool result: the row is a plain user string that claude never paired with a
+  call id, and claude's own resume path rejects a result whose id matches no
+  call.
 - sessions that were never useful are hidden from `ls`, `pick` and `sync`:
   `empty` (no turns), `unanswered` (nothing ever answered the user) and
   `failed` (assistant turns that are only API/abort errors), each detected from

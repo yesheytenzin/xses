@@ -127,10 +127,13 @@ fn write_inner(session: &CanonicalSession) -> Option<(PathBuf, PathBuf)> {
                     ..
                 } => results.push(json!({
                     "type": "tool_result",
+                    // Anthropic's pattern requires a non-empty
+                    // `[A-Za-z0-9_-]+`, so a result whose call id the source
+                    // never recorded gets a minted one.
                     "tool_use_id": call_id
                         .clone()
                         .map(|c| ids.get(&c))
-                        .unwrap_or_default(),
+                        .unwrap_or_else(|| format!("toolu_{}", uuid_like(&sid, cursor).replace('-', ""))),
                     "is_error": is_error,
                     "content": [{"type": "text", "text": output}],
                 })),

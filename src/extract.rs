@@ -372,6 +372,18 @@ fn claude(path: &Path) -> Result<Events> {
                 });
             }
             "user" | "assistant" | "system" => {
+                // claude truncates a big tool output in the transcript and keeps
+                // the full text in `<session>/tool-results/*.txt`, pointing at it
+                // from `toolUseResult`. The full output is on disk, so the
+                // result the model could read is what transfers.
+                if let Some(restored) = restored_persisted_output(&v) {
+                    out.boundary();
+                    if let Some(ts) = row_time(&v) {
+                        out.at(ts);
+                    }
+                    out.push(restored);
+                    continue;
+                }
                 let role = match t {
                     "user" => Role::User,
                     "system" => Role::System,
@@ -787,6 +799,31 @@ fn content_has_image(content: &Value) -> bool {
                 Some("image" | "input_image")
             )
         })
+    })
+}
+
+/// A claude tool result whose text claude stored beside the transcript.
+fn restored_persisted_output(row: &Value) -> Option<Block> {
+    let tur = row.get("toolUseResult")?;
+    let path = PathBuf::from(tur.get("persistedOutputPath")?.as_str()?);
+    let meta = fs::metadata(&path).ok()?;
+    if !meta.is_file() || meta.len() > MAX_INLINE_BYTES {
+        return None; // keep the transcript's own preview text instead
+    }
+    let body = match fs::read_to_string(&path) {
+        Ok(body) => body,
+        Err(_) => return None, // not text, or unreadable: leave the preview
+    };
+    // Context, not a tool result: the transcript row is a plain user string
+    // (claude never paired it with a call id), and a `tool_result` whose id
+    // matches no `tool_use` is exactly what claude's own resume path rejects.
+    Some(Context {
+        kind: "tool-output".into(),
+        text: Some(format!(
+            "[full output restored from claude's tool-results sidecar: {} bytes]\n{body}",
+            meta.len()
+        )),
+        path: Some(path),
     })
 }
 
@@ -1472,6 +1509,51 @@ mod tests {
             }
             other => panic!("want Context, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn claude_persisted_tool_outputs_are_restored() {
+        // Shape from a live store: the row points at a file holding the full
+        // output claude cut down to a 2 KB preview in the transcript.
+        let dir = std::env::temp_dir().join(format!("xses-sidecar-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sidecar = dir.join("by0bn2k8o.txt");
+        std::fs::write(&sidecar, "line one\nline two\n").unwrap();
+        let row = json!({
+            "type": "user",
+            "timestamp": "2026-10-13T09:32:00Z",
+            "toolUseResult": {
+                "persistedOutputPath": sidecar.to_str().unwrap(),
+                "persistedOutputSize": 18,
+                "stdout": "",
+                "stderr": "",
+            },
+            "message": {"role": "user", "content": "<persisted-output>\nOutput too large. Preview follows"}
+        });
+        let events = claude_rows(&[row]);
+        match &events[0].block {
+            Block::Context { kind, text, path } => {
+                assert_eq!(kind, "tool-output");
+                let text = text.as_deref().unwrap_or("");
+                assert!(text.contains("line two"), "full text carried: {text}");
+                assert!(text.contains("restored"), "provenance kept: {text}");
+                assert!(path.is_some(), "the sidecar path is recorded");
+            }
+            other => panic!("want Context, got {other:?}"),
+        }
+        // A sidecar that is gone leaves the transcript's own text alone.
+        let row = json!({
+            "type": "user",
+            "toolUseResult": {"persistedOutputPath": "/nonexistent/gone.txt"},
+            "message": {"role": "user", "content": "preview only"}
+        });
+        let events = claude_rows(&[row]);
+        assert!(
+            matches!(&events[0].block, Block::Text { text, .. } if text.contains("preview only")),
+            "fall back to the transcript text: {:?}",
+            events[0].block
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

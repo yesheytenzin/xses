@@ -31,7 +31,7 @@ pub(super) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Mapping version recorded in every import. Bump it whenever the writers
 /// change what they emit, so `sync` can re-import and upgrade old copies.
-pub(crate) const MAPPING: u32 = 5;
+pub(crate) const MAPPING: u32 = 6;
 
 /// What a writer produced for a session: the artifacts recorded in the index
 /// (and removed again by `clean`).

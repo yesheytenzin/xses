@@ -259,3 +259,75 @@ fn uuid_like(seed: &str, i: usize) -> String {
         (((h[1] as u64) << 32) | h[0] as u64) & 0xffff_ffff_ffff
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::canonical::{Block, Event, Role};
+    use crate::model::Tool;
+    use chrono::{TimeZone, Utc};
+
+    /// The claude writer's failure mode used to be a silent `None`, which sync
+    /// reported as "target wrote nothing". Prove both artifacts land on disk.
+    #[test]
+    fn writes_a_rollout_and_a_title_sidecar() {
+        let _serial = super::super::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let scratch = std::env::temp_dir().join(format!("xses-claude-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(&scratch).unwrap();
+
+        let session = CanonicalSession {
+            id: "01a1349e-571e-727e-b6e4-221162373935".into(),
+            tool: Tool::Omp,
+            cwd: "/tmp/project".into(),
+            created: Utc.with_ymd_and_hms(2026, 10, 13, 9, 30, 0).unwrap(),
+            title: Some("[omp] fix the picker".into()),
+            events: vec![
+                Event {
+                    msg: 0,
+                    block: Block::Text {
+                        role: Role::User,
+                        text: "hello".into(),
+                    },
+                },
+                Event {
+                    msg: 1,
+                    block: Block::Text {
+                        role: Role::Assistant,
+                        text: "hi".into(),
+                    },
+                },
+            ],
+        };
+
+        let previous = std::env::var_os("HOME");
+        std::env::set_var("HOME", &scratch);
+        let produced = write(&session);
+        match previous {
+            Some(home) => std::env::set_var("HOME", home),
+            None => std::env::remove_var("HOME"),
+        }
+
+        let files: Vec<&PathBuf> = produced.iter().flatten().collect();
+        assert_eq!(files.len(), 2, "rollout + title sidecar");
+        for file in &files {
+            assert!(
+                file.starts_with(&scratch),
+                "wrote outside the redirected home: {}",
+                file.display()
+            );
+            assert!(file.exists(), "missing {}", file.display());
+        }
+        let rollout = std::fs::read_to_string(files[0]).unwrap();
+        assert!(
+            rollout.lines().count() >= 3,
+            "claude rows missing: {rollout}"
+        );
+        let sidecar: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(files[1]).unwrap()).unwrap();
+        assert_eq!(sidecar["customTitle"], "[omp] fix the picker");
+        let _ = std::fs::remove_dir_all(&scratch);
+    }
+}

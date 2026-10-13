@@ -24,6 +24,11 @@ use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Serializes tests that redirect `$HOME`: writers resolve their target
+/// directory through `dirs::home_dir()`, which reads the environment.
+#[cfg(test)]
+pub(super) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Mapping version recorded in every import. Bump it whenever the writers
 /// change what they emit, so `sync` can re-import and upgrade old copies.
 pub(crate) const MAPPING: u32 = 4;

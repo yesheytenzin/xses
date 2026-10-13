@@ -1,10 +1,16 @@
 # Changelog
 
-## Unreleased — structured transfer (mapping 4), picker and transfer fixes
+## 0.0.6 — mapping 6: tool ids, message times and restored outputs
 
-Imports now carry the source's own structure instead of flattening everything
-to text. A source message maps to one native message, and its parts map to the
-target's constructs:
+The transfer layer stopped assuming what a store *might* hold and started
+recording what it does: ids that the target's own validator accepts, the time
+each source message actually happened, and the tool outputs claude keeps beside
+a transcript instead of in it. Around that, the picker, `doctor` and the index
+lock grew the guard rails a daily driver needs.
+
+Imports carry the source's own structure instead of flattening it to text: one
+source message maps to one native message, and its parts map to the target's
+constructs:
 
 - tool calls and results travel as `tool_use`/`tool_result` (claude),
   `function_call`/`function_call_output` (codex), `toolCall`/`toolResult`
@@ -24,8 +30,8 @@ target's constructs:
 - images kept as content-addressed references (`blob:sha256:<hash>`) are
   resolved from the agent's own blob store (both pi's and omp's stores are
   searched) and inlined as base64 instead of arriving as a broken data URL.
-  Mapping version 4 re-imports existing copies once so old imports stop
-  carrying the unresolved form.
+  A mapping bump re-imports existing copies once so old imports stop carrying
+  the unresolved form.
 - `--from <tool>` scopes the candidate stores before refs resolve, so
   `sync --from pi <id>` picks the pi session even when the same id also exists
   in stores it was imported into.

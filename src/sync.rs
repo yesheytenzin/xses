@@ -44,11 +44,21 @@ fn delete_opencode_imports(
             .map(|id| format!("'{}'", id.replace('\'', "''")))
             .collect::<Vec<_>>()
             .join(",");
+        // Both store generations: v1 (`session`/`message`/`part`) always,
+        // v2 (`session_v2`/`session_message`) when the store has it.
+        let v2 = if crate::scan::opencode_has_v2(&db) {
+            format!(
+                " DELETE FROM session_message WHERE session_id IN ({quoted}); \
+                 DELETE FROM session_v2 WHERE id IN ({quoted});"
+            )
+        } else {
+            String::new()
+        };
         let sql = format!(
             "PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; \
              DELETE FROM part WHERE session_id IN ({quoted}); \
              DELETE FROM message WHERE session_id IN ({quoted}); \
-             DELETE FROM session WHERE id IN ({quoted}); COMMIT;"
+             DELETE FROM session WHERE id IN ({quoted});{v2} COMMIT;"
         );
         let mut command = Command::new("sqlite3");
         command.args(["-cmd", ".timeout 5000"]).arg(&db).arg(sql);

@@ -125,36 +125,54 @@ pub fn opencode_db() -> Option<std::path::PathBuf> {
     p.exists().then_some(p)
 }
 
-/// Return OpenCode session IDs whose durable slug marks them as xses
-/// imports. The OpenCode CLI list output does not include `slug`, so cleanup
-/// must consult the database directly.
+/// Return OpenCode session IDs xses imported, across both store generations:
+/// v1 marks them with an `xses-*` slug, v2 with `metadata.xses` (slugs are
+/// server-generated there). The OpenCode CLI list output exposes neither, so
+/// cleanup consults the database directly.
 pub fn opencode_import_ids(only: Option<&HashSet<(Tool, String)>>) -> Result<HashSet<String>> {
     let Some(db) = opencode_db() else {
         return Ok(HashSet::new());
     };
-    let q = std::process::Command::new("sqlite3")
-        .arg("-readonly")
-        .arg("-json")
-        .arg(&db)
-        .arg("SELECT id, slug FROM session WHERE slug LIKE 'xses-%' OR slug LIKE 'sessionizer-%';")
-        .output()
-        .context("scan OpenCode import markers")?;
-    if !q.status.success() {
-        anyhow::bail!(
-            "OpenCode import scan failed: {}",
-            String::from_utf8_lossy(&q.stderr).trim()
-        );
+    let run = |sql: &str| -> Result<Vec<serde_json::Value>> {
+        let q = std::process::Command::new("sqlite3")
+            .arg("-readonly")
+            .arg("-json")
+            .arg(&db)
+            .arg(sql)
+            .output()
+            .context("scan OpenCode import markers")?;
+        if !q.status.success() {
+            anyhow::bail!(
+                "OpenCode import scan failed: {}",
+                String::from_utf8_lossy(&q.stderr).trim()
+            );
+        }
+        crate::proc::json_rows(
+            &String::from_utf8_lossy(&q.stdout),
+            "OpenCode import markers",
+        )
+    };
+    let mut rows = run("SELECT id, slug, NULL AS src, NULL AS src_id FROM session WHERE slug LIKE 'xses-%' OR slug LIKE 'sessionizer-%';")?;
+    if opencode_has_v2(&db) {
+        // The id is deterministic (`ses_` + import hash), so v2 rows can be
+        // matched without trusting the editable title.
+        rows.extend(run("SELECT id, slug, json_extract(metadata,'$.xses.source') AS src, json_extract(metadata,'$.xses.srcId') AS src_id FROM session_v2 WHERE json_extract(metadata,'$.xses.srcId') IS NOT NULL;")?);
     }
-    let rows = crate::proc::json_rows(
-        &String::from_utf8_lossy(&q.stdout),
-        "OpenCode import markers",
-    )?;
     Ok(rows
         .into_iter()
         .filter(|row| {
             only.is_none_or(|sources| {
                 let slug = row.get("slug").and_then(|s| s.as_str()).unwrap_or_default();
                 let id = row.get("id").and_then(|s| s.as_str()).unwrap_or_default();
+                // v2 rows carry their source inline; v1 rows match by slug/id.
+                if let (Some(src), Some(src_id)) = (
+                    row.get("src").and_then(|s| s.as_str()),
+                    row.get("src_id").and_then(|s| s.as_str()),
+                ) {
+                    return sources.iter().any(|(tool, source)| {
+                        tool.as_str() == src && source == src_id
+                    });
+                }
                 sources.iter().any(|(tool, source)| {
                     let base = crate::write::import_id_for(*tool, source);
                     slug == format!("xses-{base}")
@@ -169,9 +187,12 @@ pub fn opencode_import_ids(only: Option<&HashSet<(Tool, String)>>) -> Result<Has
 
 /// opencode: discovery via read-only SQL. `opencode export` truncates stdout
 /// under load (64KB chunks, exit 0), so every opencode *read* goes straight to
-/// SQLite; only *writes* go through the CLI (`opencode import`). Mirrors the
-/// CLI list rule (verified): sessions whose directory equals the cwd when one
-/// is pinned, else global+unarchived+root sessions, subagents hidden.
+/// SQLite; only *writes* go through the CLI (`opencode session import`).
+/// Mirrors the CLI list rule (verified): sessions whose directory equals the
+/// cwd when one is pinned, else global+unarchived+root sessions, subagents
+/// hidden. Both store generations are read: v1 (`session`/`message`) and v2
+/// (`session_v2`/`session_message`) — v2 no longer lists v1 rows, but they
+/// are still real sessions xses may have written.
 fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
     let Some(db) = opencode_db() else {
         return Ok(vec![]);
@@ -183,20 +204,60 @@ fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
         ),
         None => "s.time_archived IS NULL AND (s.parent_id IS NULL OR s.parent_id = '')".into(),
     };
-    // Aggregate each session's messages once instead of four correlated scans.
-    let sql = format!("SELECT s.id, s.slug, s.title, s.directory, s.time_created AS created,
+    let mut out = Vec::new();
+    // v1 generation: message roles live in `message.data`, parts aside.
+    out.extend(opencode_scan_generation(
+        &db,
+        &format!("SELECT s.id, s.slug, s.title, s.directory, s.time_created AS created,
         MAX(s.time_updated, COALESCE(MAX(m.time_updated), 0)) AS updated,
         COALESCE(SUM(json_extract(m.data,'$.role') IN ('user','assistant','system')),0) AS messages,
         COALESCE(SUM(json_extract(m.data,'$.role')='user'),0) AS user_turns,
         COALESCE(SUM(json_extract(m.data,'$.role')='assistant'),0) AS asst_turns,
-        COALESCE(SUM(json_extract(m.data,'$.role')='assistant' AND json_extract(m.data,'$.error') IS NULL),0) AS ok_asst_turns
+        COALESCE(SUM(json_extract(m.data,'$.role')='assistant' AND json_extract(m.data,'$.error') IS NULL),0) AS ok_asst_turns,
+        NULL AS xses_src
         FROM session s LEFT JOIN message m ON m.session_id=s.id
-        WHERE {condition} GROUP BY s.id;");
+        WHERE {condition} GROUP BY s.id;"),
+    )?);
+    // v2 generation: message types live in a `type` column with inline
+    // content; provenance rides in `session.metadata.xses` (the server
+    // regenerates slugs on import, so the v1 slug marker cannot survive).
+    if opencode_has_v2(&db) {
+        out.extend(opencode_scan_generation(
+            &db,
+            &format!("SELECT s.id, s.slug, s.title, s.directory, s.time_created AS created,
+            MAX(s.time_updated, COALESCE(MAX(m.time_updated), 0)) AS updated,
+            COALESCE(SUM(m.type IN ('user','assistant','system')),0) AS messages,
+            COALESCE(SUM(m.type='user'),0) AS user_turns,
+            COALESCE(SUM(m.type='assistant'),0) AS asst_turns,
+            COALESCE(SUM(m.type='assistant' AND m.data NOT LIKE '%\"status\":\"error\"%'),0) AS ok_asst_turns,
+            json_extract(s.metadata,'$.xses.srcId') AS xses_src
+            FROM session_v2 s LEFT JOIN session_message m ON m.session_id=s.id
+            WHERE {condition} GROUP BY s.id;"),
+        )?);
+    }
+    Ok(out)
+}
+
+/// True when the store has the v2 generation (opencode ≥ 2.x); older stores
+/// carry v1 tables only.
+pub(crate) fn opencode_has_v2(db: &std::path::Path) -> bool {
+    std::process::Command::new("sqlite3")
+        .arg("-readonly")
+        .arg(db)
+        .arg("SELECT 1 FROM sqlite_master WHERE name='session_v2';")
+        .output()
+        .map(|q| String::from_utf8_lossy(&q.stdout).contains('1'))
+        .unwrap_or(false)
+}
+
+/// One generation's session rows → [`Session`]s. Runs one aggregate query
+/// instead of four correlated scans.
+fn opencode_scan_generation(db: &std::path::Path, sql: &str) -> Result<Vec<Session>> {
     let q = std::process::Command::new("sqlite3")
         .arg("-readonly")
         .arg("-json")
-        .arg(&db)
-        .arg(&sql)
+        .arg(db)
+        .arg(sql)
         .output();
     let q = q.context("launch sqlite3 for OpenCode session scan")?;
     if !q.status.success() {
@@ -252,9 +313,15 @@ fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
             summary: display_title(Tool::Opencode, &title),
             path: PathBuf::from(format!("opencode://{id}")),
             // Titles are user-editable and can legitimately begin with an
-            // agent-looking prefix. The slug is written by xses and is
-            // the durable provenance marker.
-            is_import: slug.starts_with("xses-") || slug.starts_with("sessionizer-"),
+            // agent-looking prefix. The v1 slug is written by xses and is
+            // the durable provenance marker there; v2 imports carry
+            // `metadata.xses` instead (the server regenerates slugs).
+            is_import: slug.starts_with("xses-")
+                || slug.starts_with("sessionizer-")
+                || obj
+                    .get("xses_src")
+                    .and_then(|s| s.as_str())
+                    .is_some_and(|s| !s.is_empty()),
             noise: {
                 let user = obj.get("user_turns").and_then(|v| v.as_u64()).unwrap_or(0);
                 let asst = obj.get("asst_turns").and_then(|v| v.as_u64()).unwrap_or(0);

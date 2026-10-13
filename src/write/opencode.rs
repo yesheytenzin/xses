@@ -1,42 +1,59 @@
-//! opencode writer: synthesize an export payload, pipe it through `opencode import`.
-use super::{args_json_object, fallback_call_id, fallback_text, group_role, import_id, manifest, role_str, usage_of};
+//! opencode writer: synthesize an export payload, pipe it through
+//! `opencode session import` (v2; v1 CLI past tense). Reads go straight to
+//! SQLite across both store generations; only writes go through the CLI.
+//! The v2 import validator takes the `session export` shape: flat messages
+//! with inline content, `info.location` + `projectID`, and provenance in
+//! `info.metadata.xses` (slugs are server-generated, so the v1 slug marker
+//! cannot survive an import).
+use super::{args_json_object, fallback_call_id, fallback_text, group_role, import_id, manifest, usage_of};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
-/// opencode: synthesize an export-format payload and pipe it through
-/// `opencode import`. We never touch opencode's SQLite store directly — the
-/// CLI owns all schema knowledge (showagent's proven policy).
+/// opencode: synthesize a v2 export-format payload and pipe it through
+/// `opencode session import`. We never touch opencode's SQLite store directly
+/// — the CLI owns all schema knowledge (showagent's proven policy).
 /// The model the user actually runs in opencode (from the most recent
-/// assistant message in its DB), resolved lazily; falls back to the
-/// default when the store is empty.
+/// assistant message in its DB, either store generation), resolved lazily;
+/// falls back to the default when the store is empty.
 static OPENCODE_MODEL: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| {
     let fallback = json!({"providerID": "opencode", "modelID": "big-pickle", "id": "big-pickle"});
-    let query =
+    // v2 keeps the model nested (`model.{id,providerID}` on assistant rows);
+    // v1 kept `providerID`/`modelID` beside the role. Newest row wins.
+    for query in [
+        "SELECT json_extract(data,'$.model.providerID') AS p, json_extract(data,'$.model.id') AS m \
+         FROM session_message WHERE type='assistant' \
+         AND json_extract(data,'$.model.id') IS NOT NULL \
+         ORDER BY time_created DESC LIMIT 1;",
         "SELECT json_extract(data,'$.providerID') AS p, json_extract(data,'$.modelID') AS m \
-                 FROM message WHERE json_extract(data,'$.role')='assistant' \
-                 AND json_extract(data,'$.modelID') IS NOT NULL \
-                 ORDER BY time_created DESC LIMIT 1;";
-    let Ok(out) = std::process::Command::new("opencode")
-        .args(["db", "--format", "json", query])
-        .output()
-    else {
-        return fallback;
-    };
-    let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
-        return fallback;
-    };
-    match rows.first() {
-        Some(r) => {
+         FROM message WHERE json_extract(data,'$.role')='assistant' \
+         AND json_extract(data,'$.modelID') IS NOT NULL \
+         ORDER BY time_created DESC LIMIT 1;",
+    ] {
+        let Some(db) = crate::scan::opencode_db() else {
+            break;
+        };
+        let Ok(out) = std::process::Command::new("sqlite3")
+            .args(["-readonly", "-json"])
+            .arg(&db)
+            .arg(query)
+            .output()
+        else {
+            continue;
+        };
+        let Ok(rows) = serde_json::from_slice::<Vec<serde_json::Value>>(&out.stdout) else {
+            continue;
+        };
+        if let Some(r) = rows.first() {
             let p = r.get("p").and_then(|v| v.as_str()).unwrap_or("opencode");
             let m = r.get("m").and_then(|v| v.as_str()).unwrap_or("big-pickle");
             // the import validator requires `model.id` as well
-            json!({"providerID": p, "modelID": m, "id": m})
+            return json!({"providerID": p, "modelID": m, "id": m});
         }
-        None => fallback,
     }
+    fallback
 });
 
 pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Option<PathBuf> {
@@ -56,10 +73,9 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         .and_then(|v| v.as_str())
         .unwrap_or("big-pickle")
         .to_string();
-    // Native shapes (verified against a live export): assistant infos carry
-    // parentID/mode/path/cost/tokens + top-level providerID/modelID, user infos
-    // carry agent/model/summary and no parentID.
-    let mut prev_id: Option<String> = None;
+    // Native shapes (verified against a live `session export`): user rows
+    // carry text + files, assistant rows carry inline content plus
+    // message-level tokens/cost/model and a mandatory `time.completed`.
     let mut msgs_json: Vec<serde_json::Value> = Vec::new();
     let groups = session.grouped();
     let total = groups.len().max(1);
@@ -88,8 +104,8 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
             }
         }
     }
-    // Import note rides on the first message as assistant text: opencode's
-    // import validator rejects `role: "system"` outright (verified).
+    // Import note rides on the first message as assistant text, so a resumed
+    // agent reads the transcript as history rather than live state.
     let mut note_pending = true;
     let mut prev_ms = 0i64;
     for (i, (m, blocks)) in groups.into_iter().enumerate() {
@@ -107,77 +123,46 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
             .unwrap_or_else(|| (now_ms - ((total - i) as i64)).max(prev_ms + 1));
         prev_ms = ts;
         let role = group_role(&blocks, Role::Assistant);
-        // opencode's import validator only accepts user/assistant messages
-        // ("Expected Message" on role=system, verified against the live CLI),
-        // so transcript-context lines ride as assistant text.
-        let is_assistant = matches!(role, Role::Assistant | Role::System);
         let usage = usage_of(&blocks);
-        let info = if is_assistant {
-            json!({
-                "id": mid,
-                "sessionID": ses,
-                "role": "assistant",
-                "parentID": prev_id.clone().unwrap_or_else(|| format!("msg_{:06}-seed", 0)),
-                "time": {"created": ts},
-                "mode": "build",
-                "agent": "build",
-                "path": {"cwd": session.cwd, "root": session.cwd},
-                "cost": usage.cost,
-                "tokens": {"input": usage.input, "output": usage.output, "reasoning": usage.reasoning,
-                           "cache": {"read": usage.cache_read, "write": usage.cache_write}},
-                "providerID": provider_id,
-                "modelID": model_id,
-            })
-        } else {
-            let mut info = json!({
-                "id": mid,
-                "sessionID": ses,
-                "role": role_str(role),
-                "time": {"created": ts},
-                "agent": "build",
-                "model": model,
-                "summary": {"diffs": []},
-            });
-            if let Some(prev) = &prev_id {
-                info["parentID"] = json!(prev);
-            }
-            info
-        };
-        let mut parts: Vec<serde_json::Value> = Vec::new();
-        fn part_id(minted: &mut usize, prefix: &str) -> String {
-            *minted += 1;
-            format!("{prefix}{minted:04}-{}", mint_suffix())
-        }
+        // Assistant rows require `time.completed`; without it the validator
+        // silently drops the message (verified live). +1ms stays ordered.
+        let end_ts = ts + 1;
+        let mut content: Vec<Value> = Vec::new();
+        let mut files: Vec<Value> = Vec::new();
         if note_pending {
             note_pending = false;
-            let pid = part_id(&mut minted, "prt_");
-            parts.push(json!({
-                "type": "text",
-                "id": pid,
-                "sessionID": ses,
-                "messageID": mid,
-                "text": super::IMPORT_NOTE,
-            }));
+            if matches!(role, Role::User) {
+                // The note is assistant speech: it gets its own row ahead of
+                // a leading user message so roles stay clean.
+                msgs_json.push(json!({
+                    "id": format!("msg_{:06}-note", 0),
+                    "type": "assistant",
+                    "agent": "build",
+                    "model": {"id": model_id, "providerID": provider_id},
+                    "content": [{"type": "text", "text": super::IMPORT_NOTE}],
+                    "time": {"created": ts, "completed": end_ts},
+                    "finish": "stop",
+                    "cost": 0,
+                    "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                               "cache": {"read": 0, "write": 0}},
+                }));
+            } else {
+                content.push(json!({"type": "text", "text": super::IMPORT_NOTE}));
+            }
         }
         for block in &blocks {
             match block {
                 Block::Text { text, .. } => {
-                    let pid = part_id(&mut minted, "prt_");
-                    parts.push(json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid, "text": text}));
+                    content.push(json!({"type": "text", "text": text}));
                 }
                 Block::Thinking { text, .. } => {
-                    if text.trim().is_empty() {
-                        continue;
+                    if !text.trim().is_empty() {
+                        content.push(json!({
+                            "type": "reasoning",
+                            "text": text,
+                            "time": {"created": ts, "completed": end_ts},
+                        }));
                     }
-                    let pid = part_id(&mut minted, "prt_");
-                    parts.push(json!({
-                        "type": "reasoning",
-                        "id": pid,
-                        "sessionID": ses,
-                        "messageID": mid,
-                        "text": text,
-                        "time": {"start": ts, "end": ts},
-                    }));
                 }
                 Block::ToolCall {
                     name,
@@ -188,79 +173,44 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
                     // Same mapping the fold loop used, so the call meets its
                     // folded result even when the source id needed remapping.
                     let cid = fallback_call_id(&mut ids, call_id, &mut minted, name);
-                    // The validator requires an object input and a mandatory
-                    // `state.output`; a call whose result was never recorded
-                    // keeps an empty output rather than failing the import.
+                    // Completed states carry `content[]`; error states carry
+                    // `error.message` instead — each shape without the other
+                    // key (verified against live rows and the validator).
                     let input = args_json_object(args);
                     let (output, is_error, duration) = folded
                         .get(&cid)
                         .cloned()
                         .unwrap_or_else(|| (String::new(), false, None));
-                    let pid = part_id(&mut minted, "prt_");
-                    // The import validator wants the whole union present:
-                    // `output` and `error` both, with the unused one null.
-                    let mut state = json!({
-                        "status": if is_error || status.as_deref() == Some("error") {
-                            "error"
-                        } else {
-                            "completed"
-                        },
-                        "input": input,
-                        "output": if is_error { Value::Null } else { json!(output) },
-                        "error": if is_error { json!(output) } else { Value::Null },
-                        "title": name,
-                        "metadata": {},
-                        "time": {"start": ts, "end": ts},
-                    });
-                    if let Some(d) = duration {
-                        state["metadata"]["durationMs"] = json!(d);
-                    }
-                    parts.push(json!({
+                    let is_error = is_error || status.as_deref() == Some("error");
+                    let state = if is_error {
+                        json!({"status": "error", "input": input,
+                               "error": {"type": "tool.execution", "message": output}})
+                    } else {
+                        json!({"status": "completed", "input": input,
+                               "content": [{"type": "text", "text": output}]})
+                    };
+                    let call_end = ts + duration.unwrap_or(1).max(1) as i64;
+                    content.push(json!({
                         "type": "tool",
-                        "id": pid,
-                        "sessionID": ses,
-                        "messageID": mid,
-                        "tool": name,
-                        "callID": cid,
+                        "id": cid,
+                        "name": name,
                         "state": state,
+                        "time": {"created": ts, "completed": call_end.max(end_ts)},
                     }));
                 }
                 // Results were folded into their call's part above.
                 Block::ToolResult { .. } => {}
-                Block::Patch { hash, files } if hash.as_deref().is_some_and(|h| !h.is_empty()) => {
-                    let pid = part_id(&mut minted, "prt_");
-                    parts.push(json!({
-                        "type": "patch",
-                        "id": pid,
-                        "sessionID": ses,
-                        "messageID": mid,
-                        "hash": hash.clone().unwrap_or_default(),
-                        "files": files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>(),
-                    }));
-                }
-                // Hash-less patches ride as labelled text.
-                Block::Patch { .. } => {
-                    let pid = part_id(&mut minted, "prt_");
-                    parts.push(json!({
-                        "type": "text",
-                        "id": pid,
-                        "sessionID": ses,
-                        "messageID": mid,
-                        "text": fallback_text(block).unwrap_or_default(),
-                    }));
-                }
                 Block::Image {
                     mime,
                     data,
                     path,
                     bytes,
                 } => {
-                    let pid = part_id(&mut minted, "prt_");
-                    let mime = mime.clone().unwrap_or_else(|| "image/png".to_string());
                     match data {
-                        // `file` parts take a data URL (schema: type, mime,
-                        // filename, url) — verified against the live importer.
-                        Some(d) => {
+                        // User rows carry pictures as file entries
+                        // (data/mime/source/name, verified live).
+                        Some(d) if matches!(role, Role::User) => {
+                            let mime = mime.clone().unwrap_or_else(|| "image/png".to_string());
                             let filename = path
                                 .as_ref()
                                 .and_then(|p| p.file_name())
@@ -269,78 +219,115 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
                                 .unwrap_or_else(|| {
                                     format!("image-{bytes}.{}", extension_for(&mime))
                                 });
-                            parts.push(json!({
-                                "type": "file",
-                                "id": pid,
-                                "sessionID": ses,
-                                "messageID": mid,
+                            files.push(json!({
+                                "data": d,
                                 "mime": mime,
-                                "filename": filename,
-                                "url": format!("data:{mime};base64,{d}"),
+                                "source": {"type": "inline"},
+                                "name": filename,
                             }));
                         }
-                        None => parts.push(json!({
-                            "type": "text",
-                            "id": pid,
-                            "sessionID": ses,
-                            "messageID": mid,
-                            "text": format!(
-                                "[image: {} ({bytes} bytes) not carried]",
-                                path.as_ref()
-                                    .map(|p| p.display().to_string())
-                                    .unwrap_or(mime)
-                            ),
-                        })),
+                        _ => {
+                            if let Some(text) = fallback_text(block) {
+                                content.push(json!({"type": "text", "text": text}));
+                            }
+                        }
                     }
                 }
-                Block::Context { .. } => {
-                    let pid = part_id(&mut minted, "prt_");
-                    parts.push(
-                        json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid,
-                                      "text": fallback_text(block).unwrap_or_default()}),
-                    );
-                }
-                Block::Compressed { .. } => {
-                    let pid = part_id(&mut minted, "prt_");
-                    parts.push(
-                        json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid,
-                                      "text": fallback_text(block).unwrap_or_default()}),
-                    );
-                }
-                Block::Gap { .. } => {
-                    let pid = part_id(&mut minted, "prt_");
-                    parts.push(
-                        json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid,
-                                      "text": fallback_text(block).unwrap_or_default()}),
-                    );
+                Block::Context { .. }
+                | Block::Patch { .. }
+                | Block::Compressed { .. }
+                | Block::Gap { .. } => {
+                    if let Some(text) = fallback_text(block) {
+                        content.push(json!({"type": "text", "text": text}));
+                    }
                 }
                 Block::Usage { .. } => {}
             }
         }
-        if parts.is_empty() {
-            // Never emit an empty message: opencode's validator rejects it.
-            let pid = part_id(&mut minted, "prt_");
-            parts.push(json!({"type": "text", "id": pid, "sessionID": ses, "messageID": mid, "text": "[empty message]"}));
-        }
-        msgs_json.push(json!({"info": info, "parts": parts}));
-        prev_id = Some(mid);
+        // Plain-text view of this group's content, for message types that
+        // carry a single `text` instead of blocks.
+        let texts: Vec<&str> = content
+            .iter()
+            .filter_map(|c| {
+                if c.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    c.get("text").and_then(|t| t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let joined = texts.join("\n\n");
+        let msg = if matches!(role, Role::User) {
+            let mut m = json!({
+                "id": mid,
+                "type": "user",
+                "text": if joined.is_empty() { "[empty message]".into() } else { joined },
+                "time": {"created": ts},
+            });
+            if !files.is_empty() {
+                m["files"] = json!(files);
+            }
+            m
+        } else if matches!(role, Role::System) {
+            json!({
+                "id": mid,
+                "type": "system",
+                "text": if joined.is_empty() { "[empty message]".into() } else { joined },
+                "time": {"created": ts},
+            })
+        } else if !content.is_empty()
+            && blocks
+                .iter()
+                .all(|b| matches!(b, Block::Compressed { .. }))
+        {
+            // A pure compaction group rides as a real compaction message.
+            json!({
+                "id": mid,
+                "type": "compaction",
+                "status": "completed",
+                "reason": "auto",
+                "summary": joined,
+                "recent": "",
+                "time": {"created": ts},
+            })
+        } else {
+            if content.is_empty() {
+                // Never emit an empty assistant: the validator drops it.
+                content.push(json!({"type": "text", "text": "[empty message]"}));
+            }
+            json!({
+                "id": mid,
+                "type": "assistant",
+                "agent": "build",
+                "model": {"id": model_id, "providerID": provider_id},
+                "content": content,
+                "time": {"created": ts, "completed": end_ts},
+                "finish": "stop",
+                "cost": usage.cost,
+                "tokens": {"input": usage.input, "output": usage.output,
+                           "reasoning": usage.reasoning,
+                           "cache": {"read": usage.cache_read, "write": usage.cache_write}},
+            })
+        };
+        msgs_json.push(msg);
     }
+    // v2 import shape (verified against a live `session export`): flat
+    // messages with inline content; provenance in `metadata.xses` because
+    // slugs are server-generated and cannot carry the marker.
+    let title = super::title_for(session);
     let payload = json!({
         "info": {
             "id": ses,
-        "slug": format!("xses-{}", import_id(session.tool, &session.id)),
+            "location": {"directory": session.cwd},
+            "title": title,
             "projectID": "global",
-            "directory": session.cwd,
-            "path": session.cwd.to_string_lossy().trim_start_matches('/'),
-            "title": super::title_for(session),
-            "version": "1.0.0",
-            "time": {"created": now_ms, "updated": now_ms},
-            "agent": "build",
-            "model": model,
-            "summary": {"diffs": [], "additions": 0, "deletions": 0, "files": 0},
             "cost": 0,
-            "tokens": {"input": 0, "output": 0, "reasoning": 0, "cache": {"read": 0, "write": 0}},
-        "xses": manifest(session),
+            "time": {"created": now_ms, "updated": now_ms},
+            "tokens": {"input": 0, "output": 0, "reasoning": 0,
+                       "cache": {"read": 0, "write": 0}},
+            "agent": "build",
+            "model": {"id": model_id, "providerID": provider_id},
+            "metadata": {"xses": manifest(session)},
         },
         "messages": msgs_json,
     });
@@ -371,13 +358,42 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
             _serial = Some(RETRY_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
             std::thread::sleep(Duration::from_millis(750 * 3u64.pow(attempt - 1)));
         }
+        // The payload directory is ignored: the session lands in the
+        // `--directory` cwd, so the source project must be passed outright.
         let mut command = Command::new("opencode");
         command
+            .arg("session")
             .arg("import")
+            .arg("--directory")
+            .arg(&session.cwd)
             .arg(&tmp)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         let out = crate::proc::output_with_timeout(command, deadline);
+        let stdout = out
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        // Ids are deterministic, so a re-import of an unchanged session is
+        // already there: drop it and import fresh so a mapping bump or new
+        // turns actually replace the stored copy.
+        if stdout.contains("already exists") {
+            let mut del = Command::new("opencode");
+            del.arg("session")
+                .arg("delete")
+                .arg(&ses)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let del_out = crate::proc::output_with_timeout(del, Duration::from_secs(60));
+            if del_out.is_ok_and(|o| o.status.success()) {
+                // Fall through to the attempt below, which re-runs the
+                // import against the now-absent id.
+                last = Some(out);
+                continue;
+            }
+            last = Some(out);
+            continue;
+        }
         let imported = match &out {
             Ok(o) => {
                 o.status.success()

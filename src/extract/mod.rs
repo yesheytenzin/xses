@@ -53,9 +53,17 @@ pub fn opencode_revision(id: &str) -> Result<(String, u64)> {
     let db =
         crate::scan::opencode_db().ok_or_else(|| anyhow::anyhow!("opencode database not found"))?;
     let id = id.replace('\'', "''");
+    // Both generations; the absent one contributes no rows. `session_v2`
+    // probing keeps older stores (v1 tables only) working.
+    let v2 = if crate::scan::opencode_has_v2(&db) {
+        format!(" UNION ALL SELECT 'session_v2' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session_v2 WHERE id='{id}'
+        UNION ALL SELECT 'session_message', id, json_object('type', type, 'data', data, 'created', time_created) FROM session_message WHERE session_id='{id}'")
+    } else {
+        String::new()
+    };
     let sql = format!("SELECT 'session' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session WHERE id='{id}'
         UNION ALL SELECT 'message', id, json_object('data', data, 'created', time_created) FROM message WHERE session_id='{id}'
-        UNION ALL SELECT 'part', id, json_object('data', data, 'created', time_created) FROM part WHERE session_id='{id}' ORDER BY kind, id;");
+        UNION ALL SELECT 'part', id, json_object('data', data, 'created', time_created) FROM part WHERE session_id='{id}'{v2} ORDER BY kind, id;");
     let mut cmd = std::process::Command::new("sqlite3");
     cmd.args(["-readonly", "-json"]).arg(db).arg(sql);
     let out = crate::proc::output_with_timeout(cmd, std::time::Duration::from_secs(60))?;
@@ -134,7 +142,7 @@ use pi::pi_family;
 mod tests {
     use super::claude::{claude, claude_attachment};
     use super::common::{codex_compaction, collect_parts};
-    use super::opencode::opencode_part;
+    use super::opencode::{opencode_part, opencode_v2_content};
     use super::text_of;
     use crate::canonical::{Block, Event, Events, Role};
     use crate::model::Tool;
@@ -268,6 +276,58 @@ mod tests {
             }
             other => panic!("want Image, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn opencode_v2_tool_states_split_completed_and_error() {
+        // Completed tools carry `state.content[]`; error tools carry
+        // `state.error.message` instead (shapes read from a live v2 store).
+        let mut out = Events::default();
+        opencode_v2_content(
+            &json!({
+                "type": "tool", "id": "call-1", "name": "bash",
+                "state": {"status": "completed", "input": {"command": "ls"},
+                          "content": [{"type": "text", "text": "ok"}]},
+            }),
+            &mut out,
+        );
+        opencode_v2_content(
+            &json!({
+                "type": "tool", "id": "call-2", "name": "read",
+                "state": {"status": "error", "input": {"filePath": "x"},
+                          "error": {"type": "tool.execution", "message": "gone"}},
+            }),
+            &mut out,
+        );
+        let events = out.into_vec();
+        assert!(matches!(&events[0].block, Block::ToolCall { name, .. } if name == "bash"));
+        match &events[1].block {
+            Block::ToolResult { output, is_error, .. } => {
+                assert_eq!(output, "ok");
+                assert!(!is_error);
+            }
+            other => panic!("want ToolResult, got {other:?}"),
+        }
+        match &events[3].block {
+            Block::ToolResult { output, is_error, .. } => {
+                assert_eq!(output, "gone");
+                assert!(is_error);
+            }
+            other => panic!("want ToolResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opencode_v2_text_and_reasoning_keep_roles() {
+        let mut out = Events::default();
+        opencode_v2_content(&json!({"type": "text", "text": "hi"}), &mut out);
+        opencode_v2_content(
+            &json!({"type": "reasoning", "text": "why"}),
+            &mut out,
+        );
+        let events = out.into_vec();
+        assert!(matches!(&events[0].block, Block::Text { .. }));
+        assert!(matches!(&events[1].block, Block::Thinking { .. }));
     }
 
     /// Write a claude transcript and parse it through the real reader. Each

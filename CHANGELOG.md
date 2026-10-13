@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.7.1
 
 - Pre-snapshot opencode digest keys migrate without re-importing: a
   fingerprint miss that hits the legacy digest records the new key over

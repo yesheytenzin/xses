@@ -1,6 +1,6 @@
 [package]
 name = "xses"
-version = "0.0.4"
+version = "0.5.0"
 edition = "2021"
 description = "Unified picker and cross-importer for AI coding agent sessions"
 license = "MIT"

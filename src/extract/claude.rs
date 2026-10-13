@@ -175,4 +175,3 @@ pub(super) fn claude_attachment(a: Option<&Value>) -> Option<Block> {
         _ => None,
     }
 }
-

@@ -134,7 +134,12 @@ pub fn opencode_import_ids(only: Option<&HashSet<(Tool, String)>>) -> Result<Has
         return Ok(HashSet::new());
     };
     let run = |sql: &str| -> Result<Vec<serde_json::Value>> {
-        crate::proc::sqlite_json(&db, sql, std::time::Duration::from_secs(60), "OpenCode import markers")
+        crate::proc::sqlite_json(
+            &db,
+            sql,
+            std::time::Duration::from_secs(60),
+            "OpenCode import markers",
+        )
     };
     let mut rows = run("SELECT id, slug, NULL AS src, NULL AS src_id FROM session WHERE slug LIKE 'xses-%' OR slug LIKE 'sessionizer-%';")?;
     if opencode_has_v2(&db) {
@@ -153,9 +158,9 @@ pub fn opencode_import_ids(only: Option<&HashSet<(Tool, String)>>) -> Result<Has
                     row.get("src").and_then(|s| s.as_str()),
                     row.get("src_id").and_then(|s| s.as_str()),
                 ) {
-                    return sources.iter().any(|(tool, source)| {
-                        tool.as_str() == src && source == src_id
-                    });
+                    return sources
+                        .iter()
+                        .any(|(tool, source)| tool.as_str() == src && source == src_id);
                 }
                 sources.iter().any(|(tool, source)| {
                     let base = crate::write::import_id_for(*tool, source);

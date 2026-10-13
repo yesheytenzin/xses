@@ -5,7 +5,10 @@
 //! with inline content, `info.location` + `projectID`, and provenance in
 //! `info.metadata.xses` (slugs are server-generated, so the v1 slug marker
 //! cannot survive an import).
-use super::{args_json_object, fallback_call_id, fallback_text, group_role, import_id, manifest, usage_of, Usage};
+use super::{
+    args_json_object, fallback_call_id, fallback_text, group_role, import_id, manifest, usage_of,
+    Usage,
+};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::fs;
@@ -134,98 +137,99 @@ impl Builder {
         }
         for block in blocks {
             match block {
-            Block::Text { text, .. } => {
-                content.push(json!({"type": "text", "text": text}));
-            }
-            Block::Thinking { text, .. } => {
-                if !text.trim().is_empty() {
-                    content.push(json!({
-                        "type": "reasoning",
-                        "text": text,
-                        "time": {"created": ts, "completed": end_ts},
-                    }));
+                Block::Text { text, .. } => {
+                    content.push(json!({"type": "text", "text": text}));
                 }
-            }
-            Block::ToolCall {
-                name,
-                args,
-                call_id,
-                status,
-            } => {
-                // Same mapping the fold loop used, so the call meets its
-                // self.folded result even when the source id needed remapping.
-                let cid = fallback_call_id(&mut self.ids, call_id, &mut self.minted, name);
-                // Completed states carry `content[]`; error states carry
-                // `error.message` instead — each shape without the other
-                // key (verified against live rows and the validator).
-                let input = args_json_object(args);
-                let (output, is_error, duration) = self.folded
-                    .get(&cid)
-                    .cloned()
-                    .unwrap_or_else(|| (String::new(), false, None));
-                let is_error = is_error || status.as_deref() == Some("error");
-                let state = if is_error {
-                    json!({"status": "error", "input": input,
-                           "error": {"type": "tool.execution", "message": output}})
-                } else {
-                    json!({"status": "completed", "input": input,
-                           "content": [{"type": "text", "text": output}]})
-                };
-                let call_end = ts + duration.unwrap_or(1).max(1) as i64;
-                content.push(json!({
-                    "type": "tool",
-                    "id": cid,
-                    "name": name,
-                    "state": state,
-                    "time": {"created": ts, "completed": call_end.max(end_ts)},
-                }));
-            }
-            // Results were self.folded into their call's part above.
-            Block::ToolResult { .. } => {}
-            Block::Image {
-                mime,
-                data,
-                path,
-                bytes,
-            } => {
-                match data {
-                    // User rows carry pictures as file entries
-                    // (data/mime/source/name, verified live).
-                    Some(d) if matches!(role, Role::User) => {
-                        let mime = mime.clone().unwrap_or_else(|| "image/png".to_string());
-                        let filename = path
-                            .as_ref()
-                            .and_then(|p| p.file_name())
-                            .and_then(|n| n.to_str())
-                            .map(str::to_string)
-                            .unwrap_or_else(|| {
-                                format!("image-{bytes}.{}", extension_for(&mime))
-                            });
-                        files.push(json!({
-                            "data": d,
-                            "mime": mime,
-                            "source": {"type": "inline"},
-                            "name": filename,
+                Block::Thinking { text, .. } => {
+                    if !text.trim().is_empty() {
+                        content.push(json!({
+                            "type": "reasoning",
+                            "text": text,
+                            "time": {"created": ts, "completed": end_ts},
                         }));
                     }
-                    _ => {
-                        if let Some(text) = fallback_text(block) {
-                            content.push(json!({"type": "text", "text": text}));
+                }
+                Block::ToolCall {
+                    name,
+                    args,
+                    call_id,
+                    status,
+                } => {
+                    // Same mapping the fold loop used, so the call meets its
+                    // self.folded result even when the source id needed remapping.
+                    let cid = fallback_call_id(&mut self.ids, call_id, &mut self.minted, name);
+                    // Completed states carry `content[]`; error states carry
+                    // `error.message` instead — each shape without the other
+                    // key (verified against live rows and the validator).
+                    let input = args_json_object(args);
+                    let (output, is_error, duration) = self
+                        .folded
+                        .get(&cid)
+                        .cloned()
+                        .unwrap_or_else(|| (String::new(), false, None));
+                    let is_error = is_error || status.as_deref() == Some("error");
+                    let state = if is_error {
+                        json!({"status": "error", "input": input,
+                           "error": {"type": "tool.execution", "message": output}})
+                    } else {
+                        json!({"status": "completed", "input": input,
+                           "content": [{"type": "text", "text": output}]})
+                    };
+                    let call_end = ts + duration.unwrap_or(1).max(1) as i64;
+                    content.push(json!({
+                        "type": "tool",
+                        "id": cid,
+                        "name": name,
+                        "state": state,
+                        "time": {"created": ts, "completed": call_end.max(end_ts)},
+                    }));
+                }
+                // Results were self.folded into their call's part above.
+                Block::ToolResult { .. } => {}
+                Block::Image {
+                    mime,
+                    data,
+                    path,
+                    bytes,
+                } => {
+                    match data {
+                        // User rows carry pictures as file entries
+                        // (data/mime/source/name, verified live).
+                        Some(d) if matches!(role, Role::User) => {
+                            let mime = mime.clone().unwrap_or_else(|| "image/png".to_string());
+                            let filename = path
+                                .as_ref()
+                                .and_then(|p| p.file_name())
+                                .and_then(|n| n.to_str())
+                                .map(str::to_string)
+                                .unwrap_or_else(|| {
+                                    format!("image-{bytes}.{}", extension_for(&mime))
+                                });
+                            files.push(json!({
+                                "data": d,
+                                "mime": mime,
+                                "source": {"type": "inline"},
+                                "name": filename,
+                            }));
+                        }
+                        _ => {
+                            if let Some(text) = fallback_text(block) {
+                                content.push(json!({"type": "text", "text": text}));
+                            }
                         }
                     }
                 }
-            }
-            Block::Context { .. }
-            | Block::Patch { .. }
-            | Block::Compressed { .. }
-            | Block::Gap { .. } => {
-                if let Some(text) = fallback_text(block) {
-                    content.push(json!({"type": "text", "text": text}));
+                Block::Context { .. }
+                | Block::Patch { .. }
+                | Block::Compressed { .. }
+                | Block::Gap { .. } => {
+                    if let Some(text) = fallback_text(block) {
+                        content.push(json!({"type": "text", "text": text}));
+                    }
                 }
+                Block::Usage { .. } => {}
             }
-            Block::Usage { .. } => {}
         }
-    }
         (content, files, note)
     }
 
@@ -243,71 +247,69 @@ impl Builder {
             role,
             blocks,
         } = row;
-    // Plain-text view of this group's content, for message types that
-    // carry a single `text` instead of blocks.
-    let texts: Vec<&str> = content
-        .iter()
-        .filter_map(|c| {
-            if c.get("type").and_then(|t| t.as_str()) == Some("text") {
-                c.get("text").and_then(|t| t.as_str())
-            } else {
-                None
-            }
-        })
-        .collect();
-    let joined = texts.join("\n\n");
-    let msg = if matches!(role, Role::User) {
-        let mut m = json!({
-            "id": mid,
-            "type": "user",
-            "text": if joined.is_empty() { "[empty message]".into() } else { joined },
-            "time": {"created": ts},
-        });
-        if !files.is_empty() {
-            m["files"] = json!(files);
-        }
-        m
-    } else if matches!(role, Role::System) {
-        json!({
-            "id": mid,
-            "type": "system",
-            "text": if joined.is_empty() { "[empty message]".into() } else { joined },
-            "time": {"created": ts},
-        })
-    } else if !content.is_empty()
-        && blocks
+        // Plain-text view of this group's content, for message types that
+        // carry a single `text` instead of blocks.
+        let texts: Vec<&str> = content
             .iter()
-            .all(|b| matches!(b, Block::Compressed { .. }))
-    {
-        // A pure compaction group rides as a real compaction message.
-        json!({
-            "id": mid,
-            "type": "compaction",
-            "status": "completed",
-            "reason": "auto",
-            "summary": joined,
-            "recent": "",
-            "time": {"created": ts},
-        })
-    } else {
-        if content.is_empty() {
-            // Never emit an empty assistant: the validator drops it.
-            content.push(json!({"type": "text", "text": "[empty message]"}));
-        }
-        json!({
-            "id": mid,
-            "type": "assistant",
-            "agent": "build",
-            "model": {"id": self.model_id, "providerID": self.provider_id},
-            "content": content,
-            "time": {"created": ts, "completed": end_ts},
-            "finish": "stop",
-            "cost": usage.cost,
-            "tokens": {"input": usage.input, "output": usage.output,
-                       "reasoning": usage.reasoning,
-                       "cache": {"read": usage.cache_read, "write": usage.cache_write}},
-        })
-    };
+            .filter_map(|c| {
+                if c.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    c.get("text").and_then(|t| t.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        let joined = texts.join("\n\n");
+        let msg = if matches!(role, Role::User) {
+            let mut m = json!({
+                "id": mid,
+                "type": "user",
+                "text": if joined.is_empty() { "[empty message]".into() } else { joined },
+                "time": {"created": ts},
+            });
+            if !files.is_empty() {
+                m["files"] = json!(files);
+            }
+            m
+        } else if matches!(role, Role::System) {
+            json!({
+                "id": mid,
+                "type": "system",
+                "text": if joined.is_empty() { "[empty message]".into() } else { joined },
+                "time": {"created": ts},
+            })
+        } else if !content.is_empty()
+            && blocks.iter().all(|b| matches!(b, Block::Compressed { .. }))
+        {
+            // A pure compaction group rides as a real compaction message.
+            json!({
+                "id": mid,
+                "type": "compaction",
+                "status": "completed",
+                "reason": "auto",
+                "summary": joined,
+                "recent": "",
+                "time": {"created": ts},
+            })
+        } else {
+            if content.is_empty() {
+                // Never emit an empty assistant: the validator drops it.
+                content.push(json!({"type": "text", "text": "[empty message]"}));
+            }
+            json!({
+                "id": mid,
+                "type": "assistant",
+                "agent": "build",
+                "model": {"id": self.model_id, "providerID": self.provider_id},
+                "content": content,
+                "time": {"created": ts, "completed": end_ts},
+                "finish": "stop",
+                "cost": usage.cost,
+                "tokens": {"input": usage.input, "output": usage.output,
+                           "reasoning": usage.reasoning,
+                           "cache": {"read": usage.cache_read, "write": usage.cache_write}},
+            })
+        };
         msg
     }
 }
@@ -548,8 +550,7 @@ fn mint_suffix() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0) as u64;
-    let mut seed =
-        nanos.wrapping_add(MINT_SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    let mut seed = nanos.wrapping_add(MINT_SEED.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     for _ in 0..24 {
         seed = seed
             .wrapping_mul(6364136223846793005)

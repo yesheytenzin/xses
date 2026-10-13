@@ -1,7 +1,15 @@
 # Changelog
 
-## Unreleased
+## 0.7.0
 
+- opencode v2 stores are fully supported alongside v1: `session_v2` +
+  `session_message` are scanned and extracted (v1 `session`/`message`/`part`
+  keep working), and writes go through `opencode session import` with the
+  v2 export shape (flat messages, inline content, `files[]` images) and
+  `metadata.xses` provenance.
+- Mapping 8: all imports refresh once; old generations retire automatically.
+- Note: imports now target the opencode v2 format; opencode 1.x installs
+  can still be read, but no longer receive imports.
 - opencode reads are down to one SQLite query per session: the revision
   UNION feeds both the content digest and the transcript parse (previously
   the digest plus one query per table, plus a generation probe). Revision

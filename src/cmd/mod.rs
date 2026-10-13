@@ -86,7 +86,11 @@ fn export_path(base: &Path, fmt: &str, session: &Session, disambiguate: bool) ->
         .and_then(|s| s.to_str())
         .unwrap_or("export");
     let slug = crate::model::slug_id(&session.id, 24);
-    let id = if slug.is_empty() { "session".into() } else { slug };
+    let id = if slug.is_empty() {
+        "session".into()
+    } else {
+        slug
+    };
     parent.join(format!("{stem}.{}-{id}.{fmt}", session.tool.as_str()))
 }
 

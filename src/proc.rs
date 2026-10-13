@@ -129,7 +129,10 @@ pub fn sqlite_json(
     let out = output_with_timeout(command, timeout)
         .with_context(|| format!("launch sqlite3 for {what}"))?;
     if !out.status.success() {
-        anyhow::bail!("{what} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     json_rows(&String::from_utf8_lossy(&out.stdout), what)
 }
@@ -147,19 +150,17 @@ pub fn sqlite_text(
     let out = output_with_timeout(command, timeout)
         .with_context(|| format!("launch sqlite3 for {what}"))?;
     if !out.status.success() {
-        anyhow::bail!("{what} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        anyhow::bail!(
+            "{what} failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Write sqlite script passed as an argument: aborts on first error
 /// (`-bail`), bounded by `timeout`.
-pub fn sqlite_exec(
-    db: &std::path::Path,
-    sql: &str,
-    timeout: Duration,
-    what: &str,
-) -> Result<()> {
+pub fn sqlite_exec(db: &std::path::Path, sql: &str, timeout: Duration, what: &str) -> Result<()> {
     let mut command = Command::new("sqlite3");
     command
         .args(["-bail", "-cmd", ".timeout 5000"])
@@ -184,9 +185,7 @@ pub fn sqlite_exec_input(
     what: &str,
 ) -> Result<()> {
     let mut command = Command::new("sqlite3");
-    command
-        .args(["-bail", "-cmd", ".timeout 5000"])
-        .arg(db);
+    command.args(["-bail", "-cmd", ".timeout 5000"]).arg(db);
     let out = output_with_input(command, script, timeout)
         .with_context(|| format!("launch sqlite3 for {what}"))?;
     anyhow::ensure!(

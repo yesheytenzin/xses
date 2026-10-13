@@ -6,7 +6,6 @@ use anyhow::Result;
 use serde_json::Value;
 use std::path::PathBuf;
 
-
 /// opencode transcripts via read-only SQL (message + part `data` JSON).
 /// The runtime shapes are identical to `opencode export` output, but SQL is
 /// deterministic: the CLI truncates large stdout to 64KB multiples with exit 0.
@@ -55,10 +54,8 @@ pub(crate) fn opencode_snapshot(id: &str) -> Result<Snapshot> {
     );
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     hash.write(&out.stdout);
-    let rows: Vec<Value> = crate::proc::json_rows(
-        &String::from_utf8_lossy(&out.stdout),
-        "opencode transcript",
-    )?;
+    let rows: Vec<Value> =
+        crate::proc::json_rows(&String::from_utf8_lossy(&out.stdout), "opencode transcript")?;
     let events = events_from_union(&rows);
     Ok(Snapshot {
         revision: format!("{:016x}", hash.finish()),
@@ -75,7 +72,10 @@ pub(crate) fn opencode_snapshot(id: &str) -> Result<Snapshot> {
 /// returns as a *string* — parse one level before reading fields.
 fn union_data(row: &Value) -> Option<serde_json::Map<String, Value>> {
     let text = row.get("data")?.as_str()?;
-    serde_json::from_str::<Value>(text).ok()?.as_object().cloned()
+    serde_json::from_str::<Value>(text)
+        .ok()?
+        .as_object()
+        .cloned()
 }
 
 fn events_from_union(rows: &[Value]) -> Events {
@@ -119,7 +119,10 @@ fn events_from_union(rows: &[Value]) -> Events {
     msgs.sort_by_key(|m| {
         (
             m.get("time_created").and_then(|t| t.as_i64()).unwrap_or(0),
-            m.get("id").and_then(|i| i.as_str()).unwrap_or("").to_string(),
+            m.get("id")
+                .and_then(|i| i.as_str())
+                .unwrap_or("")
+                .to_string(),
         )
     });
     let mut parts: Vec<Value> = rows
@@ -222,9 +225,7 @@ pub(super) fn events_from_v2(rows: &[Value]) -> Events {
                         let mime = f.get("mime").and_then(|m| m.as_str()).unwrap_or("");
                         if mime.starts_with("image/") {
                             out.push(image_block(f, Tool::Opencode));
-                        } else if let Some(name) =
-                            f.get("name").and_then(|n| n.as_str())
-                        {
+                        } else if let Some(name) = f.get("name").and_then(|n| n.as_str()) {
                             out.push(Context {
                                 kind: "file".into(),
                                 text: Some(name.to_string()),
@@ -240,7 +241,9 @@ pub(super) fn events_from_v2(rows: &[Value]) -> Events {
                 let (model, provider) = match data.get("model") {
                     Some(m) => (
                         m.get("id").and_then(|v| v.as_str()).map(str::to_string),
-                        m.get("providerID").and_then(|v| v.as_str()).map(str::to_string),
+                        m.get("providerID")
+                            .and_then(|v| v.as_str())
+                            .map(str::to_string),
                     ),
                     None => (None, None),
                 };
@@ -271,8 +274,7 @@ pub(super) fn events_from_v2(rows: &[Value]) -> Events {
                 }
             }
             "compaction" => {
-                let summary =
-                    data.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+                let summary = data.get("summary").and_then(|s| s.as_str()).unwrap_or("");
                 let recent = data.get("recent").and_then(|s| s.as_str()).unwrap_or("");
                 out.push(Compressed {
                     text: if recent.is_empty() {
@@ -320,10 +322,7 @@ pub(super) fn opencode_v2_content(block: &Value, out: &mut Events) {
                 .and_then(|n| n.as_str())
                 .unwrap_or("tool")
                 .to_string();
-            let call_id = block
-                .get("id")
-                .and_then(|c| c.as_str())
-                .map(str::to_string);
+            let call_id = block.get("id").and_then(|c| c.as_str()).map(str::to_string);
             // v2 calls name the id `id` (v1: `callID`) and the tool `name`
             // (v1: `tool`); states split into completed (`content[]`) vs
             // error (`error.message`) shapes.
@@ -538,4 +537,3 @@ pub(super) fn opencode_part(part: &Value, role: Role, out: &mut Events) {
         None => {}
     }
 }
-

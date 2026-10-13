@@ -199,4 +199,3 @@ pub(super) fn codex(path: &Path) -> Result<Events> {
     }
     Ok(out)
 }
-

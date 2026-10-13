@@ -60,15 +60,10 @@ fn delete_opencode_imports(
              DELETE FROM session WHERE id IN ({quoted});{v2} COMMIT;"
         );
         // Generous per chunk: 128 sessions of imports measure at ~20-30s.
-        if let Err(e) = crate::proc::sqlite_exec(
-            &db,
-            &sql,
-            Duration::from_secs(300),
-            "OpenCode bulk cleanup",
-        ) {
-            anyhow::bail!(
-                "OpenCode bulk cleanup failed after {removed}/{total}: {e}"
-            );
+        if let Err(e) =
+            crate::proc::sqlite_exec(&db, &sql, Duration::from_secs(300), "OpenCode bulk cleanup")
+        {
+            anyhow::bail!("OpenCode bulk cleanup failed after {removed}/{total}: {e}");
         }
         removed += chunk.len();
         progress.inc(&format!("opencode {removed}/{total} sessions"));
@@ -275,9 +270,7 @@ fn canonicalize_batch<'a>(
             .map(|(source, snapshot)| {
                 threads.spawn(move || {
                     let canon = match snapshot {
-                        Some(events) => {
-                            Ok(crate::extract::canonicalize_events(source, events))
-                        }
+                        Some(events) => Ok(crate::extract::canonicalize_events(source, events)),
                         None => crate::extract::canonicalize(source),
                     }
                     .map(|c| match scope {
@@ -335,7 +328,10 @@ pub fn sync(
     }
     let seen = index.keys();
     let mut report = SyncReport {
-        targets: targets.iter().map(|&target| TargetReport::new(target)).collect(),
+        targets: targets
+            .iter()
+            .map(|&target| TargetReport::new(target))
+            .collect(),
     };
     let mut sources: Vec<_> = sessions
         .iter()
@@ -462,7 +458,8 @@ fn sync_batch(
             .iter()
             .map(|&target| {
                 let extracted = &extracted;
-                threads.spawn(move || write_target(target, extracted, seen, scope, dry_run, progress))
+                threads
+                    .spawn(move || write_target(target, extracted, seen, scope, dry_run, progress))
             })
             .collect();
         workers

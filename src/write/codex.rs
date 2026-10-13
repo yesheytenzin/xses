@@ -188,8 +188,12 @@ impl Roller<'_> {
             Block::Image {
                 mime, data, path, ..
             } => self.push_image(mime, data, path, ts),
-            Block::Context { .. } => self.push_fallback(block, "ctx_", "input_text", "developer", ts),
-            Block::Patch { .. } => self.push_fallback(block, "patch_", "output_text", "assistant", ts),
+            Block::Context { .. } => {
+                self.push_fallback(block, "ctx_", "input_text", "developer", ts)
+            }
+            Block::Patch { .. } => {
+                self.push_fallback(block, "patch_", "output_text", "assistant", ts)
+            }
             Block::Compressed { .. } => self.push_compaction(block, ts),
             Block::Usage {
                 input,
@@ -204,7 +208,6 @@ impl Roller<'_> {
     }
 
     fn push_text(&mut self, role: &Role, text: &String, ts: Option<chrono::DateTime<chrono::Utc>>) {
-
         let id = self.mint("msg_");
         let (wrapper_role, text_type) = match role {
             Role::User => ("user", "input_text"),
@@ -236,7 +239,6 @@ impl Roller<'_> {
         });
     }
     fn push_thinking(&mut self, text: &String, ts: Option<chrono::DateTime<chrono::Utc>>) {
-
         if text.trim().is_empty() {
             return;
         }
@@ -259,8 +261,13 @@ impl Roller<'_> {
             ts,
         });
     }
-    fn push_tool_call(&mut self, name: &String, args: &String, call_id: &Option<String>, ts: Option<chrono::DateTime<chrono::Utc>>) {
-
+    fn push_tool_call(
+        &mut self,
+        name: &String,
+        args: &String,
+        call_id: &Option<String>,
+        ts: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
         let shellish = is_shellish(name);
         let id = call_id
             .clone()
@@ -283,7 +290,8 @@ impl Roller<'_> {
             })
         };
         let tool = classify_tool(name, args);
-        self.pending.push((Some(id.clone()), name.clone(), tool.clone()));
+        self.pending
+            .push((Some(id.clone()), name.clone(), tool.clone()));
         let thread = match &tool {
             ThreadTool::Shell(command) => (
                 "commandExecution",
@@ -330,8 +338,15 @@ impl Roller<'_> {
             ts,
         });
     }
-    fn push_tool_result(&mut self, name: &String, output: &String, call_id: &Option<String>, is_error: bool, duration_ms: Option<u64>, ts: Option<chrono::DateTime<chrono::Utc>>) {
-
+    fn push_tool_result(
+        &mut self,
+        name: &String,
+        output: &String,
+        call_id: &Option<String>,
+        is_error: bool,
+        duration_ms: Option<u64>,
+        ts: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
         let id = call_id
             .clone()
             .or_else(|| {
@@ -342,7 +357,8 @@ impl Roller<'_> {
                     .and_then(|(c, _, _)| c.clone())
             })
             .unwrap_or_else(|| self.mint("call_"));
-        let shellish = self.pending
+        let shellish = self
+            .pending
             .iter()
             .any(|(c, n, _)| n == name && (c.as_deref() == Some(&id) || c.is_none()));
         let wrapper_payload = if shellish && is_shellish(name) {
@@ -358,7 +374,8 @@ impl Roller<'_> {
                 "output": output,
             })
         };
-        let tool = self.pending
+        let tool = self
+            .pending
             .iter()
             .rev()
             .find(|(c, n, _)| *n == *name && (c.as_deref() == Some(&id) || c.is_none()))
@@ -408,8 +425,13 @@ impl Roller<'_> {
             ts,
         });
     }
-    fn push_image(&mut self, mime: &Option<String>, data: &Option<String>, path: &Option<PathBuf>, ts: Option<chrono::DateTime<chrono::Utc>>) {
-
+    fn push_image(
+        &mut self,
+        mime: &Option<String>,
+        data: &Option<String>,
+        path: &Option<PathBuf>,
+        ts: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
         let id = self.mint("img_");
         let payload = match data {
             Some(d) => json!({
@@ -452,8 +474,14 @@ impl Roller<'_> {
             ts,
         });
     }
-    fn push_fallback(&mut self, block: &Block, prefix: &str, content_type: &str, role: &str, ts: Option<chrono::DateTime<chrono::Utc>>) {
-
+    fn push_fallback(
+        &mut self,
+        block: &Block,
+        prefix: &str,
+        content_type: &str,
+        role: &str,
+        ts: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
         let id = self.mint(prefix);
         let text = fallback_text(block).unwrap_or_default();
         self.out.push(Item {
@@ -473,7 +501,6 @@ impl Roller<'_> {
         });
     }
     fn push_compaction(&mut self, block: &Block, ts: Option<chrono::DateTime<chrono::Utc>>) {
-
         let id = self.mint("cmp_");
         let text = fallback_text(block).unwrap_or_default();
         self.out.push(Item {
@@ -492,8 +519,15 @@ impl Roller<'_> {
             ts,
         });
     }
-    fn push_usage(&mut self, input: u64, output: u64, reasoning: u64, cache_read: u64, cache_write: u64, ts: Option<chrono::DateTime<chrono::Utc>>) {
-
+    fn push_usage(
+        &mut self,
+        input: u64,
+        output: u64,
+        reasoning: u64,
+        cache_read: u64,
+        cache_write: u64,
+        ts: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
         let id = self.mint("usage_");
         self.out.push(Item {
             wrapper: "event_msg",

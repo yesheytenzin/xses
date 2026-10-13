@@ -1,12 +1,12 @@
 //! Shared record helpers for the source extractors: timestamps, JSONL
 //! plumbing, image/blob handling, and the generic part collector.
+use super::text_of;
 use crate::canonical::{Block, Block::*, Events, Role};
 use crate::model::Tool;
 use anyhow::Result;
 use serde_json::Value;
 use std::fs;
 use std::io::{BufRead, BufReader};
-use super::text_of;
 use std::path::{Path, PathBuf};
 
 /// Largest binary payload carried inline. Sources embed base64 images; past
@@ -55,7 +55,6 @@ pub(super) fn parse_record(line_no: usize, line: &str, out: &mut Events) -> Opti
         }
     }
 }
-
 
 pub(super) fn content_has_image(content: &Value) -> bool {
     content.as_array().is_some_and(|items| {

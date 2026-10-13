@@ -51,7 +51,8 @@ pub(super) fn fallback_text(block: &Block) -> Option<String> {
             bytes,
         } => Some(format!(
             "[image reference: {} ({bytes} bytes)]",
-            path.as_ref().map(|p| p.display().to_string())
+            path.as_ref()
+                .map(|p| p.display().to_string())
                 .unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()))
         )),
         Block::Context { kind, text, path } => {
@@ -65,12 +66,14 @@ pub(super) fn fallback_text(block: &Block) -> Option<String> {
             "[patch: {} file{}]\n{}",
             files.len(),
             if files.len() == 1 { "" } else { "s" },
-            files.iter().map(|f| f.display().to_string()).collect::<Vec<_>>().join("\n")
+            files
+                .iter()
+                .map(|f| f.display().to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
         )),
         Block::Compressed { text } => Some(format!("[compaction]\n{text}")),
-        Block::Gap { detail, .. } => {
-            Some(format!("[gap in imported history: {detail}]"))
-        }
+        Block::Gap { detail, .. } => Some(format!("[gap in imported history: {detail}]")),
         _ => None,
     }
 }

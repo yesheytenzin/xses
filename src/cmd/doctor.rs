@@ -186,13 +186,11 @@ fn report_width() -> usize {
 mod tests {
     #[test]
     fn issue_details_become_one_short_line() {
-        let sql = "exit status: 1 Error: Unexpected error | | Failed query: insert into \"message\"";
+        let sql =
+            "exit status: 1 Error: Unexpected error | | Failed query: insert into \"message\"";
         let line = crate::text::shorten(&crate::text::collapse(sql), 40);
         assert!(line.chars().count() <= 40, "{line}");
         assert!(line.ends_with('…'), "{line}");
-        assert_eq!(
-            crate::text::shorten("exit status: 1", 80),
-            "exit status: 1"
-        );
+        assert_eq!(crate::text::shorten("exit status: 1", 80), "exit status: 1");
     }
 }

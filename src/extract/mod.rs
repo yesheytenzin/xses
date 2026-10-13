@@ -133,8 +133,8 @@ mod tests {
     use super::text_of;
     use crate::canonical::{Block, Event, Events, Role};
     use crate::model::Tool;
-    use serde_json::Value;
     use serde_json::json;
+    use serde_json::Value;
     use std::path::Path;
 
     fn parts(items: Value) -> Vec<Event> {
@@ -289,14 +289,18 @@ mod tests {
         let events = out.into_vec();
         assert!(matches!(&events[0].block, Block::ToolCall { name, .. } if name == "bash"));
         match &events[1].block {
-            Block::ToolResult { output, is_error, .. } => {
+            Block::ToolResult {
+                output, is_error, ..
+            } => {
                 assert_eq!(output, "ok");
                 assert!(!is_error);
             }
             other => panic!("want ToolResult, got {other:?}"),
         }
         match &events[3].block {
-            Block::ToolResult { output, is_error, .. } => {
+            Block::ToolResult {
+                output, is_error, ..
+            } => {
                 assert_eq!(output, "gone");
                 assert!(is_error);
             }
@@ -308,10 +312,7 @@ mod tests {
     fn opencode_v2_text_and_reasoning_keep_roles() {
         let mut out = Events::default();
         opencode_v2_content(&json!({"type": "text", "text": "hi"}), &mut out);
-        opencode_v2_content(
-            &json!({"type": "reasoning", "text": "why"}),
-            &mut out,
-        );
+        opencode_v2_content(&json!({"type": "reasoning", "text": "why"}), &mut out);
         let events = out.into_vec();
         assert!(matches!(&events[0].block, Block::Text { .. }));
         assert!(matches!(&events[1].block, Block::Thinking { .. }));

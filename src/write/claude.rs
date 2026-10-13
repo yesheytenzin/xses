@@ -4,8 +4,8 @@
 //! `tool_result` (the latter in a `user` row, as claude does), plus image
 //! blocks for inline pictures and per-message `usage`.
 use super::{
-    args_json, fallback_text, group_role, iso, manifest, next_row_time, push, synth_id,
-    usage_of, uuid_like,
+    args_json, fallback_text, group_role, iso, manifest, next_row_time, push, synth_id, usage_of,
+    uuid_like,
 };
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};

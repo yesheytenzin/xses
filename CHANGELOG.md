@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased — structured transfer (mapping 2)
+## Unreleased — structured transfer (mapping 4), picker and transfer fixes
 
 Imports now carry the source's own structure instead of flattening everything
 to text. A source message maps to one native message, and its parts map to the
@@ -12,8 +12,8 @@ target's constructs:
   durations, so a resumed agent sees what ran and what it returned.
 - reasoning travels as `thinking` / `reasoning` parts (text only: provider
   signatures are never replayed).
-- images travel inline (base64/`input_image`/`image` parts) up to 5 MB per part
-  and 20 MB per session; larger ones become named gaps.
+- images travel inline (base64/`input_image`/`image` parts) up to 5 MB per
+  part; larger ones become named gaps.
 - codex projections carry `commandExecution` rows (with output) and usage
   arrives as `token_count` events; opencode gets `reasoning`, `tool`, and
   `patch` parts plus `step-finish` tokens; claude gets per-message `usage`.
@@ -43,6 +43,49 @@ target's constructs:
 - import headers carry a manifest (`blocks`, `gaps`, `mapping`), the mapping
   version is part of the idempotency fingerprint (older copies re-import once),
   and `FEATURE.md` documents what is carried, text-only, or impossible.
+
+- sessions that were never useful are hidden from `ls`, `pick` and `sync`:
+  `empty` (no turns), `unanswered` (nothing ever answered the user) and
+  `failed` (assistant turns that are only API/abort errors), each detected from
+  the store's own signal where it has one. `ls --count` reports the tally,
+  `--include-noise` lists or acts on them, and listed rows carry a `!reason`.
+- `doctor` reports only what is installed: stores of missing agents are not
+  listed, each store is read on its own so an unreadable one reports itself
+  (`opencode  unavailable: … sqlite3 is not installed`), and every issue is a
+  single line — control sequences stripped, clipped to the terminal width, with
+  the journal path printed when something was clipped.
+- `sync` and `clean` draw a one-line progress bar on stderr while they work
+  (phase, counts, elapsed, failures, the session being written), shown only on
+  a terminal and silenced by `XSES_NO_PROGRESS=1`.
+- the index lock is enforced by identity: mutations refuse to write once the
+  lock file is gone or replaced, the guard re-acquires it atomically when it
+  vanished and nobody else took it, and a run never deletes a lock it no longer
+  owns.
+- claude images carry their bytes and media type (the payload is nested under
+  `source`, and its `media_type` was ignored, so images arrived as text
+  placeholders and a WebP/JPEG would have been re-labelled png).
+- opencode `file` parts that hold images are read as images; they are how a
+  live store keeps an attached picture.
+- claude attachments carry their payload: embedded text (with the line range it
+  covers) and image payloads transfer, a bare path inlines an on-disk image
+  within the cap, and anything else is a note naming the file. Compaction
+  references keep embedded content too.
+- codex `compacted` rows are carried as compaction instead of being ignored,
+  and claude's `isMeta` rows (skill bodies, local-command output) transfer once
+  as context — claude re-sends the same injection on every later turn.
+- imported tools keep codex's own item types in the projection: patch calls
+  become `fileChange` with per-file kind and diff, `mcp__server__tool` calls
+  `mcpToolCall` with arguments, status and output, `view_image` an `imageView`;
+  a failed patch still shows a row so its error is visible.
+- writer failures journal `write-failed` with the path and the OS error instead
+  of a bare "target wrote nothing".
+- claude's subagent transcripts (`<slug>/<session>/subagents/agent-*.jsonl`) are
+  not sessions: claude's picker never lists one and `claude --resume` cannot
+  open it, so they are skipped like the `isSidechain` rows they belong to.
+
+Also fixed along the way: `xses ls | head` exits quietly (`SIGPIPE`'s default
+disposition is restored), and the `xses doctor` report no longer panics when
+its output is piped.
 
 Also fixed along the way: `ls --all -n N` ignored the explicit `-n`
 (`scope::limit`), and the release script's `--help` leaked the `set -euo` line.

@@ -18,6 +18,7 @@ pub struct Args {
     pub scope: Option<usize>,
     pub include_imports: bool,
     pub out: Option<PathBuf>,
+    pub include_noise: bool,
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
@@ -31,9 +32,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         scope: turn_scope,
         include_imports,
         out,
+        include_noise,
     } = args;
     let plan = refs::resolve_items(&items, &from, &to)?;
-    let mut sessions = scope::load(all)?;
+    let mut sessions = scope::load(all, include_noise)?;
     // `--from <tool>` scopes which stores a ref may resolve against and which
     // tools bulk mode draws from, so it must apply before selection.
     if !plan.from_tools.is_empty() {

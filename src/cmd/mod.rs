@@ -15,9 +15,30 @@ use std::path::{Path, PathBuf};
 
 pub fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    match run_cmd(cli) {
+        // `xses ls | head` closes the pipe; that is not an error.
+        Err(e) if is_broken_pipe(&e) => Ok(()),
+        other => other,
+    }
+}
+
+fn is_broken_pipe(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::BrokenPipe)
+    })
+}
+
+fn run_cmd(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
-        None => pick::run(String::new(), false, None),
-        Some(Cmd::Pick { query, all, limit }) => pick::run(query.unwrap_or_default(), all, limit),
+        None => pick::run(String::new(), false, None, false),
+        Some(Cmd::Pick {
+            query,
+            all,
+            limit,
+            include_noise,
+        }) => pick::run(query.unwrap_or_default(), all, limit, include_noise),
         Some(Cmd::Sync {
             items,
             from,
@@ -28,6 +49,7 @@ pub fn run() -> anyhow::Result<()> {
             scope,
             include_imports,
             out,
+            include_noise,
         }) => sync::run(sync::Args {
             items,
             from,
@@ -38,13 +60,15 @@ pub fn run() -> anyhow::Result<()> {
             scope,
             include_imports,
             out,
+            include_noise,
         }),
         Some(Cmd::Ls {
             tool,
             all,
             count,
             limit,
-        }) => ls::run(tool.map(Tool::from), all, count, limit),
+            include_noise,
+        }) => ls::run(tool.map(Tool::from), all, count, limit, include_noise),
         Some(Cmd::Doctor { all, limit }) => doctor::run(all, limit),
         Some(Cmd::Clean { all, dry_run }) => clean::run(all, dry_run),
     }

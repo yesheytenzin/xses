@@ -63,8 +63,13 @@ fn has_command(bin: &str, args: &[&str]) -> bool {
 }
 
 /// Sessions visible per store, and how many of them xses wrote.
+/// Hidden-session reasons for these rows.
+fn sessions_of(rows: &[&crate::model::Session]) -> Vec<crate::model::Session> {
+    rows.iter().map(|s| (*s).clone()).collect()
+}
+
 fn stores(all: bool) -> anyhow::Result<()> {
-    let sessions = scope::load(all)?;
+    let sessions = scope::load(all, true)?;
     println!(
         "\nstores ({})",
         if all { "every project" } else { "this project" }
@@ -72,11 +77,18 @@ fn stores(all: bool) -> anyhow::Result<()> {
     for tool in Tool::write_targets() {
         let rows: Vec<_> = sessions.iter().filter(|s| s.tool == *tool).collect();
         let imports = rows.iter().filter(|s| s.is_import).count();
+        let noise = scope::noise_tally(&sessions_of(&rows));
         println!(
-            "  {:<9} {:>5} sessions ({} imported)",
+            "  {:<9} {:>5} sessions ({} imported){}{}",
             tool.as_str(),
             rows.len(),
-            imports
+            imports,
+            if noise.is_empty() { "" } else { " | hidden: " },
+            noise
+                .iter()
+                .map(|(k, n)| format!("{n} {k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     Ok(())

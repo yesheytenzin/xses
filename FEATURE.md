@@ -56,6 +56,20 @@ Projections each target's own UI reads:
 | Original tool-call ids | ids are provider-validated; xses re-mints deterministic ids so results still pair |
 | Exact per-message timing | ordering is preserved; timestamps are synthesized where the target requires monotonic values |
 
+## Sessions that are not worth resuming
+
+Three shapes are treated as noise and hidden by default (they carry no work to
+continue): `empty` (no user or assistant turns at all), `unanswered` (the user
+asked and no assistant turn ever arrived), and `failed` (assistant turns that
+are only error/abort markers). Detection prefers each store's own signal —
+claude `isApiErrorMessage`, pi/omp `stopReason` in error/aborted/signal, codex
+`turn_aborted`, opencode message `error` — falling back to error-shaped text
+(`API Error: …`, `rate limit`, `stream error`, …).
+
+They are never *deleted* and never silent: `ls --count` and `doctor` report the
+tally per reason, `ls --include-noise` lists them with a `!reason` marker, and
+`pick`/`sync` accept `--include-noise` when they are wanted.
+
 ## Naming and updates
 
 Re-sync updates in place: a source session's artifact path (and opencode id)

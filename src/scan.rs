@@ -105,6 +105,38 @@ fn reused_if_unchanged(prev: &HashMap<PathBuf, Session>, path: &Path) -> Option<
     (cached.mtime == mtime && cached.size == md.len()).then(|| cached.clone())
 }
 
+/// Classify how useful a session is, from what its turns look like.
+fn noise_reason(user_turns: u64, assistant_turns: u64, failed_turns: u64) -> Option<String> {
+    if user_turns == 0 && assistant_turns == 0 {
+        return Some("empty".into());
+    }
+    if assistant_turns == 0 {
+        return Some("unanswered".into());
+    }
+    if failed_turns == assistant_turns {
+        return Some("failed".into());
+    }
+    None
+}
+
+/// Assistant text that is only an error/abort message, checked when the store
+/// records no explicit error flag (pi/omp `stopReason`, codex aborts).
+fn looks_like_error(text: &str) -> bool {
+    let t = text.trim_start();
+    const MARKERS: [&str; 8] = [
+        "api error",
+        "error:",
+        "error!",
+        "rate limit",
+        "overloaded",
+        "invalid api key",
+        "stream error",
+        "connection error",
+    ];
+    let lower = t.to_ascii_lowercase();
+    MARKERS.iter().any(|m| lower.starts_with(m))
+}
+
 fn truncate(s: &str, max: usize) -> String {
     let normalized = s.split_whitespace().collect::<Vec<_>>().join(" ");
     let s = normalized.trim();
@@ -197,6 +229,7 @@ fn scan_claude(prev: &HashMap<PathBuf, Session>) -> Result<Vec<Session>> {
         let mut first_user: Option<String> = None;
         let mut imported_marker_seen = false;
         let mut source_tool = None;
+        let (mut user_turns, mut asst_turns, mut failed_turns) = (0u64, 0u64, 0u64);
         crate::jsonl::for_each_record(p, |v| {
             if v.get("xses").is_some() || v.get("sessionizer").is_some() {
                 imported_marker_seen = true;
@@ -217,16 +250,39 @@ fn scan_claude(prev: &HashMap<PathBuf, Session>) -> Result<Vec<Session>> {
                     let is_meta = v.get("isMeta").and_then(|b| b.as_bool()).unwrap_or(false);
                     if !is_meta {
                         messages += 1;
+                        let text = content.and_then(text_of).filter(|t| !t.trim().is_empty());
+                        if text.is_some() {
+                            user_turns += 1;
+                        }
                         if first_user.is_none() {
-                            if let Some(t) = content.and_then(text_of) {
-                                if !t.trim().is_empty() && !t.starts_with("<") {
+                            if let Some(t) = text {
+                                if !t.starts_with("<") {
                                     first_user = Some(t);
                                 }
                             }
                         }
                     }
                 }
-                Some("assistant") | Some("system") => messages += 1,
+                Some("assistant") => {
+                    messages += 1;
+                    if let Some(t) = v
+                        .get("message")
+                        .and_then(|m| m.get("content"))
+                        .and_then(text_of)
+                    {
+                        if !t.trim().is_empty() {
+                            asst_turns += 1;
+                            let is_api_error = v
+                                .get("isApiErrorMessage")
+                                .and_then(|b| b.as_bool())
+                                .unwrap_or(false);
+                            if is_api_error || looks_like_error(&t) {
+                                failed_turns += 1;
+                            }
+                        }
+                    }
+                }
+                Some("system") => messages += 1,
                 _ => {}
             }
             true
@@ -248,6 +304,7 @@ fn scan_claude(prev: &HashMap<PathBuf, Session>) -> Result<Vec<Session>> {
             ),
             path: p.to_path_buf(),
             is_import: imported_marker_seen,
+            noise: noise_reason(user_turns, asst_turns, failed_turns),
         });
     }
     Ok(out)
@@ -292,6 +349,7 @@ fn scan_codex(prev: &HashMap<PathBuf, Session>) -> Result<Vec<Session>> {
         // (`cli_version`); canonical filenames now look native.
         let mut file_is_import = false;
         let mut source_tool = None;
+        let (mut user_turns, mut asst_turns, mut failed_turns) = (0u64, 0u64, 0u64);
         crate::jsonl::for_each_record(p, |v| {
             match v.get("type").and_then(|t| t.as_str()) {
                 Some("session_meta") => {
@@ -326,11 +384,28 @@ fn scan_codex(prev: &HashMap<PathBuf, Session>) -> Result<Vec<Session>> {
                                 if let Some(t) = text_of(c) {
                                     if !t.trim().is_empty() {
                                         first_user = Some(t);
+                                        user_turns += 1;
                                     }
                                 }
                             }
+                        } else if v.pointer("/payload/content").and_then(text_of).is_some() {
+                            user_turns += 1;
                         }
-                    } else if matches!(role, "assistant" | "system") {
+                    } else if role == "assistant" {
+                        messages += 1;
+                        if let Some(t) = v.pointer("/payload/content").and_then(text_of) {
+                            if !t.trim().is_empty() {
+                                asst_turns += 1;
+                                if v.pointer("/payload/isApiErrorMessage")
+                                    .and_then(|b| b.as_bool())
+                                    .unwrap_or(false)
+                                    || looks_like_error(&t)
+                                {
+                                    failed_turns += 1;
+                                }
+                            }
+                        }
+                    } else if role == "system" {
                         messages += 1;
                     }
                 }
@@ -355,6 +430,7 @@ fn scan_codex(prev: &HashMap<PathBuf, Session>) -> Result<Vec<Session>> {
             ),
             path: p.to_path_buf(),
             is_import: file_is_import,
+            noise: noise_reason(user_turns, asst_turns, failed_turns),
         });
     }
     Ok(out)
@@ -423,6 +499,7 @@ fn scan_pi_family(prev: &HashMap<PathBuf, Session>, tool: Tool) -> Result<Vec<Se
         let mut messages = 0u64;
         let mut first_user: Option<String> = None;
         let mut title: Option<String> = None;
+        let (mut user_turns, mut asst_turns, mut failed_turns) = (0u64, 0u64, 0u64);
         crate::jsonl::for_each_record(p, |v| {
             match v.get("type").and_then(|t| t.as_str()) {
                 Some("session") => {
@@ -447,17 +524,33 @@ fn scan_pi_family(prev: &HashMap<PathBuf, Session>, tool: Tool) -> Result<Vec<Se
                     match role {
                         "user" => {
                             messages += 1;
-                            if first_user.is_none() {
-                                if let Some(c) = v.pointer("/message/content") {
-                                    if let Some(t) = text_of(c) {
-                                        if !t.trim().is_empty() {
-                                            first_user = Some(t);
-                                        }
+                            if let Some(c) = v.pointer("/message/content") {
+                                if let Some(t) = text_of(c).filter(|t| !t.trim().is_empty()) {
+                                    user_turns += 1;
+                                    if first_user.is_none() {
+                                        first_user = Some(t);
                                     }
                                 }
                             }
                         }
-                        "assistant" | "system" => messages += 1,
+                        "assistant" => {
+                            messages += 1;
+                            if let Some(t) = v.pointer("/message/content").and_then(text_of) {
+                                if !t.trim().is_empty() {
+                                    asst_turns += 1;
+                                    let stop = v
+                                        .pointer("/message/stopReason")
+                                        .and_then(|s| s.as_str())
+                                        .unwrap_or("stop");
+                                    if matches!(stop, "error" | "aborted" | "signal")
+                                        || looks_like_error(&t)
+                                    {
+                                        failed_turns += 1;
+                                    }
+                                }
+                            }
+                        }
+                        "system" | "developer" => messages += 1,
                         _ => {}
                     }
                 }
@@ -482,6 +575,7 @@ fn scan_pi_family(prev: &HashMap<PathBuf, Session>, tool: Tool) -> Result<Vec<Se
             ),
             path: p.to_path_buf(),
             is_import: header_import,
+            noise: noise_reason(user_turns, asst_turns, failed_turns),
         });
     }
     Ok(out)
@@ -549,11 +643,11 @@ fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
     }
     let sql = match cwd_filter {
         Some(f) => format!(
-            "SELECT json_object('id', s.id, 'slug', s.slug, 'title', s.title, 'directory', s.directory, 'created', s.time_created, 'messages', (SELECT count(*) FROM message m WHERE m.session_id = s.id AND json_extract(m.data,'$.role') IN ('user','assistant','system'))) AS j \
+            "SELECT json_object('id', s.id, 'slug', s.slug, 'title', s.title, 'directory', s.directory, 'created', s.time_created, 'messages', (SELECT count(*) FROM message m WHERE m.session_id = s.id AND json_extract(m.data,'$.role') IN ('user','assistant','system')), 'user_turns', (SELECT count(*) FROM message m WHERE m.session_id = s.id AND json_extract(m.data,'$.role')='user'), 'asst_turns', (SELECT count(*) FROM message m WHERE m.session_id = s.id AND json_extract(m.data,'$.role')='assistant'), 'ok_asst_turns', (SELECT count(*) FROM message m WHERE m.session_id = s.id AND json_extract(m.data,'$.role')='assistant' AND json_extract(m.data,'$.error') IS NULL)) AS j \
              FROM session s WHERE s.directory = '{}' ORDER BY s.time_created DESC;",
             f.to_string_lossy().replace('\'', "''")
         ),
-        None => "SELECT json_object('id', s.id, 'slug', s.slug, 'title', s.title, 'directory', s.directory, 'created', s.time_created, 'messages', (SELECT count(*) FROM message m WHERE m.session_id = s.id AND json_extract(m.data,'$.role') IN ('user','assistant','system'))) AS j \
+        None => "SELECT json_object('id', s.id, 'slug', s.slug, 'title', s.title, 'directory', s.directory, 'created', s.time_created, 'messages', (SELECT count(*) FROM message m WHERE m.session_id = s.id AND json_extract(m.data,'$.role') IN ('user','assistant','system')), 'user_turns', (SELECT count(*) FROM message m WHERE m.session_id = s.id AND json_extract(m.data,'$.role')='user'), 'asst_turns', (SELECT count(*) FROM message m WHERE m.session_id = s.id AND json_extract(m.data,'$.role')='assistant'), 'ok_asst_turns', (SELECT count(*) FROM message m WHERE m.session_id = s.id AND json_extract(m.data,'$.role')='assistant' AND json_extract(m.data,'$.error') IS NULL)) AS j \
              FROM session s WHERE s.time_archived IS NULL \
              AND (s.parent_id IS NULL OR s.parent_id = '') ORDER BY s.time_created DESC;"
             .to_string(),
@@ -623,6 +717,15 @@ fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
             // agent-looking prefix. The slug is written by xses and is
             // the durable provenance marker.
             is_import: slug.starts_with("xses-") || slug.starts_with("sessionizer-"),
+            noise: {
+                let user = obj.get("user_turns").and_then(|v| v.as_u64()).unwrap_or(0);
+                let asst = obj.get("asst_turns").and_then(|v| v.as_u64()).unwrap_or(0);
+                let ok = obj
+                    .get("ok_asst_turns")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                noise_reason(user, asst, asst.saturating_sub(ok))
+            },
         });
     }
     Ok(out)
@@ -640,6 +743,24 @@ mod tests {
             "[claude] imported"
         );
         assert_eq!(display_title(Tool::Claude, ""), "[claude] (untitled)");
+    }
+
+    #[test]
+    fn noise_is_classified_by_turn_shape() {
+        // nothing was ever said
+        assert_eq!(noise_reason(0, 0, 0).as_deref(), Some("empty"));
+        // the user asked, nothing answered
+        assert_eq!(noise_reason(1, 0, 0).as_deref(), Some("unanswered"));
+        // answered, but only by errors
+        assert_eq!(noise_reason(2, 3, 3).as_deref(), Some("failed"));
+        // a real conversation
+        assert_eq!(noise_reason(2, 3, 1), None);
+        assert_eq!(noise_reason(0, 1, 0), None);
+        assert!(looks_like_error(
+            "API Error: 400 All target providers failed."
+        ));
+        assert!(looks_like_error("  Rate limit reached"));
+        assert!(!looks_like_error("I'll gather system diagnostics first."));
     }
 
     #[test]
@@ -673,6 +794,7 @@ mod tests {
             summary: "[pi] test".into(),
             path: path.clone(),
             is_import: false,
+            noise: None,
         };
         let mut prev: HashMap<PathBuf, Session> = HashMap::new();
         prev.insert(path.clone(), cached);

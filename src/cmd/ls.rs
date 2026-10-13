@@ -1,13 +1,23 @@
 //! `xses ls`: newest few sessions in this directory, or `--all`.
+//!
+//! Sessions that were never useful (empty, unanswered, or failed) stay hidden
+//! unless `--include-noise` is passed; `--count` always reports how many are
+//! hidden, so they are never invisible.
 use crate::model::Tool;
 use crate::scope;
 use std::io::Write as _;
 
-pub fn run(tool: Option<Tool>, all: bool, count: bool, limit: Option<usize>) -> anyhow::Result<()> {
+pub fn run(
+    tool: Option<Tool>,
+    all: bool,
+    count: bool,
+    limit: Option<usize>,
+    include_noise: bool,
+) -> anyhow::Result<()> {
     if count {
         return counts();
     }
-    let mut sessions = scope::load(all)?;
+    let mut sessions = scope::load(all, include_noise)?;
     if let Some(t) = tool {
         sessions.retain(|s| s.tool == t);
     }
@@ -15,17 +25,37 @@ pub fn run(tool: Option<Tool>, all: bool, count: bool, limit: Option<usize>) -> 
     let stdout = std::io::stdout();
     let mut w = stdout.lock();
     for s in &sessions {
+        let mark = match s.noise.as_deref() {
+            Some(reason) => format!("!{reason}"),
+            None => String::new(),
+        };
         writeln!(
             w,
-            "{:<6} {:<16} {:>4} {:<44} {}",
+            "{:<6} {:<16} {:>4} {:<44} {} {}",
             s.tool.as_str(),
             s.mtime.format("%Y-%m-%d %H:%M"),
             s.messages,
             s.summary,
-            s.cwd.display()
+            s.cwd.display(),
+            mark
         )?;
     }
     println!("\n{} sessions", sessions.len());
+    if include_noise {
+        return Ok(());
+    }
+    let hidden = scope::noise_tally(&crate::scan::scan_all(scope::filter(all).as_deref())?);
+    if !hidden.is_empty() {
+        println!(
+            "({} hidden: {}) — pass --include-noise to see them",
+            hidden.iter().map(|(_, n)| n).sum::<usize>(),
+            hidden
+                .iter()
+                .map(|(k, n)| format!("{n} {k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
     Ok(())
 }
 
@@ -38,6 +68,18 @@ fn counts() -> anyhow::Result<()> {
         if n > 0 || !tool.is_cli_backed() {
             println!("{:<8} {:>4} sessions", tool.as_str(), n);
         }
+    }
+    let noise = scope::noise_tally(&sessions);
+    if !noise.is_empty() {
+        println!(
+            "hidden   {:>4} not worth resuming ({})",
+            noise.iter().map(|(_, n)| n).sum::<usize>(),
+            noise
+                .iter()
+                .map(|(k, n)| format!("{n} {k}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
     }
     Ok(())
 }

@@ -70,6 +70,12 @@ pub struct Session {
     pub path: PathBuf,
     /// True if this file was written by xses (echo protection).
     pub is_import: bool,
+    /// Why this session is not worth resuming, when it is not: `empty` (no
+    /// turns at all), `unanswered` (nothing ever answered the user), or
+    /// `failed` (every assistant turn is an API/abort error). Hidden from
+    /// listings and sync unless `--include-noise` is passed.
+    #[serde(default)]
+    pub noise: Option<String>,
 }
 
 impl Session {

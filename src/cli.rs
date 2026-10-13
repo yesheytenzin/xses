@@ -40,6 +40,9 @@ pub enum Cmd {
         /// Rows to list (0 = no cap). Default: 5, or everything with --all.
         #[arg(short = 'n', long)]
         limit: Option<usize>,
+        /// Also show sessions that are empty, unanswered, or failed.
+        #[arg(long)]
+        include_noise: bool,
     },
     /// Move sessions: `sync` (latest per source tool), `sync --all` (all),
     /// `sync claude`, `sync latest --to pi`, `sync --from claude --to pi`,
@@ -71,6 +74,9 @@ pub enum Cmd {
         /// Output file for format targets (default: stdout).
         #[arg(short, long)]
         out: Option<std::path::PathBuf>,
+        /// Also sync sessions that are empty, unanswered, or failed.
+        #[arg(long)]
+        include_noise: bool,
     },
     /// List sessions across tools (newest few in this directory).
     #[command(alias = "list")]
@@ -86,6 +92,9 @@ pub enum Cmd {
         /// Rows to list (0 = no cap). Default: 5, or everything with --all.
         #[arg(short = 'n', long)]
         limit: Option<usize>,
+        /// Also list sessions that are empty, unanswered, or failed.
+        #[arg(long)]
+        include_noise: bool,
     },
     /// Report what is installed, what failed, and what xses has imported.
     Doctor {

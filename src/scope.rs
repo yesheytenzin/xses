@@ -15,9 +15,38 @@ pub fn filter(all: bool) -> Option<PathBuf> {
 }
 
 /// Sessions visible to a command: this directory, or every project.
-pub fn load(all: bool) -> anyhow::Result<Vec<Session>> {
+///
+/// Sessions classified as `empty`/`unanswered`/`failed` are hidden unless the
+/// caller opts in — they were never useful to resume, and importing them fills
+/// every other agent's picker with noise.
+pub fn load(all: bool, include_noise: bool) -> anyhow::Result<Vec<Session>> {
     let f = filter(all);
-    crate::scan::scan_all(f.as_deref())
+    let mut sessions = crate::scan::scan_all(f.as_deref())?;
+    if !include_noise {
+        sessions.retain(|s| s.noise.is_none());
+    }
+    Ok(sessions)
+}
+
+/// Hidden-session tally by reason, for `ls --count` and `doctor`.
+pub fn noise_tally(sessions: &[Session]) -> Vec<(&'static str, usize)> {
+    let mut out: Vec<(&'static str, usize)> = Vec::new();
+    for s in sessions {
+        let Some(reason) = s.noise.as_deref() else {
+            continue;
+        };
+        let key = match reason {
+            "empty" => "empty",
+            "unanswered" => "unanswered",
+            _ => "failed",
+        };
+        match out.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, n)) => *n += 1,
+            None => out.push((key, 1)),
+        }
+    }
+    out.sort();
+    out
 }
 
 /// Effective row cap. An explicit `-n` always wins (`-n 0` = no cap);

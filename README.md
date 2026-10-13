@@ -66,7 +66,8 @@ the agent that owns it.
 | Flag | Meaning |
 |---|---|
 | `--all` | Every project. |
-| `--count` | Per-tool tallies for every project (store health). |
+| `--count` | Per-tool tallies for every project, plus hidden-session counts. |
+| `--include-noise` | Also list empty/unanswered/failed sessions (marked `!reason`). |
 | `-n, --limit <N>` | Rows to list (0 = no cap). |
 
 ### `xses sync [ITEMS]`
@@ -85,6 +86,7 @@ destinations (tool names, `sharegpt`, `openai`) or session refs (`latest`,
 | `--include-imports` | Also re-import files xses itself wrote. |
 | `-o, --out <PATH>` | Output file for format targets (default stdout). |
 | `--dry-run` | Plan and report fidelity without writing anything. |
+| `--include-noise` | Also sync empty/unanswered/failed sessions. |
 
 ```sh
 xses sync                                # newest session of each agent -> every other agent
@@ -138,7 +140,11 @@ gone), and the newest failures from the issue journal.
 - Marks what a target cannot hold (redacted reasoning, oversized images,
   patches outside opencode, live state) with `[gap in imported history: …]`
   markers, counted as `dropped` in the fidelity report.
-- Skips empty sessions, and skips xses-made imports unless `--include-imports`.
+- Skips sessions that were never useful — `empty`, `unanswered` (nothing ever
+  answered the user), and `failed` (assistant turns that are only API/abort
+  errors) — and skips xses-made imports unless `--include-imports`.
+  `--include-noise` shows/acts on them, `ls --count` reports how many are
+  hidden, and `doctor` breaks the count down by reason.
 - Avoids duplicate imports (idempotent per session content) and reports what
   survived each conversion; re-syncing a session that changed updates the same
   entry instead of adding another, and imports carry the source agent's own

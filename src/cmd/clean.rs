@@ -35,7 +35,7 @@ fn newest_synced_here() -> anyhow::Result<Option<HashSet<(Tool, String)>>> {
     if recorded.is_empty() {
         return Ok(None);
     }
-    let sessions = scope::load(false)?;
+    let sessions = scope::load(false, true)?;
     let here = |tool: Tool, id: &str| {
         sessions
             .iter()

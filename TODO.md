@@ -67,3 +67,14 @@
   index keeps records whose retirement is refused.
   Also fixed: test journal pollution via `XDG_DATA_HOME` (it overrides
   `$HOME` for `dirs::data_dir`).
+
+- [x] 14. opencode delete/read race vs live server (live incident): with
+  stable ses ids, every live update hits `already exists` → delete →
+  re-import — but `opencode serve` answers reads from a stale snapshot, so
+  the re-import conflicted while the row was already gone, and blind
+  re-deletes then destroyed the copy (2546-message session lost, restored
+  via re-sync). Fixed: delete once, settle-poll `session export` (bounded
+  20 × 500ms) until the server agrees the id is gone, never delete twice;
+  a repeat conflict waits instead. Plus `XSES_ISSUES_FILE` journal
+  override so unit tests can't pollute the real journal (wired into pi,
+  claude, and index test setups; verified zero journal growth on test).

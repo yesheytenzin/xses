@@ -300,10 +300,17 @@ mod tests {
 
         let previous = std::env::var_os("HOME");
         std::env::set_var("HOME", &scratch);
+        // Keep failure journals out of the real journal (see issues::path).
+        let previous_issues = std::env::var_os("XSES_ISSUES_FILE");
+        std::env::set_var("XSES_ISSUES_FILE", scratch.join("issues.jsonl"));
         let produced = write(&session, None);
         match previous {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
+        }
+        match previous_issues {
+            Some(v) => std::env::set_var("XSES_ISSUES_FILE", v),
+            None => std::env::remove_var("XSES_ISSUES_FILE"),
         }
 
         let files: Vec<&PathBuf> = produced.iter().flatten().collect();
@@ -387,10 +394,17 @@ mod tests {
 
         let previous = std::env::var_os("HOME");
         std::env::set_var("HOME", &scratch);
+        // Keep failure journals out of the real journal (see issues::path).
+        let previous_issues = std::env::var_os("XSES_ISSUES_FILE");
+        std::env::set_var("XSES_ISSUES_FILE", scratch.join("issues.jsonl"));
         let produced = write(&session, None);
         match previous {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
+        }
+        match previous_issues {
+            Some(v) => std::env::set_var("XSES_ISSUES_FILE", v),
+            None => std::env::remove_var("XSES_ISSUES_FILE"),
         }
 
         let files: Vec<&PathBuf> = produced.iter().flatten().collect();

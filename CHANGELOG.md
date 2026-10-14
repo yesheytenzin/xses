@@ -24,6 +24,9 @@
   and `clean`/retirement refuse to delete them — a record can no longer
   aim at a native session. `doctor` reports `unmarked` records.
   MAPPING 9 → 10 (stable artifact identity) → 11 (sidecars).
+- Opencode updates now settle after delete (`session export` poll, bounded)
+  instead of racing the live server's snapshot; repeat conflicts wait,
+  never re-delete. Test journal sandboxed via `XSES_ISSUES_FILE`.
 
 ## 0.7.2
 

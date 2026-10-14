@@ -171,6 +171,9 @@ mod tests {
     use super::*;
     #[test]
     fn publication_precedes_retirement_and_pending_retirements_recover() {
+        let _serial = crate::write::HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("xses-index-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let old = dir.join("old.jsonl");
@@ -186,6 +189,8 @@ mod tests {
             key: "pi|claude|source|new".into(),
             paths: vec![new.clone()],
         };
+        let previous_issues = std::env::var_os("XSES_ISSUES_FILE");
+        std::env::set_var("XSES_ISSUES_FILE", dir.join("issues.jsonl"));
         let mut index = Index {
             path: dir.join("index.jsonl"),
             records: vec![old_record, new_record],
@@ -221,6 +226,10 @@ mod tests {
         index2.commit(Vec::new()).unwrap();
         assert!(native.exists(), "native file must survive");
         assert_eq!(index2.records.len(), 2, "record must be kept");
+        match previous_issues {
+            Some(v) => std::env::set_var("XSES_ISSUES_FILE", v),
+            None => std::env::remove_var("XSES_ISSUES_FILE"),
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

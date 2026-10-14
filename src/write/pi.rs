@@ -530,6 +530,7 @@ mod sidecar_tests {
                 Some(v) => std::env::set_var("XDG_DATA_HOME", v),
                 None => std::env::remove_var("XDG_DATA_HOME"),
             }
+            std::env::remove_var("XSES_ISSUES_FILE");
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
@@ -547,6 +548,7 @@ mod sidecar_tests {
         // journal writes during tests land in the real journal.
         let prev_xdg = std::env::var_os("XDG_DATA_HOME");
         std::env::set_var("XDG_DATA_HOME", dir.join(".local/share"));
+        std::env::set_var("XSES_ISSUES_FILE", dir.join("issues.jsonl"));
         ScratchHome {
             _serial: serial,
             dir,

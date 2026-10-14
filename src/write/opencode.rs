@@ -474,6 +474,10 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
     // never blocks an unrelated session's import.
     static RETRY_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let mut last = None;
+    // Whether we already deleted a conflicting generation: a second delete
+    // would destroy the copy we are trying to replace, so a repeat conflict
+    // waits instead (the live server can answer from a stale snapshot).
+    let mut replaced = false;
     for attempt in 0..IMPORT_ATTEMPTS {
         // Back off before re-entering: exponential with jitter, outside the
         // gate so other sessions proceed while this one waits.
@@ -509,15 +513,32 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         // already there: drop it and import fresh so a mapping bump or new
         // turns actually replace the stored copy.
         if stdout.contains("already exists") {
-            let mut del = session_cmd();
-            del.arg("delete").arg(&ses);
-            let del_out = crate::proc::output_with_timeout(del, Duration::from_secs(60));
-            if del_out.is_ok_and(|o| o.status.success()) {
-                // Fall through to the attempt below, which re-runs the
-                // import against the now-absent id.
+            if !replaced {
+                let mut del = session_cmd();
+                del.arg("delete").arg(&ses);
+                let deleted = crate::proc::output_with_timeout(del, Duration::from_secs(60))
+                    .is_ok_and(|o| o.status.success());
+                replaced = true;
+                if deleted {
+                    // The live server can answer reads from a stale snapshot
+                    // right after a delete (verified: a re-import conflicted
+                    // while the row was already gone, and blind re-deletes
+                    // then destroyed the copy). Settle first: poll until the
+                    // server agrees the id is gone, bounded, before the next
+                    // attempt below re-runs the import.
+                    for _ in 0..20 {
+                        if session_gone(&ses) {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(500));
+                    }
+                }
                 last = Some(out);
                 continue;
             }
+            // Conflict after our own delete: the server is still stale.
+            // Wait it out — never delete twice.
+            std::thread::sleep(Duration::from_secs(2));
             last = Some(out);
             continue;
         }
@@ -589,6 +610,17 @@ fn retry_jitter(attempt: u32) -> u64 {
         .wrapping_add(1442695040888963407)
         >> 41)
         % 251
+}
+
+/// True when the server no longer has the session: `session export`
+/// fails for a missing id (exit 1, "Session not found"). Read-only probe
+/// for the delete-then-import settle window; the import itself remains the
+/// final arbiter, so a false negative only costs one more attempt.
+fn session_gone(ses: &str) -> bool {
+    let mut probe = session_cmd();
+    probe.arg("export").arg(ses);
+    !crate::proc::output_with_timeout(probe, Duration::from_secs(30))
+        .is_ok_and(|o| o.status.success())
 }
 
 /// One `opencode session …` invocation with piped output. Callers add

@@ -22,6 +22,12 @@ pub struct Issue {
 
 /// Journal location, for callers that need to point at the full text.
 pub fn path() -> Option<PathBuf> {
+    // Test hatch: unit tests redirect the journal here so failures under
+    // test never pollute the user's real journal (dirs::data_dir prefers
+    // XDG_DATA_HOME, which $HOME overrides do not move).
+    if let Some(p) = std::env::var_os("XSES_ISSUES_FILE") {
+        return Some(p.into());
+    }
     Some(dirs::data_dir()?.join("xses").join("issues.jsonl"))
 }
 

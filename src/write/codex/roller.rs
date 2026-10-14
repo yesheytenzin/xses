@@ -9,6 +9,67 @@ use crate::canonical::{Block, Role};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 
+/// Schema-faithful `commandExecution` projection row (v2 `ThreadItem`).
+/// Every field the schema requires without a default is present: the
+/// resume loader parses each page strictly, and a missing `commandActions`
+/// or `processId` fails the whole page (verified against codex 0.162
+/// sources + live native rows). Nullable unknowns stay null rather than
+/// invented.
+fn command_execution(
+    id: &str,
+    command: &str,
+    cwd: &std::path::Path,
+    status: &str,
+    output: &str,
+    exit_code: Option<i64>,
+    duration_ms: Option<u64>,
+) -> Value {
+    json!({
+        "type": "commandExecution",
+        "id": id,
+        "pluginId": null,
+        "scriptPath": null,
+        "processId": null,
+        "command": command,
+        "cwd": cwd,
+        "commandActions": [{"type": "unknown", "command": command}],
+        "source": "agent",
+        "status": status,
+        "aggregatedOutput": output,
+        "exitCode": exit_code,
+        "durationMs": duration_ms,
+    })
+}
+
+/// Schema-faithful `mcpToolCall` projection row: the schema's required
+/// fields plus explicit nulls for every non-defaulted `Option` (a missing
+/// key fails just like a wrong type). Statuses are camelCase.
+fn mcp_tool_call(
+    id: &str,
+    server: &str,
+    tool: &str,
+    status: &str,
+    arguments: Value,
+    result: Value,
+) -> Value {
+    json!({
+        "type": "mcpToolCall",
+        "id": id,
+        "server": server,
+        "tool": tool,
+        "status": status,
+        "arguments": arguments,
+        "appContext": null,
+        "mcpAppResourceUri": null,
+        "mcpAppUi": null,
+        "pluginId": null,
+        "readOnlyHint": null,
+        "result": result,
+        "error": null,
+        "durationMs": null,
+    })
+}
+
 pub(super) fn is_shellish(name: &str) -> bool {
     matches!(
         name,
@@ -178,38 +239,32 @@ impl Roller<'_> {
         let thread = match &tool {
             ThreadTool::Shell(command) => (
                 "commandExecution",
-                json!({
-                    "type": "commandExecution",
-                    "id": id,
-                    "command": command,
-                    "cwd": self.cwd,
-                    "status": "in_progress",
-                    "aggregatedOutput": "",
-                    "exitCode": null,
-                    "durationMs": null,
-                    "source": "xses-import",
-                }),
+                command_execution(&id, command, self.cwd, "inProgress", "", None, None),
             ),
             // codex's TUI draws a patch as a file change, not as a
             // command; the diff lives in the call's arguments.
             ThreadTool::FileChange(changes) => (
                 "fileChange",
-                json!({"type": "fileChange", "id": id, "changes": changes}),
+                json!({
+                    "type": "fileChange",
+                    "id": id,
+                    "changes": changes,
+                    "status": "inProgress",
+                }),
             ),
+            // Intentional fallback: unstructured args land as null
+            // rather than failing the import; the rollout still
+            // names the tool and server.
             ThreadTool::Mcp { server, tool } => (
                 "mcpToolCall",
-                json!({
-                    "type": "mcpToolCall",
-                    "id": id,
-                    "server": server,
-                    "tool": tool,
-                    "status": "in_progress",
-                    // Intentional fallback: unstructured args land as null
-                    // rather than failing the import; the rollout still
-                    // names the tool and server.
-                    "arguments": serde_json::from_str::<Value>(args).unwrap_or(Value::Null),
-                    "result": null,
-                }),
+                mcp_tool_call(
+                    &id,
+                    server,
+                    tool,
+                    "inProgress",
+                    serde_json::from_str::<Value>(args).unwrap_or(Value::Null),
+                    Value::Null,
+                ),
             ),
             ThreadTool::ImageView(path) => (
                 "imageView",
@@ -278,33 +333,41 @@ impl Roller<'_> {
         // A successful patch already rendered as the file change
         // itself; only its failure needs a row of its own.
         let thread = match &tool {
-            ThreadTool::FileChange(_) if !is_error => None,
+            // A successful patch lands as the completed change itself
+            // (same id replaces the in-progress row from the call side).
+            ThreadTool::FileChange(changes) if !is_error => Some((
+                "fileChange".to_string(),
+                json!({
+                    "type": "fileChange",
+                    "id": id,
+                    "changes": changes,
+                    "status": "completed",
+                }),
+            )),
+            ThreadTool::FileChange(_) => None,
             ThreadTool::ImageView(_) => None,
             ThreadTool::Mcp { server, tool: mcp } => Some((
                 "mcpToolCall".to_string(),
-                json!({
-                    "type": "mcpToolCall",
-                    "id": id,
-                    "server": server,
-                    "tool": mcp,
-                    "status": if is_error { "failed" } else { "completed" },
-                    "arguments": Value::Null,
-                    "result": {"content": [{"type": "text", "text": output}]},
-                }),
+                mcp_tool_call(
+                    &id,
+                    server,
+                    mcp,
+                    if is_error { "failed" } else { "completed" },
+                    Value::Null,
+                    json!({"content": [{"type": "text", "text": output}]}),
+                ),
             )),
             _ => Some((
                 "commandExecution".to_string(),
-                json!({
-                    "type": "commandExecution",
-                    "id": id,
-                    "command": command,
-                    "cwd": self.cwd,
-                    "status": if is_error { "failed" } else { "completed" },
-                    "aggregatedOutput": output,
-                    "exitCode": Value::Null,
-                    "durationMs": duration_ms,
-                    "source": "xses-import",
-                }),
+                command_execution(
+                    &id,
+                    &command,
+                    self.cwd,
+                    if is_error { "failed" } else { "completed" },
+                    output,
+                    None,
+                    duration_ms,
+                ),
             )),
         };
         self.out.push(Item {

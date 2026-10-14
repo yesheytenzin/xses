@@ -91,7 +91,8 @@ try:
     run("sync", "--from", "pi", "--to", "claude")
     full_key, full_paths = source_record()
     assert full_key != old_key and len(index_records()) == 1
-    assert all(not Path(p).exists() for p in old_paths)
+    assert full_paths == old_paths, "re-sync must preserve artifact identity"
+    assert all(Path(p).exists() for p in full_paths)
     full_rollout = next(Path(p) for p in full_paths if p.endswith(".jsonl"))
     assert "first question" in full_rollout.read_text()
     assert "first question" in run("ls", "claude")
@@ -158,7 +159,8 @@ try:
     db.commit()
     assert "1 written" in run("sync", "--from", "opencode", "--to", "pi")
     current = source_record("opencode", "oc-source")
-    assert previous[0] != current[0] and all(not Path(p).exists() for p in previous[1])
+    assert previous[0] != current[0] and previous[1] == current[1]
+    assert all(Path(p).exists() for p in current[1])
     assert "bravo" in Path(current[1][0]).read_text()
     db.execute("DELETE FROM part WHERE id='p1'")
     db.commit()

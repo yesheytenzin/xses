@@ -288,11 +288,22 @@ pub(super) fn write(
                 "timestamp": row_ts_ms,
             });
             if matches!(role, Role::Assistant) {
-                let msg_provider = usage.provider.as_deref().unwrap_or(&pi_provider);
-                message["api"] = json!(msg_provider);
-                message["provider"] = json!(msg_provider);
-                message["model"] = json!(usage.model.as_deref().unwrap_or(&pi_model_id));
-                message["stopReason"] = json!("stop");
+                // No api/provider/model on pi imports: stamping the source's
+                // execution routing (e.g. opencode-go/muse-spark) makes the
+                // provider duplicate tool outputs on resume (400, verified
+                // live against opencode-go). The transcript keeps per-message
+                // accounting in usage blocks; the resuming stack applies its
+                // own routing. Omp keeps the fields: its app reads its own
+                // store natively and shows no such quirk.
+                if !is_omp {
+                    message["stopReason"] = json!("stop");
+                } else {
+                    let msg_provider = usage.provider.as_deref().unwrap_or(&pi_provider);
+                    message["api"] = json!(msg_provider);
+                    message["provider"] = json!(msg_provider);
+                    message["model"] = json!(usage.model.as_deref().unwrap_or(&pi_model_id));
+                    message["stopReason"] = json!("stop");
+                }
                 message["thinkingLevel"] = json!("off");
                 message["durationMs"] = json!(0);
                 message["usage"] = json!({
@@ -604,6 +615,61 @@ mod sidecar_tests {
         );
         let _ = std::fs::remove_dir_all(dir);
         drop(home);
+    }
+
+    /// Pi-target assistant messages carry no api/provider/model: stamping
+    /// the source's execution routing makes opencode-go duplicate tool
+    /// outputs on resume (400, verified live with probes). Omp keeps them.
+    #[test]
+    fn pi_imports_leave_routing_to_the_resuming_stack() {
+        let home = scratch_home();
+        let _home = &home;
+        let mut session = omp_session();
+        session.events.push(crate::canonical::Event {
+            msg: 1,
+            block: Block::Text {
+                role: Role::Assistant,
+                text: "hello".into(),
+            },
+        });
+        session.events.push(crate::canonical::Event {
+            msg: 1,
+            block: Block::Usage {
+                input: 1,
+                output: 2,
+                reasoning: 0,
+                cache_read: 0,
+                cache_write: 0,
+                cost: 0.0,
+                model: Some("muse-spark-1.3-contributor".into()),
+                provider: Some("opencode-go".into()),
+            },
+        });
+        for (target, keep) in [(Tool::Pi, false), (Tool::Omp, true)] {
+            let out = write(target, &session, Some("m11"));
+            let path = out[0].clone().expect("session written");
+            let mut assistants = 0;
+            for line in std::fs::read_to_string(&path).unwrap().lines() {
+                let v: Value = serde_json::from_str(line).unwrap();
+                let is_assistant =
+                    v.pointer("/message/role").and_then(|r| r.as_str()) == Some("assistant");
+                if !is_assistant {
+                    continue;
+                }
+                assistants += 1;
+                for k in ["api", "provider", "model"] {
+                    assert_eq!(
+                        v["message"].get(k).is_some(),
+                        keep,
+                        "{target:?} assistant message {k} presence (paid forward from usage)"
+                    );
+                }
+            }
+            assert!(
+                assistants > 0,
+                "{target:?} should emit an assistant message"
+            );
+        }
     }
 
     #[test]

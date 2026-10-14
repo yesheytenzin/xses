@@ -31,7 +31,7 @@ pub(super) fn rollout_items(session: &CanonicalSession) -> Vec<Item> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::canonical::{Block, Event};
+    use crate::canonical::{Block, Event, Role};
     use crate::model::Tool;
     use chrono::Utc;
     use serde_json::Value;
@@ -163,8 +163,11 @@ mod tests {
         assert!(changes[0]["diff"].as_str().unwrap_or("").contains("+x = 2"));
         assert_eq!(changes[1]["kind"]["type"], "add");
         assert_eq!(changes[1]["path"], "/tmp/b.py");
-        // Its successful result adds nothing; the diff is the result.
-        assert_eq!(by_type("fileChange").len(), 1);
+        // Its successful result completes the change: same id, first
+        // in-progress from the call, then completed with the same diff.
+        assert_eq!(by_type("fileChange").len(), 2);
+        assert_eq!(by_type("fileChange")[0]["status"], "inProgress");
+        assert_eq!(by_type("fileChange")[1]["status"], "completed");
         assert_eq!(by_type("commandExecution").len(), 1, "only the shell call");
 
         // MCP: server, tool, arguments at the call, status and output after.
@@ -228,6 +231,122 @@ mod tests {
             result.payload.get("call_id").and_then(|v| v.as_str()),
             "call and result must share one id"
         );
+    }
+
+    /// The resume loader parses every projected row strictly (v2
+    /// `ThreadItem`): a missing non-defaulted key fails the whole page.
+    /// Pins the required shapes against codex 0.162's own schemas.
+    #[test]
+    fn projected_rows_match_the_resume_loader_schema() {
+        let s = test_session(vec![
+            Event {
+                msg: 0,
+                block: Block::Text {
+                    role: Role::User,
+                    text: "hi".into(),
+                },
+            },
+            Event {
+                msg: 1,
+                block: Block::ToolCall {
+                    name: "bash".into(),
+                    args: r#"{"command":"ls"}"#.into(),
+                    call_id: Some("c1".into()),
+                    status: None,
+                },
+            },
+            Event {
+                msg: 2,
+                block: Block::ToolResult {
+                    name: "bash".into(),
+                    output: "a".into(),
+                    call_id: Some("c1".into()),
+                    is_error: false,
+                    duration_ms: None,
+                },
+            },
+            Event {
+                msg: 3,
+                block: Block::ToolCall {
+                    name: "mcp__srv__tool".into(),
+                    args: "{}".into(),
+                    call_id: Some("c2".into()),
+                    status: None,
+                },
+            },
+            Event {
+                msg: 4,
+                block: Block::ToolCall {
+                    name: "apply_patch".into(),
+                    args: "*** Add File: /tmp/a\n+1\n".into(),
+                    call_id: Some("c3".into()),
+                    status: None,
+                },
+            },
+        ]);
+        let items = rollout_items(&s);
+        let mut saw = std::collections::HashSet::new();
+        for item in items.iter().filter_map(|i| i.thread.as_ref()) {
+            let (kind, j) = item;
+            saw.insert(kind.clone());
+            let get = |k: &str| j.get(k);
+            // No snake_case statuses: the schemas are camelCase.
+            if let Some(s) = get("status").and_then(|v| v.as_str()) {
+                assert!(!s.contains('_'), "{kind} status must be camelCase, got {s}");
+            }
+            match kind.as_str() {
+                "commandExecution" => {
+                    for k in [
+                        "command",
+                        "cwd",
+                        "commandActions",
+                        "processId",
+                        "status",
+                        "aggregatedOutput",
+                        "source",
+                    ] {
+                        assert!(get(k).is_some(), "commandExecution missing {k}: {j}");
+                    }
+                    assert!(get("commandActions").unwrap().is_array());
+                }
+                "mcpToolCall" => {
+                    for k in [
+                        "server",
+                        "tool",
+                        "status",
+                        "arguments",
+                        "appContext",
+                        "pluginId",
+                        "readOnlyHint",
+                        "result",
+                        "error",
+                        "durationMs",
+                    ] {
+                        assert!(get(k).is_some(), "mcpToolCall missing {k}: {j}");
+                    }
+                }
+                "fileChange" => {
+                    for k in ["changes", "status"] {
+                        assert!(get(k).is_some(), "fileChange missing {k}: {j}");
+                    }
+                }
+                "userMessage" => {
+                    assert!(get("content").unwrap().is_array());
+                }
+                "agentMessage" => {
+                    assert!(get("text").and_then(|t| t.as_str()).is_some());
+                }
+                _ => {}
+            }
+        }
+        for k in [
+            "userMessage",
+            "commandExecution",
+            "mcpToolCall",
+            "fileChange",
+        ] {
+            assert!(saw.contains(k), "expected a {k} row");
+        }
     }
 
     #[test]

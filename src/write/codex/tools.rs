@@ -90,9 +90,11 @@ pub(super) fn patch_changes(text: &str) -> Vec<Value> {
     let mut current: Option<(String, String, Vec<String>)> = None;
     let flush = |out: &mut Vec<Value>, cur: Option<(String, String, Vec<String>)>| {
         if let Some((path, kind, lines)) = cur {
+            // `Update` carries a required-or-null `movePath`; sibling
+            // variants ignore the extra key (no deny_unknown_fields).
             out.push(json!({
                 "path": path,
-                "kind": {"type": kind},
+                "kind": {"type": kind, "movePath": null},
                 "diff": lines.join("\n"),
             }));
         }

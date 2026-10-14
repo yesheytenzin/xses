@@ -71,3 +71,13 @@ the previous native export is restored.
 Run `python3 verify-xses/flows/benchmark.py` after a release build for real-store
 listing timings with isolated xses caches. `--baseline /path/to/old/xses` compares
 binaries on the same stores. These are application-cache, not cold-disk timings.
+
+## Native transcript UI
+
+Run `python3 verify-xses/flows/native.py target/debug/xses --ui` with tmux and
+all five agent CLIs installed. It uses disposable stores and no model requests.
+Pass criteria: native tool calls/results render, skill reads fold by default,
+Codex dates use realistic epoch seconds, and OpenCode has no bogus empty rows.
+The flow also converts a hidden Claude skill injection into a Pi tool result
+without losing its historical instructions. Captured UI text is saved beside
+the native flow's command log.

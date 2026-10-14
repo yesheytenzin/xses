@@ -5,10 +5,7 @@
 //! with inline content, `info.location` + `projectID`, and provenance in
 //! `info.metadata.xses` (slugs are server-generated, so the v1 slug marker
 //! cannot survive an import).
-use super::{
-    args_json_object, fallback_call_id, fallback_text, group_role, import_id, manifest, usage_of,
-    Usage,
-};
+use super::{fallback_call_id, fallback_text, group_role, import_id, manifest, usage_of, Usage};
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
 use std::fs;
@@ -72,6 +69,7 @@ struct Builder {
     ids: super::TargetIds,
     minted: usize,
     folded: std::collections::HashMap<String, (String, bool, Option<u64>)>,
+    calls: std::collections::HashSet<String>,
     model_id: String,
     provider_id: String,
     /// Session id stem for the import-note message id. Message ids are
@@ -86,6 +84,16 @@ impl Builder {
     /// id before the message loop. Minted fallback ids are shared with the
     /// loop so an id-less call and its result still meet.
     fn fold(&mut self, groups: &[(u32, Vec<&Block>)]) {
+        for (_, blocks) in groups {
+            for block in blocks {
+                if let Block::ToolCall {
+                    call_id: Some(id), ..
+                } = block
+                {
+                    self.calls.insert(id.clone());
+                }
+            }
+        }
         for (_, blocks) in groups {
             for block in blocks {
                 if let Block::ToolResult {
@@ -166,7 +174,9 @@ impl Builder {
                     // Completed states carry `content[]`; error states carry
                     // `error.message` instead — each shape without the other
                     // key (verified against live rows and the validator).
-                    let input = args_json_object(args);
+                    let (native_name, input) =
+                        super::tools::native_tool(crate::model::Tool::Opencode, name, args);
+                    let input = super::args_json_object(&input.to_string());
                     let (output, is_error, duration) = self
                         .folded
                         .get(&cid)
@@ -184,13 +194,22 @@ impl Builder {
                     content.push(json!({
                         "type": "tool",
                         "id": cid,
-                        "name": name,
+                        "name": native_name,
                         "state": state,
                         "time": {"created": ts, "completed": call_end.max(end_ts)},
                     }));
                 }
                 // Results were self.folded into their call's part above.
-                Block::ToolResult { .. } => {}
+                Block::ToolResult {
+                    call_id,
+                    name,
+                    output,
+                    ..
+                } => {
+                    if !call_id.as_ref().is_some_and(|id| self.calls.contains(id)) {
+                        content.push(json!({"type":"text", "text":format!("[recorded {name} result]\n{output}")}));
+                    }
+                }
                 Block::Image {
                     mime,
                     data,
@@ -380,6 +399,7 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         ids: super::TargetIds::default(),
         minted: 0,
         folded: std::collections::HashMap::new(),
+        calls: std::collections::HashSet::new(),
         model_id,
         provider_id,
         ses: ses.clone(),
@@ -390,6 +410,17 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
     let mut note_pending = true;
     let mut prev_ms = 0i64;
     for (i, (m, blocks)) in groups.into_iter().enumerate() {
+        // Results already live inside their call's native tool part. Emitting
+        // their otherwise-empty source group creates a bogus visible message.
+        if blocks.iter().all(|b| match b {
+            Block::Usage { .. } => true,
+            Block::ToolResult {
+                call_id: Some(id), ..
+            } => builder.calls.contains(id),
+            _ => false,
+        }) {
+            continue;
+        }
         // opencode orders messages by (time_created, id): ids must sort in
         // transcript order and timestamps must increase, or the import shows
         // up scrambled.

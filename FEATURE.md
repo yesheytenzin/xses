@@ -44,3 +44,13 @@ cleaning it to avoid simultaneous writes.
 real xses CLI against disposable stores. `native.py` additionally checks native
 Pi export, Codex thread loading, and OpenCode imports without model requests.
 See [the verification checklist](verify-xses/SKILL.md).
+
+## Loaded skills
+
+Recognized skill injections (including Claude's `Base directory for this skill:`
+metadata and Pi's `<skill name="…" location="…">` wrappers) transfer as
+completed native file reads. The historical instructions
+remain in the tool result, while the target UI can show a folded read or skill
+entry. Existing recorded skill-file reads use the same native tool conversion.
+Sync does not install skills or enable them in another agent. Unrecognized
+metadata remains labeled context so instructions are never silently discarded.

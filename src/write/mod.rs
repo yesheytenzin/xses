@@ -11,6 +11,7 @@ mod codex;
 mod export;
 mod opencode;
 mod pi;
+mod tools;
 
 pub(crate) use codex::registered as codex_registered;
 pub(crate) use codex::retire_codex;
@@ -31,7 +32,7 @@ pub(super) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Mapping version recorded in every import. Bump it whenever the writers
 /// change what they emit, so `sync` can re-import and upgrade old copies.
-pub(crate) const MAPPING: u32 = 14;
+pub(crate) const MAPPING: u32 = 15;
 
 /// Shown as a system message at the top of every import: the transcript that
 /// follows already ran somewhere else and must not be treated as live state.
@@ -224,6 +225,8 @@ pub fn session_revision(
 ) -> Result<(Vec<PathBuf>, LossReport)> {
     let publication = crate::publication::Publication::begin()?;
     let (_, report) = session.transfer_summary();
+    let native_session = tools::skill_history(session);
+    let session = native_session.as_ref();
     let files = match target {
         Tool::Pi | Tool::Omp => pi::write(target, session, Some(revision)),
         Tool::Claude => claude::write(session, Some(revision)),

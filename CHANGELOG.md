@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.2
+
+- Render known tools with target-native names and arguments; include Claude
+  result metadata so imported calls and outputs appear in its transcript UI.
+- Correct Codex turn timestamps to seconds and project file reads as native
+  read actions. Keep item timestamps in milliseconds.
+- Omit OpenCode result rows already folded into calls, avoiding empty messages;
+  preserve orphan results as labeled recorded output.
+- Transfer recognized injected skill instructions as completed file reads,
+  keeping the full historical content in foldable native tool results.
+- Verify rich transcripts and folded skills in all five native terminal UIs
+  using `python3 verify-xses/flows/native.py target/debug/xses --ui`.
+
 ## 0.8.1
 
 This release includes the changes prepared for 0.8.0, whose publication was

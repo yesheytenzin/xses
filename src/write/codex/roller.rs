@@ -41,6 +41,19 @@ fn command_execution(
     })
 }
 
+fn read_execution(
+    id: &str,
+    path: &std::path::Path,
+    cwd: &std::path::Path,
+    status: &str,
+    output: &str,
+) -> Value {
+    let command = format!("cat {}", path.display());
+    let mut item = command_execution(id, &command, cwd, status, output, None, None);
+    item["commandActions"] = json!([{"type":"read", "command":command, "name":path.file_name().unwrap_or_default().to_string_lossy(), "path":path}]);
+    item
+}
+
 /// Schema-faithful `mcpToolCall` projection row: the schema's required
 /// fields plus explicit nulls for every non-defaulted `Option` (a missing
 /// key fails just like a wrong type). Statuses are camelCase.
@@ -243,6 +256,10 @@ impl Roller<'_> {
             ),
             // codex's TUI draws a patch as a file change, not as a
             // command; the diff lives in the call's arguments.
+            ThreadTool::Read(path) => (
+                "commandExecution",
+                read_execution(&id, path, self.cwd, "inProgress", ""),
+            ),
             ThreadTool::FileChange(changes) => (
                 "fileChange",
                 json!({
@@ -335,6 +352,16 @@ impl Roller<'_> {
         let thread = match &tool {
             // A successful patch lands as the completed change itself
             // (same id replaces the in-progress row from the call side).
+            ThreadTool::Read(path) => Some((
+                "commandExecution".into(),
+                read_execution(
+                    &id,
+                    path,
+                    self.cwd,
+                    if is_error { "failed" } else { "completed" },
+                    output,
+                ),
+            )),
             ThreadTool::FileChange(changes) if !is_error => Some((
                 "fileChange".to_string(),
                 json!({

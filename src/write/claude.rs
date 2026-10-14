@@ -4,8 +4,7 @@
 //! `tool_result` (the latter in a `user` row, as claude does), plus image
 //! blocks for inline pictures and per-message `usage`.
 use super::{
-    args_json, fallback_text, group_role, iso, manifest, next_row_time, push, synth_id, usage_of,
-    uuid_like,
+    fallback_text, group_role, iso, manifest, next_row_time, push, synth_id, usage_of, uuid_like,
 };
 use crate::canonical::{Block, CanonicalSession, Role};
 use serde_json::{json, Value};
@@ -103,11 +102,12 @@ fn write_inner(
     // Anthropic rejects an id outside `[A-Za-z0-9_-]`; map once so a call and
     // its result keep the same value.
     let mut ids = super::TargetIds::default();
+    let mut calls = std::collections::HashMap::new();
     for (m, blocks) in session.grouped() {
         let row_ts = next_row_time(session, m, &mut prev_ts);
         let role = group_role(&blocks, Role::Assistant);
         let mut content: Vec<Value> = Vec::new();
-        let mut results: Vec<Value> = Vec::new();
+        let mut results: Vec<(Value, Value)> = Vec::new();
         for block in &blocks {
             match block {
                 Block::Text { text, .. } => content.push(json!({"type": "text", "text": text})),
@@ -122,33 +122,46 @@ fn write_inner(
                     call_id,
                     ..
                 } => {
-                    content.push(json!({
-                        "type": "tool_use",
-                        "id": call_id
-                            .clone()
-                            .map(|c| ids.get(&c))
-                            .unwrap_or_else(|| format!("toolu_{}", uuid_like(&sid, cursor).replace('-', ""))),
-                        "name": name,
-                        "input": args_json(args),
-                    }));
+                    let (native_name, input) =
+                        super::tools::native_tool(crate::model::Tool::Claude, name, args);
+                    let id = call_id.clone().map(|c| ids.get(&c)).unwrap_or_else(|| {
+                        format!("toolu_{}", uuid_like(&sid, cursor).replace('-', ""))
+                    });
+                    calls.insert(id.clone(), (native_name.clone(), input.clone()));
+                    content.push(
+                        json!({"type":"tool_use", "id":id, "name":native_name, "input":input}),
+                    );
                 }
                 Block::ToolResult {
                     output,
                     call_id,
                     is_error,
                     ..
-                } => results.push(json!({
-                    "type": "tool_result",
-                    // Anthropic's pattern requires a non-empty
-                    // `[A-Za-z0-9_-]+`, so a result whose call id the source
-                    // never recorded gets a minted one.
-                    "tool_use_id": call_id
-                        .clone()
-                        .map(|c| ids.get(&c))
-                        .unwrap_or_else(|| format!("toolu_{}", uuid_like(&sid, cursor).replace('-', ""))),
-                    "is_error": is_error,
-                    "content": [{"type": "text", "text": output}],
-                })),
+                } => {
+                    let id = call_id.clone().map(|c| ids.get(&c)).unwrap_or_else(|| {
+                        format!("toolu_{}", uuid_like(&sid, cursor).replace('-', ""))
+                    });
+                    let native_result = match calls.get(&id) {
+                        Some((name, _)) if name == "Bash" => json!({
+                            "stdout":if *is_error { "" } else { output },
+                            "stderr":if *is_error { output } else { "" },
+                            "interrupted":false, "isImage":false, "noOutputExpected":false,
+                        }),
+                        Some((name, input)) if name == "Read" && !is_error => json!({
+                            "type":"text", "file": {
+                                "filePath":input.get("file_path").and_then(Value::as_str).unwrap_or("imported context"),
+                                "content":output, "numLines":output.lines().count(),
+                                "startLine":1, "totalLines":output.lines().count(),
+                            }
+                        }),
+                        _ => json!(output),
+                    };
+                    results.push((
+                        json!({"type":"tool_result", "tool_use_id":id,
+                        "is_error":is_error, "content":[{"type":"text", "text":output}]}),
+                        native_result,
+                    ));
+                }
                 Block::Image { mime, data, .. } => match data {
                     Some(d) => content.push(json!({
                         "type": "image",
@@ -206,14 +219,15 @@ fn write_inner(
             );
             parent = Some(uuid);
         }
-        if !results.is_empty() {
+        for (result, native_result) in results {
             // claude keeps tool results in a user row.
             let uuid = next_uuid(&mut cursor, &uuids, &sid);
             push(
                 &mut buf,
                 &json!({
                     "type": "user",
-                    "message": {"role": "user", "content": results},
+                    "message": {"role": "user", "content": [result]},
+                    "toolUseResult": native_result,
                     "uuid": uuid,
                     "parentUuid": parent,
                     "timestamp": iso(&row_ts),

@@ -85,6 +85,16 @@ try:
     rows = [{"type":"session","version":3,"id":"native-flow","cwd":str(project),"timestamp":"2026-10-01T00:00:00Z"},
             {"type":"message","id":"u1","message":{"role":"user","content":"native compatibility question"}},
             {"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":"native compatibility answer"}}]
+    rows.extend([
+        {"type":"message","id":"u-rich","parentId":"a1","message":{"role":"user","content":[{"type":"text","text":"UI audit: show **bold**, `inline code`, and a list:\n- item one\n- item two"}]}},
+        {"type":"message","id":"a-tool","parentId":"u-rich","message":{"role":"assistant","content":[{"type":"thinking","thinking":"UI audit reasoning"},{"type":"toolCall","id":"audit-call","name":"bash","arguments":{"command":"printf audit-output"}}]}},
+        {"type":"message","id":"t-rich","parentId":"a-tool","message":{"role":"toolResult","toolCallId":"audit-call","toolName":"bash","content":[{"type":"text","text":"audit-output"}],"isError":False}},
+        {"type":"message","id":"a-rich","parentId":"t-rich","message":{"role":"assistant","content":[{"type":"text","text":"UI audit complete.\n```python\nprint(42)\n```"}]}},
+        {"type":"message","id":"a-skill","parentId":"a-rich","message":{"role":"assistant","content":[{"type":"toolCall","id":"skill-read","name":"read","arguments":{"path":str(project / "SKILL.md")}}]}},
+        {"type":"message","id":"skill-result","parentId":"a-skill","message":{"role":"toolResult","toolCallId":"skill-read","toolName":"read","content":[{"type":"text","text":"Base directory for this skill: " + str(project) + "\n# Audit skill\n" + "\n".join("skill instruction " + str(i) for i in range(80))}],"isError":False}},
+        {"type":"message","id":"wrapped-skill","parentId":"skill-result","message":{"role":"user","content":'<skill name="audit" location="' + str(project / 'SKILL.md') + '">\n' + '\n'.join('wrapped skill instruction ' + str(i) for i in range(80)) + '\n</skill>\n\nApply the loaded skill'}},
+        {"type":"message","id":"a-skill-done","parentId":"skill-result","message":{"role":"assistant","content":"Skill history retained."}}
+    ])
     source.write_text("".join(json.dumps(row)+"\n" for row in rows))
     run(["opencode", "session", "list", "--format", "json", *list_flags])
     run([binary, "sync", "--from", "pi", "--to", "claude", "--to", "codex", "--to", "opencode", "--to", "omp"])
@@ -138,6 +148,11 @@ try:
         server.stdin.flush()
         result = rpc(2, "thread/read", {"threadId":sid, "includeTurns":True})
         assert "native compatibility answer" in json.dumps(result)
+        assert "audit-output" in json.dumps(result)
+        assert all(turn['startedAt'] < 100_000_000_000 for turn in result['thread']['turns'])
+        assert 'skill instruction 79' in json.dumps(result)
+        assert 'wrapped skill instruction 79' in json.dumps(result)
+        assert 'Apply the loaded skill' in json.dumps(result)
     finally:
         server.terminate()
         server.wait(timeout=10)
@@ -233,7 +248,26 @@ try:
         restored = run(['opencode', 'session', 'export', oc_id])
         assert 'updated native question' in restored and 'forced-import-failure' not in restored
         assert not list((root / 'data/xses/pending-imports').glob('*/journal.json'))
-    run([binary, "clean", "--all"])
+    if '--ui' in sys.argv:
+        from native_ui import verify
+        verify(root, env, project, records(), codex_binary)
+    # A hidden Claude skill injection must become a completed native read,
+    # retaining historical content without a standalone conversation dump.
+    skill_source = home / '.claude/projects/skill/skill-source.jsonl'
+    skill_source.parent.mkdir(parents=True)
+    skill_body = 'Base directory for this skill: ' + str(project) + '\n# Skill instructions\nPreserve historical skill context.'
+    skill_source.write_text(''.join(json.dumps(row)+'\n' for row in [
+        {'type':'user', 'cwd':str(project), 'message':{'role':'user','content':'skill metadata check'}},
+        {'type':'user', 'isMeta':True, 'message':{'role':'user','content':skill_body}},
+        {'type':'assistant', 'message':{'role':'assistant','content':'skill metadata answer'}}]))
+    run([binary, 'sync', '--from', 'claude', '--to', 'pi'])
+    skill_import = next(paths[0] for key, paths in records() if key.startswith('pi|claude|skill-source|'))
+    imported = [json.loads(line) for line in Path(skill_import).read_text().splitlines()]
+    assert any(row.get('message',{}).get('role')=='toolResult' and any(block.get('text') == skill_body for block in row.get('message',{}).get('content',[]) if isinstance(block,dict)) for row in imported)
+    assert not any(row.get('message',{}).get('role') in ['user','assistant'] and any(block.get('text') == skill_body for block in row.get('message',{}).get('content',[]) if isinstance(block,dict)) for row in imported)
+    # Native UIs may append resume/context records even without a prompt.
+    # Only these disposable UI fixtures opt into forced cleanup.
+    run([binary, "clean", "--all", *(["--force"] if "--ui" in sys.argv else [])])
     assert json.loads(run(["opencode", "session", "list", "--format", "json", *list_flags]) or "[]") == []
     assert source.exists() and not Path(pi_import).exists() and not Path(codex_import).exists()
     print("PASS: native Pi export, OpenCode replacement/rollback/cleanup, Codex thread/read and killed-publication recovery")

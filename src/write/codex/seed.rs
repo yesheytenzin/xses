@@ -117,7 +117,14 @@ pub(super) fn seed_codex_history(
         turns.push((0, items.len()));
     }
     let mut turn_ids: Vec<String> = Vec::new();
-    for (t, (start, _end)) in turns.iter().enumerate() {
+    for (t, (start, end)) in turns.iter().enumerate() {
+        // Turn wall-clock fields use seconds; item created_at_ms uses milliseconds.
+        let started = items[*start].ts.unwrap_or(session.created).timestamp();
+        let completed = items[end - 1]
+            .ts
+            .unwrap_or(session.created)
+            .timestamp()
+            .max(started);
         // ordinal of the first item in this turn (meta=0, turn_context=1)
         let ord = (start + 2) as u64;
         let turn_id = format!("{sid}-t{t:04}");
@@ -132,7 +139,7 @@ pub(super) fn seed_codex_history(
             return false;
         };
         stmts.push(format!(
-            "INSERT OR REPLACE INTO thread_turns (thread_id, turn_id, rollout_ordinal, status, started_at, completed_at, duration_ms, first_user_item_id, final_agent_item_id, rollout_end_ordinal) VALUES ({sid_q}, {turn_q}, {ord}, 'completed', {ms}, {ms}, 0, {first_q}, NULL, {ord});"
+            "INSERT OR REPLACE INTO thread_turns (thread_id, turn_id, rollout_ordinal, status, started_at, completed_at, duration_ms, first_user_item_id, final_agent_item_id, rollout_end_ordinal) VALUES ({sid_q}, {turn_q}, {ord}, 'completed', {started}, {completed}, 0, {first_q}, NULL, {ord});"
         ));
         turn_ids.push(turn_id);
     }

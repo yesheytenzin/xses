@@ -11,6 +11,7 @@ use std::path::PathBuf;
 /// views have their own item types, which is what its TUI draws.
 pub(super) enum ThreadTool {
     Shell(String),
+    Read(PathBuf),
     FileChange(Vec<Value>),
     Mcp { server: String, tool: String },
     ImageView(PathBuf),
@@ -43,6 +44,11 @@ pub(super) fn classify_tool(name: &str, args: &str) -> ThreadTool {
                 .map(str::to_string)
         })
     };
+    if matches!(lower.as_str(), "read" | "read_file" | "readfile") {
+        if let Some(path) = field(&["path", "file_path", "filePath"]) {
+            return ThreadTool::Read(PathBuf::from(path));
+        }
+    }
     if matches!(
         lower.as_str(),
         "view_image" | "viewimage" | "image_view" | "read_image"

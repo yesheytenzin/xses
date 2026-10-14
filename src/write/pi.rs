@@ -4,8 +4,8 @@
 //! `image`), `toolResult` messages carrying their `toolCallId`, compaction
 //! records, and per-message usage so the TUI's stats still render.
 use super::{
-    args_json, fallback_call_id, fallback_text, group_role, import_id, iso, iso_stamp,
-    next_row_time, push, role_str, synth_id, usage_of, IMPORT_NOTE,
+    fallback_call_id, fallback_text, group_role, import_id, iso, iso_stamp, next_row_time, push,
+    role_str, synth_id, usage_of, IMPORT_NOTE,
 };
 use crate::canonical::{Block, CanonicalSession, Role};
 use crate::model::Tool;
@@ -244,8 +244,8 @@ fn write_at(
                     parts.push(json!({
                         "type": "toolCall",
                         "id": fallback_call_id(&mut ids, call_id, &mut minted, name),
-                        "name": name,
-                        "arguments": args_json(args),
+                        "name": super::tools::native_tool(if is_omp { Tool::Omp } else { Tool::Pi }, name, args).0,
+                        "arguments": super::tools::native_tool(if is_omp { Tool::Omp } else { Tool::Pi }, name, args).1,
                     }));
                 }
                 Block::ToolResult {
@@ -257,7 +257,7 @@ fn write_at(
                 } => {
                     results.push(json!({
                         "toolCallId": fallback_call_id(&mut ids, call_id, &mut minted, name),
-                        "toolName": name,
+                        "toolName": super::tools::native_tool(if is_omp { Tool::Omp } else { Tool::Pi }, name, "{}").0,
                         "isError": is_error,
                         // Intentional fallback: sources without a duration
                         // read as instant, not unknown.

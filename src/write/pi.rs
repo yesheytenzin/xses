@@ -20,6 +20,15 @@ pub(super) fn write(
     let Some(home) = dirs::home_dir() else {
         return vec![None, None];
     };
+    write_at(target, session, revision, &home)
+}
+
+fn write_at(
+    target: Tool,
+    session: &CanonicalSession,
+    revision: Option<&str>,
+    home: &std::path::Path,
+) -> Vec<Option<PathBuf>> {
     let is_omp = matches!(target, Tool::Omp);
     // pi wraps the absolute path slug; omp strips home then wraps segments.
     // The store is chosen by the TARGET, not the source.
@@ -35,7 +44,7 @@ pub(super) fn write(
         _ => (home.join(".omp/agent/sessions"), {
             let rel = session
                 .cwd
-                .strip_prefix(&home)
+                .strip_prefix(home)
                 .map(|r| r.to_string_lossy().to_string())
                 .unwrap_or_else(|_| session.cwd.to_string_lossy().to_string());
             format!("-{}", rel.trim_start_matches('/').replace('/', "-"))
@@ -590,7 +599,7 @@ mod sidecar_tests {
     fn omp_imports_carry_a_provenance_sidecar() {
         let home = scratch_home();
         let dir = &home.dir;
-        let out = write(Tool::Omp, &omp_session(), Some("m11"));
+        let out = write_at(Tool::Omp, &omp_session(), Some("m11"), &home.dir);
         assert_eq!(out.len(), 2, "session + sidecar");
         let session = out[0].clone().expect("session written");
         let sidecar = out[1].clone().expect("sidecar written");
@@ -646,7 +655,7 @@ mod sidecar_tests {
             },
         });
         for (target, keep) in [(Tool::Pi, false), (Tool::Omp, true)] {
-            let out = write(target, &session, Some("m11"));
+            let out = write_at(target, &session, Some("m11"), &home.dir);
             let path = out[0].clone().expect("session written");
             let mut assistants = 0;
             for line in std::fs::read_to_string(&path).unwrap().lines() {
@@ -678,14 +687,14 @@ mod sidecar_tests {
         let dir = &home.dir;
         let session = omp_session();
         // First write lands session + sidecar.
-        let out = write(Tool::Omp, &session, Some("m11"));
+        let out = write_at(Tool::Omp, &session, Some("m11"), &home.dir);
         let path = out[0].clone().expect("session written");
         // Lose the sidecar and the markers: what remains reads native.
         std::fs::remove_file(import_sidecar(&path)).ok();
         // Rewriting our own unmarked-shaped copy must fail loudly, and the
         // file must be byte-identical afterwards — never adopted.
         let before = std::fs::read(&path).unwrap();
-        let retry = write(Tool::Omp, &session, Some("m11"));
+        let retry = write_at(Tool::Omp, &session, Some("m11"), &home.dir);
         assert!(
             retry.iter().all(|o| o.is_none()),
             "unmarked file must be refused"

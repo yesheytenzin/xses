@@ -56,7 +56,11 @@ impl Active {
                     .directory
                     .join(format!("file-{}", self.journal.files.len()));
                 std::fs::copy(path, &backup)?;
-                std::fs::File::open(&backup)?.sync_all()?;
+                // FlushFileBuffers on Windows requires a writable handle.
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .open(&backup)?
+                    .sync_all()?;
                 Some(backup)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,

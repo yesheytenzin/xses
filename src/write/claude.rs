@@ -12,15 +12,29 @@ use serde_json::{json, Value};
 use std::path::PathBuf;
 
 pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Vec<Option<PathBuf>> {
-    let Some((rollout, sidecar)) = write_inner(session, revision) else {
+    let Some(home) = dirs::home_dir() else {
+        return vec![None];
+    };
+    write_at(session, revision, &home)
+}
+
+fn write_at(
+    session: &CanonicalSession,
+    revision: Option<&str>,
+    home: &std::path::Path,
+) -> Vec<Option<PathBuf>> {
+    let Some((rollout, sidecar)) = write_inner(session, revision, home) else {
         return vec![None];
     };
     // The sidecar is a second artifact clean() must remove.
     vec![Some(rollout), Some(sidecar)]
 }
 
-fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(PathBuf, PathBuf)> {
-    let home = dirs::home_dir()?;
+fn write_inner(
+    session: &CanonicalSession,
+    revision: Option<&str>,
+    home: &std::path::Path,
+) -> Option<(PathBuf, PathBuf)> {
     let slug = session.cwd.to_string_lossy().replace('/', "-");
     let sid = synth_id(session.tool, &super::artifact_key(session, revision));
     // Claude's /resume only lists files whose name == the session UUID. Its row
@@ -300,7 +314,7 @@ mod tests {
         // Keep failure journals out of the real journal (see issues::path).
         let previous_issues = std::env::var_os("XSES_ISSUES_FILE");
         std::env::set_var("XSES_ISSUES_FILE", scratch.join("issues.jsonl"));
-        let produced = write(&session, None);
+        let produced = write_at(&session, None, &scratch);
         match previous {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),
@@ -394,7 +408,7 @@ mod tests {
         // Keep failure journals out of the real journal (see issues::path).
         let previous_issues = std::env::var_os("XSES_ISSUES_FILE");
         std::env::set_var("XSES_ISSUES_FILE", scratch.join("issues.jsonl"));
-        let produced = write(&session, None);
+        let produced = write_at(&session, None, &scratch);
         match previous {
             Some(home) => std::env::set_var("HOME", home),
             None => std::env::remove_var("HOME"),

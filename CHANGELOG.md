@@ -1,6 +1,13 @@
 # Changelog
 
-## 0.8.0
+## 0.8.1
+
+This release includes the changes prepared for 0.8.0, whose publication was
+stopped when Windows CI detected a recovery failure.
+
+- Fix Windows import backup flushing by opening the backup with write access.
+- Isolate writer tests with explicit scratch roots on every platform.
+
 
 - Sync continued imported sessions back as separate branches while preserving
   originals; ignore untouched copies to prevent sync loops. Continuation

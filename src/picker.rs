@@ -21,20 +21,8 @@ pub fn resume_argv(s: &Session) -> Vec<String> {
     match s.tool {
         Tool::Claude => vec!["claude".into(), "--resume".into(), id],
         Tool::Codex => vec!["codex".into(), "resume".into(), id],
-        Tool::Pi => vec![
-            "pi".into(),
-            "--session".into(),
-            id,
-            "--cwd".into(),
-            s.cwd.to_string_lossy().to_string(),
-        ],
-        Tool::Omp => vec![
-            "omp".into(),
-            "-r".into(),
-            id,
-            "--cwd".into(),
-            s.cwd.to_string_lossy().to_string(),
-        ],
+        Tool::Pi => vec!["pi".into(), "--session".into(), id],
+        Tool::Omp => vec!["omp".into(), "-r".into(), id],
         Tool::Opencode => vec![
             "opencode".into(),
             "-s".into(),

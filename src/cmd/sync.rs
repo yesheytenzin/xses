@@ -22,6 +22,7 @@ pub struct Args {
 }
 
 pub fn run(args: Args) -> anyhow::Result<()> {
+    let _operation = sync::prepare(args.dry_run)?;
     let Args {
         items,
         from,
@@ -45,9 +46,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         sessions.retain(|s| s.noise.is_none());
     }
     // Sources: explicit refs select; empty refs mean the newest per tool.
-    // Explicit picks always resolve (even to imports); bulk mode skips
-    // imports unless asked, to prevent echo loops.
+    // Explicit picks always resolve. Bulk mode also includes imported copies
+    // with new local user turns, but excludes untouched copies to prevent echoes.
     let has_refs = !plan.refs.is_empty();
+    let mut selection_failed = false;
     let sources: Vec<Session> = if has_refs {
         let mut picked = Vec::new();
         for r in plan.refs.clone() {
@@ -55,9 +57,31 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
         dedupe(picked)
     } else {
-        let mut bulk = select_bulk_sources(sessions, all, num, include_imports)?;
-        bulk.retain(|s| include_imports || !s.is_import);
-        bulk
+        let mut eligible = Vec::new();
+        let mut legacy = 0;
+        for session in sessions {
+            if include_imports || !session.is_import {
+                eligible.push(session);
+            } else {
+                match crate::continuations::status(&session) {
+                    Ok(Some(true)) => eligible.push(session),
+                    Ok(Some(false)) => {}
+                    Ok(None) => legacy += 1,
+                    Err(e) => {
+                        let detail = format!("{}: {e:#}", session.short());
+                        if !dry_run {
+                            crate::issues::record("baseline-unreadable", &session.id, &detail);
+                        }
+                        eprintln!("preserved {detail}");
+                        selection_failed = true;
+                    }
+                }
+            }
+        }
+        if legacy > 0 {
+            eprintln!("note: {legacy} older imports have no continuation baseline; sync a continued session by ID explicitly");
+        }
+        select_bulk_sources(eligible, all, num, true)?
     };
     let mut tool_targets = refs::tool_targets(&plan.dests);
     let format_targets = refs::format_targets(&plan.dests);
@@ -79,7 +103,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
         }
         return Ok(());
     }
-    let mut import_failed = false;
+    let mut import_failed = selection_failed;
     if !tool_targets.is_empty() {
         // explicit refs bypass the import filter (bulk mode keeps it)
         let progress = if dry_run {
@@ -91,12 +115,12 @@ pub fn run(args: Args) -> anyhow::Result<()> {
             &tool_targets,
             &sources,
             dry_run,
-            include_imports || has_refs,
+            true, // sources already selected above, including continued copies
             turn_scope,
             &progress,
         )?;
         progress.finish();
-        import_failed = report.targets.iter().any(|t| !t.failed.is_empty());
+        import_failed |= report.targets.iter().any(|t| !t.failed.is_empty());
         let (written, skipped, loss) = report.totals();
         println!(
             "{}: {} source sessions across {} targets → {} written, {} skipped | fidelity: {} preserved, {} normalized, {} downgraded, {} dropped",
@@ -170,7 +194,7 @@ pub fn run(args: Args) -> anyhow::Result<()> {
     }
     anyhow::ensure!(
         !import_failed,
-        "one or more imports failed; previous imports were retained"
+        "one or more imports failed; run xses doctor for details"
     );
     Ok(())
 }

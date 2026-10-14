@@ -89,10 +89,10 @@ impl Index {
         &self.records
     }
 
-    pub fn remove_sources(&mut self, only: Option<&HashSet<(Tool, String)>>) -> Result<()> {
-        self.records.retain(|r| {
-            only.is_some_and(|selected| !source_of(&r.key).is_some_and(|s| selected.contains(&s)))
-        });
+    pub fn remove_artifacts(&mut self, removed: &[PathBuf]) -> Result<()> {
+        let removed: HashSet<_> = removed.iter().collect();
+        self.records
+            .retain(|r| !r.paths.iter().all(|p| removed.contains(p)));
         self.save()
     }
 
@@ -137,7 +137,11 @@ impl Index {
                 .filter(|p| !new.paths.contains(p))
                 .cloned()
                 .collect();
-            match crate::sync::retire_artifacts(&obsolete) {
+            let target = Tool::parse(old.key.split('|').next().unwrap_or_default())
+                .context("invalid target in sync index")?;
+            match crate::continuations::protect(target, &obsolete)
+                .and_then(|()| crate::sync::retire_artifacts_preserving(&obsolete, &new.paths))
+            {
                 Ok(()) => {
                     retired.insert(i);
                 }
@@ -176,7 +180,7 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = std::env::temp_dir().join(format!("xses-index-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let old = dir.join("old.jsonl");
+        let old = dir.join("old.txt");
         let new = dir.join("new.jsonl");
         // Marked: provably an import, so retirement proceeds.
         std::fs::write(&old, b"{\"xses\":{\"source\":\"claude\"}}\n").unwrap();

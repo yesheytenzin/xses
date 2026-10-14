@@ -9,7 +9,6 @@
 use super::{iso, iso_stamp, manifest, push, synth_id};
 use crate::canonical::CanonicalSession;
 use serde_json::{json, Value};
-use std::fs;
 use std::path::PathBuf;
 
 /// One rollout record plus (optionally) the projection row that mirrors it.
@@ -39,6 +38,10 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
             sid
         ));
     let ts = iso(&session.created);
+    if let Err(e) = seed::backup_thread(&home, &sid) {
+        super::journal_failure(&sid, &e.to_string());
+        return None;
+    }
     let items = rollout_items(session);
     let mut buf = Vec::new();
     // codex's thread/read rejects a rollout whose first line isn't a fully
@@ -110,15 +113,11 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
     // register the drop-in file so `codex resume` sees it.
     let title = super::title_for(session);
     if !register_codex_thread(&home, &sid, &target, session, &title) {
-        remove_codex_metadata(&home, &sid);
-        let _ = fs::remove_file(&target);
         return None;
     }
     // the TUI transcript renders from `thread_history_1.sqlite` projections,
     // never built for drop-in rollouts — seed them so resume shows content.
     if !seed_codex_history(&home, &sid, &items, session, buf.len() as u64) {
-        remove_codex_metadata(&home, &sid);
-        let _ = fs::remove_file(&target);
         return None;
     }
     Some(target)
@@ -130,5 +129,6 @@ mod seed;
 mod tools;
 
 use rollout::rollout_items;
+pub(crate) use seed::registered;
 pub(crate) use seed::retire_codex;
-use seed::{local_creator_ids, register_codex_thread, remove_codex_metadata, seed_codex_history};
+use seed::{local_creator_ids, register_codex_thread, seed_codex_history};

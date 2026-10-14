@@ -355,6 +355,10 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         import_id(session.tool, &super::artifact_key(session, revision))
     );
     let now_ms = chrono::Utc::now().timestamp_millis();
+    if let Err(e) = crate::publication::track_opencode(&ses, &session.cwd) {
+        super::journal_failure(&ses, &e.to_string());
+        return None;
+    }
     let model = local_opencode_model();
     let provider_id = model
         .get("providerID")
@@ -512,7 +516,11 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         // Ids are deterministic, so a re-import of an unchanged session is
         // already there: drop it and import fresh so a mapping bump or new
         // turns actually replace the stored copy.
-        if stdout.contains("already exists") {
+        let conflict = stdout.contains("already exists")
+            || out
+                .as_ref()
+                .is_ok_and(|o| String::from_utf8_lossy(&o.stderr).contains("already exists"));
+        if conflict {
             if !replaced {
                 let mut del = session_cmd();
                 del.arg("delete").arg(&ses);

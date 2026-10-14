@@ -7,14 +7,15 @@ use crate::scope;
 use crate::sync;
 use std::collections::HashSet;
 
-pub fn run(all: bool, dry_run: bool) -> anyhow::Result<()> {
+pub fn run(all: bool, dry_run: bool, force: bool) -> anyhow::Result<()> {
+    let _operation = sync::prepare(dry_run)?;
     let progress = if dry_run {
         crate::progress::Progress::disabled()
     } else {
         crate::progress::Progress::new(0)
     };
     let removed = if all {
-        sync::clean(dry_run, &progress)?
+        sync::clean(dry_run, force, &progress)?
     } else {
         let Some(selected) = newest_synced_here()? else {
             println!(
@@ -23,7 +24,7 @@ pub fn run(all: bool, dry_run: bool) -> anyhow::Result<()> {
             );
             return Ok(());
         };
-        sync::clean_selected(dry_run, &selected, &progress)?
+        sync::clean_selected(dry_run, force, &selected, &progress)?
     };
     progress.finish();
     println!(
@@ -42,11 +43,7 @@ fn newest_synced_here() -> anyhow::Result<Option<HashSet<(Tool, String)>>> {
         return Ok(None);
     }
     let sessions = scope::load(false, true)?;
-    let here = |tool: Tool, id: &str| {
-        sessions
-            .iter()
-            .any(|s| s.tool == tool && s.id == id && !s.is_import)
-    };
+    let here = |tool: Tool, id: &str| sessions.iter().any(|s| s.tool == tool && s.id == id);
     Ok(recorded
         .into_iter()
         .find(|(tool, id)| here(*tool, id))

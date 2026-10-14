@@ -227,9 +227,6 @@ fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(Pa
         }
     };
     if !super::atomic_write_journaled(&sidecar, &sidecar_bytes, &subject) {
-        if revision.is_some() {
-            let _ = std::fs::remove_file(&target);
-        }
         return None;
     }
     Some((target, sidecar))

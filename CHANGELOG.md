@@ -1,6 +1,28 @@
 # Changelog
 
-## Unreleased
+## 0.8.0
+
+- Sync continued imported sessions back as separate branches while preserving
+  originals; ignore untouched copies to prevent sync loops. Continuation
+  detection includes assistant, image, and tool activity.
+- Preserve changed imports and imports with missing or invalid baselines during
+  replacement and cleanup. `clean --force` explicitly removes protected copies.
+- Recover interrupted imports with durable undo journals, restoring native files
+  and database records. Hold the operation lock across discovery and writes.
+- Repair missing artifacts and native registrations, validate provenance before
+  cleanup, and preserve healthy progress when individual sessions fail.
+- Cache scoped file scans and OpenCode database counts, invalidate on database
+  and WAL changes, and bound snapshot batches and child-process output.
+- Support OpenCode v1-only, v2-only, and mixed databases, preferring v2 records
+  when IDs overlap. Preserve agent title prefixes and handle import conflicts.
+- Resume picker selections in their original directory and propagate native
+  agent failures. Fix Codex projected transcripts and Pi import routing.
+- Mapping 14 refreshes imports; older copies without trustworthy continuation
+  baselines are preserved. Pause native target work while replacing imports.
+- Add cross-platform CI and CLI safety checks. Fix release checksum filenames
+  and preserve every platform binary when generating build attestations.
+
+### Additional fixes since 0.7.2
 
 - Tech-debt paydown (TODO.md, all 10 items): split `write/codex.rs` into
   `write/codex/{mod,rollout,roller,tools,seed}.rs`; central SQLite quoting

@@ -12,6 +12,7 @@ mod export;
 mod opencode;
 mod pi;
 
+pub(crate) use codex::registered as codex_registered;
 pub(crate) use codex::retire_codex;
 pub(crate) use export::export_trace;
 
@@ -30,7 +31,7 @@ pub(super) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Mapping version recorded in every import. Bump it whenever the writers
 /// change what they emit, so `sync` can re-import and upgrade old copies.
-pub(crate) const MAPPING: u32 = 13;
+pub(crate) const MAPPING: u32 = 14;
 
 /// Shown as a system message at the top of every import: the transcript that
 /// follows already ran somewhere else and must not be treated as live state.
@@ -221,6 +222,7 @@ pub fn session_revision(
     session: &CanonicalSession,
     revision: &str,
 ) -> Result<(Vec<PathBuf>, LossReport)> {
+    let publication = crate::publication::Publication::begin()?;
     let (_, report) = session.transfer_summary();
     let files = match target {
         Tool::Pi | Tool::Omp => pi::write(target, session, Some(revision)),
@@ -234,7 +236,10 @@ pub fn session_revision(
             target.as_str()
         );
     }
-    Ok((files.into_iter().flatten().collect(), report))
+    let files: Vec<_> = files.into_iter().flatten().collect();
+    crate::continuations::record(target, &files, session)?;
+    publication.commit()?;
+    Ok((files, report))
 }
 
 /// Stable artifact identity for one session in one target: the mapping
@@ -308,7 +313,9 @@ pub(super) fn write_import_sidecar(
 /// path is native: adopting it would corrupt the store and poison the
 /// index with a record pointing at a native file.
 pub(super) fn target_is_ours(path: &Path) -> bool {
-    crate::sync::first_line_has_marker(path) || sidecar_provenance(path).is_some()
+    crate::sync::first_line_has_marker(path)
+        || sidecar_provenance(path).is_some()
+        || crate::continuations::known_import(path)
 }
 /// Import artifact id for a source session; import filenames and opencode
 /// slugs embed it, so `clean` can map artifacts back to their session.
@@ -376,19 +383,6 @@ pub(super) fn role_str(role: Role) -> &'static str {
     }
 }
 
-pub(super) fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
-    // First backup wins: the `.bak` keeps the pre-xses original for human
-    // recovery, not a rotation — overwriting it on every re-import would
-    // leave only the previous import behind when it is needed most.
-    if path.exists() {
-        let bak = path.with_extension("bak");
-        if !bak.exists() {
-            fs::copy(path, &bak)?;
-        }
-    }
-    crate::storage::atomic_write(path, bytes)
-}
-
 /// Assigns ids a target will accept, keeping a call and its result on the same
 /// value. Anthropic validates `tool_use.id` against `^[A-Za-z0-9_-]+$` (a 400
 /// otherwise), and source ids can carry more — codex/omp compose
@@ -443,7 +437,32 @@ fn safe_id(id: &str) -> String {
 /// produced" with `None`, so without this the OS error would vanish and
 /// `doctor` could only say "target wrote nothing".
 pub(super) fn atomic_write_journaled(path: &Path, bytes: &[u8], subject: &str) -> bool {
-    match atomic_write(path, bytes) {
+    if crate::publication::is_active() && crate::continuations::is_transcript(path) && path.exists()
+    {
+        let home = dirs::home_dir().unwrap_or_default();
+        let tool = if path.starts_with(home.join(".codex")) {
+            Tool::Codex
+        } else if path.starts_with(home.join(".omp")) {
+            Tool::Omp
+        } else if path.starts_with(home.join(".pi")) {
+            Tool::Pi
+        } else {
+            Tool::Claude
+        };
+        if let Err(e) = crate::continuations::protect(tool, &[path.into()]) {
+            journal_failure(subject, &e.to_string());
+            return false;
+        }
+    }
+    if path.extension().is_some_and(|ext| ext == "jsonl") && path.exists() && !target_is_ours(path)
+    {
+        journal_failure(
+            subject,
+            &format!("refusing to overwrite unmarked file {}", path.display()),
+        );
+        return false;
+    }
+    match crate::publication::write(path, bytes) {
         Ok(()) => true,
         Err(e) => {
             crate::issues::record("write-failed", subject, &format!("{}: {e}", path.display()));

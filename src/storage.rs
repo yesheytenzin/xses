@@ -43,11 +43,14 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let (temporary, mut file) = loop {
         let n = NEXT_TEMP.fetch_add(1, Ordering::Relaxed);
         let temporary = parent.join(format!(".xses-{}-{n}.tmp", std::process::id()));
-        match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
         {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&temporary) {
             Ok(file) => break (Temporary(temporary), file),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(e.into()),

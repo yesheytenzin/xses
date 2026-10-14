@@ -22,6 +22,53 @@ fn qid(id: &str, sid: &str) -> Option<String> {
 }
 
 /// Seed `thread_turns` + `thread_items` + projection state for an imported
+pub(super) fn backup_thread(home: &std::path::Path, sid: &str) -> anyhow::Result<()> {
+    let db = codex_state_db(home)
+        .ok_or_else(|| anyhow::anyhow!("Codex state database is not initialized"))?;
+    crate::publication::track_rows(&db, "threads", "id", sid)?;
+    let history = home.join(".codex/thread_history_1.sqlite");
+    for table in [
+        "thread_turns",
+        "thread_items",
+        "thread_history_projection_state",
+    ] {
+        crate::publication::track_rows(&history, table, "thread_id", sid)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn registered(path: &std::path::Path) -> anyhow::Result<bool> {
+    let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("no home dir"))?;
+    let Some(db) = codex_state_db(&home) else {
+        return Ok(false);
+    };
+    let name = path
+        .file_stem()
+        .and_then(|p| p.to_str())
+        .unwrap_or_default();
+    let Some(sid) = name.get(name.len().saturating_sub(36)..) else {
+        return Ok(false);
+    };
+    let sid = crate::proc::sql_quote_id(sid)?;
+    let found = crate::proc::sqlite_text(
+        &db,
+        &format!("SELECT 1 FROM threads WHERE id={sid};"),
+        std::time::Duration::from_secs(10),
+        "Codex registration check",
+    )?;
+    let history = home.join(".codex/thread_history_1.sqlite");
+    if found != "1" || !history.is_file() {
+        return Ok(false);
+    }
+    Ok(crate::proc::sqlite_text(
+        &history,
+        &format!("SELECT 1 FROM thread_history_projection_state WHERE thread_id={sid};"),
+        std::time::Duration::from_secs(10),
+        "Codex projection check",
+    )? == "1")
+}
+
+/// Seed `thread_turns` + `thread_items` + projection state for an imported
 /// rollout. Shapes mirror native rows (verified by diff): one turn per user
 /// message, one projection item per rollout item, state pointing at
 /// end-of-file so the recorder continues appending cleanly.
@@ -40,7 +87,14 @@ pub(super) fn seed_codex_history(
     let Some(sid_q) = qid(sid, sid) else {
         return false;
     };
-    let mut stmts: Vec<String> = Vec::new();
+    let mut stmts: Vec<String> = [
+        "thread_items",
+        "thread_turns",
+        "thread_history_projection_state",
+    ]
+    .into_iter()
+    .map(|table| format!("DELETE FROM {table} WHERE thread_id={sid_q};"))
+    .collect();
     // group items into turns: each user message starts a turn
     let mut turns: Vec<(usize, usize)> = Vec::new();
     let mut cur: Option<usize> = None;
@@ -214,29 +268,6 @@ pub(super) fn register_codex_thread(
         "codex thread registration",
     )
     .is_ok()
-}
-
-pub(super) fn remove_codex_metadata(home: &std::path::Path, sid: &str) {
-    // Best effort: failures here are retried via the index on the next sync.
-    let timeout = std::time::Duration::from_secs(10);
-    if let Some(db) = codex_state_db(home) {
-        // Best effort: failures here are retried via the index on the next sync.
-        if let Ok(sid_sql) = crate::proc::sql_quote_id(sid) {
-            let sql = format!("DELETE FROM threads WHERE id = {sid_sql};");
-            crate::proc::sqlite_exec(&db, &sql, timeout, "codex metadata removal").ok();
-        }
-    }
-    let hist = home.join(".codex/thread_history_1.sqlite");
-    if hist.exists() {
-        if let Ok(sid_sql) = crate::proc::sql_quote_id(sid) {
-            let sql = format!(
-                "DELETE FROM thread_items WHERE thread_id = {sid_sql}; \
-                 DELETE FROM thread_turns WHERE thread_id = {sid_sql}; \
-                 DELETE FROM thread_history_projection_state WHERE thread_id = {sid_sql};"
-            );
-            crate::proc::sqlite_exec(&hist, &sql, timeout, "codex history removal").ok();
-        }
-    }
 }
 
 /// Remove an obsolete generation's picker and projection entries. The index

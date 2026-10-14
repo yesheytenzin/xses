@@ -104,7 +104,8 @@ pub fn tool_targets(dests: &[Dest]) -> Vec<Tool> {
             Dest::Format(_) => None,
         })
         .collect();
-    out.dedup();
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|tool| seen.insert(*tool));
     out
 }
 
@@ -116,7 +117,8 @@ pub fn format_targets(dests: &[Dest]) -> Vec<&'static str> {
             Dest::Tool(_) => None,
         })
         .collect();
-    out.dedup();
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|format| seen.insert(*format));
     out
 }
 

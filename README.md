@@ -41,8 +41,32 @@ xses doctor                   # installed stores, index, newest failures
 `sync` tokens are destinations (tool names, `sharegpt`, `openai`) or session
 refs (`latest`, `latest:N`, an id prefix); `-n N` moves the newest N sessions
 per source tool (default 1), `--scope N` imports only the trailing N turns,
-`--dry-run` writes nothing, and `--include-imports` re-imports files xses
-itself wrote. A ref-only `sync` is a preview.
+`--dry-run` writes nothing, and `--include-imports` also selects untouched
+imported copies. A ref-only `sync` is a preview.
+
+After you continue an imported copy with new user, assistant, image, or tool activity, ordinary `sync`
+includes it automatically (within the same newest-per-agent limit). It sends
+the full continued transcript back as a separate branch; it never merges into
+or overwrites the original native session. Repeated syncs update that branch
+in place. Untouched returned copies are excluded so history does not echo
+between agents. Titles retain the original `[agent]` prefix.
+
+If a target copy has changed since import, refreshing it fails with a
+`continued copy ... was preserved` message instead of erasing its work. Sync
+that copy by ID to share its branch, then resume the branch you want to use.
+Detection uses native message IDs and semantic block fingerprints, including
+repeated prompts. Title/metadata changes alone do not trigger a return branch,
+but changed history is still protected from replacement. Older user-only
+baselines and imports without a baseline need explicit selection by session ID.
+Sync reports unreadable baselines per session and continues healthy work.
+Mapping 14 creates fresh tracked copies on upgrade; older copies with unknown
+or changed history are retained until you explicitly remove them.
+
+`clean` preserves changed copies and copies with missing or unreadable baselines.
+Use `clean --dry-run` to preview this; `clean --force` explicitly removes these
+copies too. Interrupted import publications recover before the next mutating
+sync or clean. Stop work in a target while replacing it: native agents do not
+participate in xses's operation lock.
 
 Long syncs report progress on stderr — terminals only, silenced by
 `XSES_NO_PROGRESS=1`.
@@ -67,7 +91,9 @@ visible `[gap in imported history: …]` marker. Sessions that were never useful
 transfers per data class is in [FEATURE.md](FEATURE.md).
 
 State lives in `~/.local/share/xses/`: `index.jsonl` (imports and their
-artifacts), `scan-cache-<tool>.json`, `issues.jsonl`. Scan caches are versioned and
+artifacts), scan/count caches, `issues.jsonl`, `import-baselines/` (message IDs
+and fingerprints), and `pending-imports/` (durable recovery journals). Recovery
+backups are removed after successful publication. Scan caches are versioned and
 checkpoint complete JSONL records; unchanged listings do not rewrite them.
 Source-filtered commands only scan the requested stores. 
 Maintainers release with
@@ -84,6 +110,13 @@ Rust 1.89 or newer is required. Run `cargo test --all-targets --locked`,
 PR CI runs these on Linux, macOS, and Windows. On Linux, run the isolated CLI
 regressions with `python3 verify-xses/flows/regression.py target/debug/xses`
 after `cargo build`; Python 3 and `sqlite3` must be on PATH.
+Run `python3 verify-xses/flows/continuations.py target/debug/xses` for continued
+imports, return branches, echo prevention, and conflicting local work in the
+Claude, Codex, Pi, and oh-my-pi file stores.
+Run `python3 verify-xses/flows/safety.py target/debug/xses` for failure injection,
+cleanup ordering, missing artifacts/baselines, and interrupted publication.
+With initialized agent CLIs, `python3 verify-xses/flows/native.py target/debug/xses`
+checks native Pi export, Codex loading, and OpenCode replacement/cleanup.
 
 For repeatable listing timings, build with `cargo build --release --locked`
 and run `python3 verify-xses/flows/benchmark.py`. It reads native stores and

@@ -14,7 +14,7 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-const VERSION: u32 = 1;
+const VERSION: u32 = 2;
 const GUARD_BYTES: u64 = 256;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -39,6 +39,7 @@ struct Stamp {
     created: DateTime<Utc>,
     size: u64,
     identity: String,
+    provenance: Option<(u64, DateTime<Utc>)>,
 }
 impl Stamp {
     fn read(path: &Path) -> Result<Self> {
@@ -57,6 +58,9 @@ impl Stamp {
             created,
             size: md.len(),
             identity,
+            provenance: fs::metadata(path.with_extension("xses.json"))
+                .ok()
+                .and_then(|metadata| Some((metadata.len(), metadata.modified().ok()?.into()))),
         })
     }
 }
@@ -73,6 +77,7 @@ struct State {
     failed: u64,
     imported: bool,
     source: Option<Tool>,
+    created: Option<DateTime<Utc>>,
 }
 
 impl State {
@@ -105,6 +110,14 @@ impl State {
     }
 
     fn record(&mut self, tool: Tool, v: &Value) {
+        if self.created.is_none() {
+            self.created = v
+                .pointer("/payload/timestamp")
+                .or_else(|| v.get("timestamp"))
+                .and_then(Value::as_str)
+                .and_then(|timestamp| DateTime::parse_from_rfc3339(timestamp).ok())
+                .map(|timestamp| timestamp.with_timezone(&Utc));
+        }
         match tool {
             Tool::Claude => self.claude(v),
             Tool::Codex => self.codex(v),
@@ -240,7 +253,7 @@ impl State {
             tool,
             cwd: self.cwd.clone(),
             mtime: stamp.mtime,
-            created: stamp.created,
+            created: self.created.unwrap_or(stamp.created),
             size: stamp.size,
             revision: None,
             messages: self.messages,
@@ -340,19 +353,72 @@ fn summarize(path: &Path, tool: Tool, stamp: Stamp, previous: Option<&Entry>) ->
     })
 }
 
-pub(super) fn scan(tool: Tool, save_cache: bool) -> Result<Vec<Session>> {
+pub(super) fn scan(
+    tool: Tool,
+    cwd_filter: Option<&Path>,
+    save_cache: bool,
+) -> Result<Vec<Session>> {
     let home = dirs::home_dir().context("no home dir")?;
-    let (base, depth) = match tool {
+    let (base, depth): (&str, usize) = match tool {
         Tool::Claude => (".claude/projects", 0),
         Tool::Codex => (".codex/sessions", 4),
         Tool::Pi => (".pi/agent/sessions", 2),
         Tool::Omp => (".omp/agent/sessions", 2),
         Tool::Opencode => unreachable!(),
     };
-    let root = home.join(base);
-    let cache_path = dirs::data_dir()
-        .context("no data dir")?
-        .join(format!("xses/scan-cache-{}.json", tool.as_str()));
+    let mut root = home.join(base);
+    let mut narrowed = false;
+    if let Some(cwd) = cwd_filter.filter(|_| tool != Tool::Codex && root.is_dir()) {
+        // Native project directories encode cwd. Narrow only when the whole
+        // store follows that convention; custom/mixed fixture layouts retain
+        // the complete discovery path rather than hiding sessions.
+        let conventional = fs::read_dir(&root)?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .iter()
+            .all(|e| {
+                if !e.file_type().is_ok_and(|t| t.is_dir()) {
+                    return e.path().extension().is_none_or(|ext| ext != "jsonl");
+                }
+                let name = e.file_name();
+                let name = name.to_string_lossy();
+                if tool == Tool::Pi {
+                    name.starts_with("--") && name.ends_with("--")
+                } else {
+                    name.starts_with('-')
+                }
+            });
+        if conventional {
+            let slug = match tool {
+                Tool::Pi => format!(
+                    "-{}-",
+                    format!("{}/", cwd.to_string_lossy()).replace('/', "-")
+                ),
+                Tool::Omp => format!(
+                    "-{}",
+                    cwd.strip_prefix(&home)
+                        .unwrap_or(cwd)
+                        .to_string_lossy()
+                        .trim_start_matches('/')
+                        .replace('/', "-")
+                ),
+                _ => cwd.to_string_lossy().replace('/', "-"),
+            };
+            root = root.join(slug);
+            narrowed = true;
+        }
+    }
+    let cache_path = dirs::data_dir().context("no data dir")?.join(if narrowed {
+        format!(
+            "xses/scan-cache-{}-{}.json",
+            tool.as_str(),
+            crate::write::import_id_for(
+                tool,
+                &cwd_filter.unwrap_or(Path::new("")).to_string_lossy()
+            )
+        )
+    } else {
+        format!("xses/scan-cache-{}.json", tool.as_str())
+    });
     // A concurrent scanner can proceed read-only. Holding this lock from load
     // through save prevents an older scan from overwriting a newer checkpoint.
     let lock = if save_cache {
@@ -373,7 +439,11 @@ pub(super) fn scan(tool: Tool, save_cache: bool) -> Result<Vec<Session>> {
     let mut sessions = Vec::new();
     if root.is_dir() {
         for entry in walkdir::WalkDir::new(&root)
-            .min_depth(depth)
+            .min_depth(if narrowed {
+                depth.saturating_sub(1)
+            } else {
+                depth
+            })
             .into_iter()
             .filter_entry(|e| !(tool == Tool::Claude && e.file_name() == "subagents"))
         {
@@ -405,8 +475,10 @@ pub(super) fn scan(tool: Tool, save_cache: bool) -> Result<Vec<Session>> {
                     summarize(path, tool, stamp, previous.as_ref())?
                 }
             };
-            if let Some(session) = current.visible.session(tool, path, &current.stamp) {
-                sessions.push(session);
+            if cwd_filter.is_none_or(|cwd| current.visible.cwd == cwd) {
+                if let Some(session) = current.visible.session(tool, path, &current.stamp) {
+                    sessions.push(session);
+                }
             }
             entries.insert(path.to_owned(), current);
         }

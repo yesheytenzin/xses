@@ -6,6 +6,7 @@ use chrono::Utc;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
+pub(crate) mod counts;
 mod files;
 
 pub fn scan_all(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
@@ -20,9 +21,9 @@ pub fn scan_tools(
 ) -> Result<Vec<Session>> {
     let scan = |tool: Tool| {
         if tool == Tool::Opencode {
-            scan_opencode(cwd_filter)
+            scan_opencode(cwd_filter, save_cache)
         } else {
-            files::scan(tool, save_cache)
+            files::scan(tool, cwd_filter, save_cache)
         }
     };
     let mut out = if let [tool] = tools {
@@ -87,9 +88,9 @@ fn looks_like_error(text: &str) -> bool {
 
 fn display_title(tool: Tool, title: &str) -> String {
     let title = shorten(title, 120);
-    let known_agent_prefix = ["claude", "codex", "pi", "omp"]
+    let known_agent_prefix = Tool::all_tools()
         .iter()
-        .any(|agent| title.starts_with(&format!("[{agent}] ")));
+        .any(|agent| title.starts_with(&format!("[{}] ", agent.as_str())));
     if known_agent_prefix {
         return title;
     }
@@ -126,6 +127,30 @@ pub fn opencode_db() -> Option<std::path::PathBuf> {
 }
 
 /// Return OpenCode session IDs xses imported, across both store generations:
+pub(crate) fn opencode_exists(id: &str) -> Result<bool> {
+    let Some(db) = opencode_db() else {
+        return Ok(false);
+    };
+    let id = crate::proc::sql_quote_id(id)?;
+    let (v1, v2) = opencode_generations(&db)?;
+    let mut queries = Vec::new();
+    if v1 {
+        queries.push(format!("SELECT id FROM session WHERE id={id}"));
+    }
+    if v2 {
+        queries.push(format!("SELECT id FROM session_v2 WHERE id={id}"));
+    }
+    let query = queries.join(" UNION ALL ");
+    Ok(!crate::proc::sqlite_text(
+        &db,
+        &query,
+        std::time::Duration::from_secs(10),
+        "OpenCode presence check",
+    )?
+    .is_empty())
+}
+
+/// Return OpenCode session IDs xses imported, across both store generations:
 /// v1 marks them with an `xses-*` slug, v2 with `metadata.xses` (slugs are
 /// server-generated there). The OpenCode CLI list output exposes neither, so
 /// cleanup consults the database directly.
@@ -141,8 +166,13 @@ pub fn opencode_import_ids(only: Option<&HashSet<(Tool, String)>>) -> Result<Has
             "OpenCode import markers",
         )
     };
-    let mut rows = run("SELECT id, slug, NULL AS src, NULL AS src_id FROM session WHERE slug LIKE 'xses-%' OR slug LIKE 'sessionizer-%';")?;
-    if opencode_has_v2(&db) {
+    let (v1, v2) = opencode_generations(&db)?;
+    let mut rows = if v1 {
+        run("SELECT id, slug, NULL AS src, NULL AS src_id FROM session WHERE slug LIKE 'xses-%' OR slug LIKE 'sessionizer-%';")?
+    } else {
+        Vec::new()
+    };
+    if v2 {
         // The id is deterministic (`ses_` + import hash), so v2 rows can be
         // matched without trusting the editable title.
         rows.extend(run("SELECT id, slug, json_extract(metadata,'$.xses.source') AS src, json_extract(metadata,'$.xses.srcId') AS src_id FROM session_v2 WHERE json_extract(metadata,'$.xses.srcId') IS NOT NULL;")?);
@@ -182,10 +212,36 @@ pub fn opencode_import_ids(only: Option<&HashSet<(Tool, String)>>) -> Result<Has
 /// hidden. Both store generations are read: v1 (`session`/`message`) and v2
 /// (`session_v2`/`session_message`) — v2 no longer lists v1 rows, but they
 /// are still real sessions xses may have written.
-fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
+fn scan_opencode(cwd_filter: Option<&Path>, save_cache: bool) -> Result<Vec<Session>> {
     let Some(db) = opencode_db() else {
         return Ok(vec![]);
     };
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Cached {
+        version: u32,
+        database: std::path::PathBuf,
+        scope: Option<std::path::PathBuf>,
+        stamp: Vec<Option<(u64, u64)>>,
+        sessions: Vec<Session>,
+    }
+    let before = counts::stamp(&db)?;
+    let scope = cwd_filter.map(Path::to_path_buf);
+    let cache = crate::index::path()?.with_file_name(format!(
+        "opencode-scan-{}.json",
+        crate::write::import_id_for(Tool::Opencode, &format!("{}:{scope:?}", db.display()))
+    ));
+    if let Some(cached) = std::fs::read(&cache)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Cached>(&bytes).ok())
+    {
+        if cached.version == 2
+            && cached.database == db
+            && cached.scope == scope
+            && cached.stamp == before
+        {
+            return Ok(cached.sessions);
+        }
+    }
     let condition = match cwd_filter {
         Some(cwd) => format!(
             "s.directory = {}",
@@ -194,8 +250,10 @@ fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
         None => "s.time_archived IS NULL AND (s.parent_id IS NULL OR s.parent_id = '')".into(),
     };
     let mut out = Vec::new();
+    let (v1, v2) = opencode_generations(&db)?;
     // v1 generation: message roles live in `message.data`, parts aside.
-    out.extend(opencode_scan_generation(
+    if v1 {
+        out.extend(opencode_scan_generation(
         &db,
         &format!("SELECT s.id, s.slug, s.title, s.directory, s.time_created AS created,
         MAX(s.time_updated, COALESCE(MAX(m.time_updated), 0)) AS updated,
@@ -207,11 +265,12 @@ fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
         FROM session s LEFT JOIN message m ON m.session_id=s.id
         WHERE {condition} GROUP BY s.id;"),
     )?);
+    }
     // v2 generation: message types live in a `type` column with inline
     // content; provenance rides in `session.metadata.xses` (the server
     // regenerates slugs on import, so the v1 slug marker cannot survive).
-    if opencode_has_v2(&db) {
-        out.extend(opencode_scan_generation(
+    if v2 {
+        let newer = opencode_scan_generation(
             &db,
             &format!("SELECT s.id, s.slug, s.title, s.directory, s.time_created AS created,
             MAX(s.time_updated, COALESCE(MAX(m.time_updated), 0)) AS updated,
@@ -222,7 +281,26 @@ fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
             json_extract(s.metadata,'$.xses.srcId') AS xses_src
             FROM session_v2 s LEFT JOIN session_message m ON m.session_id=s.id
             WHERE {condition} GROUP BY s.id;"),
-        )?);
+        )?;
+        let ids: HashSet<_> = newer.iter().map(|s| s.id.as_str()).collect();
+        out.retain(|s| !ids.contains(s.id.as_str()));
+        out.extend(newer);
+    }
+    if save_cache && before == counts::stamp(&db)? {
+        let cached = Cached {
+            version: 2,
+            database: db,
+            scope,
+            stamp: before,
+            sessions: out,
+        };
+        let lock = crate::storage::Lock::try_acquire(&cache.with_extension("lock"))
+            .ok()
+            .flatten();
+        if lock.is_some() {
+            let _ = crate::storage::atomic_write(&cache, &serde_json::to_vec(&cached)?);
+        }
+        return Ok(cached.sessions);
     }
     Ok(out)
 }
@@ -248,27 +326,35 @@ pub(crate) fn opencode_session_union(id: &str, legacy: bool) -> anyhow::Result<S
     let Some(db) = opencode_db() else {
         anyhow::bail!("opencode database not found")
     };
-    let v2 = if opencode_has_v2(&db) {
-        format!(" UNION ALL SELECT 'session_v2' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session_v2 WHERE id={esc}\
-        UNION ALL SELECT 'session_message', id, {v2_msg_cols} FROM session_message WHERE session_id={esc}")
-    } else {
-        String::new()
-    };
-    Ok(format!("SELECT 'session' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session WHERE id={esc}\
-        UNION ALL SELECT 'message', id, json_object('data', data, 'created', time_created) FROM message WHERE session_id={esc}\
-        UNION ALL SELECT 'part', id, {part_cols} FROM part WHERE session_id={esc}{v2} ORDER BY kind, id;"))
+    let (v1, v2) = opencode_generations(&db)?;
+    let mut legs = Vec::new();
+    if v1 {
+        legs.push(format!("SELECT 'session' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session WHERE id={esc}"));
+        legs.push(format!("SELECT 'message', id, json_object('data', data, 'created', time_created) FROM message WHERE session_id={esc}"));
+        legs.push(format!(
+            "SELECT 'part', id, {part_cols} FROM part WHERE session_id={esc}"
+        ));
+    }
+    if v2 {
+        legs.push(format!("SELECT 'session_v2' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session_v2 WHERE id={esc}"));
+        legs.push(format!("SELECT 'session_message', id, {v2_msg_cols} FROM session_message WHERE session_id={esc}"));
+    }
+    Ok(legs.join(" UNION ALL ") + " ORDER BY kind, id;")
 }
 
 /// True when the store has the v2 generation (opencode ≥ 2.x); older stores
 /// carry v1 tables only.
-pub(crate) fn opencode_has_v2(db: &std::path::Path) -> bool {
-    crate::proc::sqlite_text(
+pub(crate) fn opencode_generations(db: &Path) -> Result<(bool, bool)> {
+    let names = crate::proc::sqlite_text(
         db,
-        "SELECT 1 FROM sqlite_master WHERE name='session_v2';",
-        std::time::Duration::from_secs(30),
-        "opencode generation probe",
-    )
-    .is_ok_and(|out| out.contains('1'))
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session','session_v2');",
+        std::time::Duration::from_secs(10),
+        "OpenCode schema probe",
+    )?;
+    let v1 = names.lines().any(|name| name == "session");
+    let v2 = names.lines().any(|name| name == "session_v2");
+    anyhow::ensure!(v1 || v2, "unsupported OpenCode database: no session tables");
+    Ok((v1, v2))
 }
 
 /// Sessions deleted per sqlite3 invocation. Import rows are blob-heavy
@@ -281,7 +367,7 @@ pub(crate) const OPENCODE_DELETE_CHUNK: usize = 128;
 /// (`session`/`message`/`part`) always, v2 (`session_v2`/`session_message`)
 /// when the store has it. This is the single owner of the generation
 /// branch — scanners, extractors and cleaners query through it or
-/// [`opencode_has_v2`], never with inline `session_v2` SQL of their own.
+/// [`opencode_generations`], never with inline `session_v2` SQL of their own.
 pub(crate) fn delete_opencode_sessions(
     ids: &std::collections::HashSet<String>,
     progress: &crate::progress::Progress,
@@ -299,7 +385,8 @@ pub(crate) fn delete_opencode_sessions(
     for chunk in ids.chunks(OPENCODE_DELETE_CHUNK) {
         let quoted = crate::proc::sql_id_list(chunk.iter().map(|s| s.as_str()))
             .context("OpenCode cleanup ids")?;
-        let v2 = if opencode_has_v2(&db) {
+        let (has_v1, has_v2) = opencode_generations(&db)?;
+        let v2 = if has_v2 {
             format!(
                 " DELETE FROM session_message WHERE session_id IN ({quoted}); \
                  DELETE FROM session_v2 WHERE id IN ({quoted});"
@@ -307,12 +394,12 @@ pub(crate) fn delete_opencode_sessions(
         } else {
             String::new()
         };
-        let sql = format!(
-            "PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; \
-             DELETE FROM part WHERE session_id IN ({quoted}); \
-             DELETE FROM message WHERE session_id IN ({quoted}); \
-             DELETE FROM session WHERE id IN ({quoted});{v2} COMMIT;"
-        );
+        let v1 = if has_v1 {
+            format!("DELETE FROM part WHERE session_id IN ({quoted}); DELETE FROM message WHERE session_id IN ({quoted}); DELETE FROM session WHERE id IN ({quoted});")
+        } else {
+            String::new()
+        };
+        let sql = format!("PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; {v1}{v2} COMMIT;");
         // Generous per chunk: 128 blob-heavy sessions measure at ~20-30s.
         if let Err(e) = crate::proc::sqlite_exec(
             &db,
@@ -417,6 +504,10 @@ mod tests {
             "[claude] imported"
         );
         assert_eq!(display_title(Tool::Claude, ""), "[claude] (untitled)");
+        assert_eq!(
+            display_title(Tool::Claude, "[opencode] imported"),
+            "[opencode] imported"
+        );
     }
 
     #[test]

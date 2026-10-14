@@ -12,6 +12,7 @@ import queue
 import threading
 import shutil
 import sqlite3
+import signal
 import subprocess
 import sys
 import tempfile
@@ -32,6 +33,23 @@ log = []
 codex_binary = os.environ.get("XSES_VERIFY_CODEX", "codex")
 if Path(shutil.which(codex_binary) or codex_binary).resolve().name == "mise":
     codex_binary = subprocess.check_output(["mise", "which", "codex"], text=True).strip()
+
+# Isolate the actual OpenCode CLI from the person's background server. Probe
+# capabilities instead of assuming flags from a particular release.
+opencode_binary = shutil.which("opencode")
+assert opencode_binary, "opencode is required"
+list_help = subprocess.check_output([opencode_binary, "session", "list", "--help"], text=True)
+list_flags = ["--pure"] if "--pure" in list_help else []
+if "--standalone" in list_help:
+    wrapper_dir = root / "bin"
+    wrapper_dir.mkdir()
+    wrapper = wrapper_dir / "opencode"
+    wrapper.write_text("#!/usr/bin/env python3\nimport os,sys\n" +
+                       f"binary={opencode_binary!r}\n" +
+                       "args=sys.argv[1:]\nif args and args[0]=='session': args.append('--standalone')\n" +
+                       "os.execv(binary,[binary,*args])\n")
+    wrapper.chmod(0o755)
+    env["PATH"] = str(wrapper_dir) + os.pathsep + env["PATH"]
 
 def run(argv):
     p = subprocess.run(argv, env=env, cwd=project, text=True, capture_output=True, timeout=60)
@@ -68,9 +86,9 @@ try:
             {"type":"message","id":"u1","message":{"role":"user","content":"native compatibility question"}},
             {"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","content":"native compatibility answer"}}]
     source.write_text("".join(json.dumps(row)+"\n" for row in rows))
-    run(["opencode", "session", "list", "--format", "json", "--pure"])
+    run(["opencode", "session", "list", "--format", "json", *list_flags])
     run([binary, "sync", "--from", "pi", "--to", "claude", "--to", "codex", "--to", "opencode", "--to", "omp"])
-    oc_list = run(["opencode", "session", "list", "--format", "json", "--pure"])
+    oc_list = run(["opencode", "session", "list", "--format", "json", *list_flags])
     assert "native compatibility question" in oc_list
     # Pi itself parses a native-format xses import and exports the transcript.
     run([binary, "sync", "--from", "claude", "--to", "pi", "--include-imports"])
@@ -83,8 +101,17 @@ try:
     # Ask the native Codex app server to read the generated rollout/projection.
     codex_import = next(paths[0] for key, paths in records() if key.startswith("codex|pi|"))
     sid = json.loads(Path(codex_import).read_text().splitlines()[0])["payload"]["id"]
+    old_rollout = Path(codex_import)
+    source_rows = [json.loads(line) for line in source.read_text().splitlines()]
+    source_rows[0]['timestamp'] = '2026-09-30T00:00:00Z'
+    source.write_text(''.join(json.dumps(row)+'\n' for row in source_rows))
+    run([binary, 'sync', '--from', 'pi', '--to', 'codex'])
+    codex_import = next(paths[0] for key, paths in records() if key.startswith('codex|pi|'))
+    assert Path(codex_import) != old_rollout and not old_rollout.exists()
+    with sqlite3.connect(home / '.codex' / schemas[0].name) as connection:
+        assert connection.execute('SELECT rollout_path FROM threads WHERE id=?', (sid,)).fetchone()[0] == codex_import
     stderr = (root / "codex-app-server.stderr").open("w")
-    server = subprocess.Popen([codex_binary, "app-server", "--stdio"], env=env, cwd=project,
+    server = subprocess.Popen([codex_binary, "app-server"], env=env, cwd=project,
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, text=True)
     responses = queue.Queue()
     def read_responses():
@@ -115,15 +142,101 @@ try:
         server.terminate()
         server.wait(timeout=10)
         stderr.close()
+    # Kill a real xses refresh after its rollout/state mutation but before its
+    # history seed. The next invocation must restore both native databases and
+    # the exact previous rollout before selecting sources.
+    if os.name == 'posix':
+        original_rollout = Path(codex_import).read_bytes()
+        def codex_rows():
+            saved = []
+            for database, tables, column in [(home / '.codex' / schemas[0].name, ['threads'], 'id'),
+                    (home / '.codex/thread_history_1.sqlite', ['thread_items', 'thread_turns', 'thread_history_projection_state'], 'thread_id')]:
+                with sqlite3.connect(database) as connection:
+                    for table in tables:
+                        saved.append((table, connection.execute(f'SELECT * FROM {table} WHERE {column}=? ORDER BY 1,2', (sid,)).fetchall()))
+            return saved
+        original_rows = codex_rows()
+        marker = root / 'history-seed-blocked'
+        wrapper_dir = root / 'bin'
+        wrapper_dir.mkdir(exist_ok=True)
+        sqlite_binary = shutil.which('sqlite3')
+        wrapper = wrapper_dir / 'sqlite3'
+        wrapper.write_text('#!/usr/bin/env python3\nimport os,sys,time\nfrom pathlib import Path\n' +
+            f'binary={sqlite_binary!r}\nmarker=Path({str(marker)!r})\n' +
+            "args=sys.argv[1:]\n" +
+            "if '-readonly' not in args and any('thread_history_1.sqlite' in arg for arg in args):\n" +
+            "    text=sys.stdin.read()\n    marker.write_text(str(os.getpid()))\n    while True: time.sleep(0.1)\n" +
+            "os.execv(binary,[binary,*args])\n")
+        wrapper.chmod(0o755)
+        crash_env = env | {'PATH': str(wrapper_dir) + os.pathsep + env['PATH']}
+        with source.open('a') as stream:
+            stream.write(json.dumps({'type': 'message', 'id': 'before-crash', 'message': {'role': 'user', 'content': 'interrupted update'}})+'\n')
+        process = subprocess.Popen([binary, 'sync', '--from', 'pi', '--to', 'codex'], env=crash_env,
+            cwd=project, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        try:
+            deadline = time.monotonic() + 15
+            while not marker.exists() and process.poll() is None and time.monotonic() < deadline:
+                time.sleep(0.025)
+            assert marker.exists(), process.communicate(timeout=1)
+            process.kill()
+            os.kill(int(marker.read_text()), signal.SIGKILL)
+            stdout, errors = process.communicate(timeout=10)
+            log.append(dict(argv=[binary, 'sync', '--from', 'pi', '--to', 'codex'],
+                            status=process.returncode, stdout=stdout, stderr=errors, killed_at='history seed'))
+        finally:
+            if process.poll() is None:
+                process.kill()
+            wrapper.unlink()
+        run([binary, 'sync', '--from', 'omp', '--to', 'pi'])
+        assert Path(codex_import).read_bytes() == original_rollout
+        assert codex_rows() == original_rows
+        assert not list((root / 'data/xses/pending-imports').glob('*/journal.json'))
     # Verify real OpenCode re-sync leaves a single native picker row.
     with source.open("a") as stream:
         stream.write(json.dumps({"type":"message","id":"u2","message":{"role":"user","content":"updated native question"}})+"\n")
     run([binary, "sync", "--from", "pi", "--to", "opencode"])
-    assert len(json.loads(run(["opencode", "session", "list", "--format", "json", "--pure"]))) == 1
+    assert len(json.loads(run(["opencode", "session", "list", "--format", "json", *list_flags]))) == 1
+    # Force replacement imports to fail while allowing the saved original's
+    # native export to be re-imported. This exercises real OpenCode rollback.
+    if os.name == 'posix':
+        wrapper_dir = root / 'bin'
+        wrapper_dir.mkdir(exist_ok=True)
+        wrapper = wrapper_dir / 'opencode'
+        previous_wrapper = wrapper.read_text() if wrapper.exists() else None
+        standalone = ['--standalone'] if '--standalone' in list_help else []
+        wrapper.write_text('#!/usr/bin/env python3\nimport os,sys\nfrom pathlib import Path\n' +
+            f'binary={opencode_binary!r}\nstandalone={standalone!r}\n' +
+            "args=sys.argv[1:]\n" +
+            "if len(args)>1 and args[:2]==['session','import']:\n" +
+            "    payload=next((Path(arg) for arg in args[2:] if Path(arg).is_file()),None)\n" +
+            "    if payload and 'forced-import-failure' in payload.read_text():\n" +
+            "        print('injected import failure',file=sys.stderr)\n        sys.exit(1)\n" +
+            "if args and args[0]=='session': args.extend(standalone)\n" +
+            "os.execv(binary,[binary,*args])\n")
+        wrapper.chmod(0o755)
+        failure_env = env | {'PATH': str(wrapper_dir) + os.pathsep + env['PATH']}
+        with source.open('a') as stream:
+            stream.write(json.dumps({'type': 'message', 'id': 'failure', 'message': {'role': 'user', 'content': 'forced-import-failure'}})+'\n')
+        try:
+            result = subprocess.run([binary, 'sync', '--from', 'pi', '--to', 'opencode'],
+                cwd=project, env=failure_env, capture_output=True, text=True, timeout=60)
+            log.append(dict(argv=[binary, 'sync', '--from', 'pi', '--to', 'opencode'],
+                status=result.returncode, stdout=result.stdout, stderr=result.stderr, injected_failure=True))
+            assert result.returncode != 0
+        finally:
+            if previous_wrapper is None:
+                wrapper.unlink()
+            else:
+                wrapper.write_text(previous_wrapper)
+                wrapper.chmod(0o755)
+        oc_id = next(paths[0].removeprefix('opencode://') for key, paths in records() if key.startswith('opencode|pi|'))
+        restored = run(['opencode', 'session', 'export', oc_id])
+        assert 'updated native question' in restored and 'forced-import-failure' not in restored
+        assert not list((root / 'data/xses/pending-imports').glob('*/journal.json'))
     run([binary, "clean", "--all"])
-    assert json.loads(run(["opencode", "session", "list", "--format", "json", "--pure"]) or "[]") == []
+    assert json.loads(run(["opencode", "session", "list", "--format", "json", *list_flags]) or "[]") == []
     assert source.exists() and not Path(pi_import).exists() and not Path(codex_import).exists()
-    print("PASS: native Pi export, OpenCode listing/replacement/cleanup, Codex thread/read")
+    print("PASS: native Pi export, OpenCode replacement/rollback/cleanup, Codex thread/read and killed-publication recovery")
 finally:
     (root / "commands.json").write_text(json.dumps(log, indent=2))
     print("Evidence:", root / "commands.json")

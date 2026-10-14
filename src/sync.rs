@@ -2,8 +2,8 @@
 //!
 //! Rules:
 //! - Sources are always read-only.
-//! - Files xses itself wrote carry an import marker and are skipped as
-//!   sources unless `include_imports` is set (echo protection).
+//! - The command selects native sessions and continued imports. Untouched
+//!   imports are excluded unless explicitly requested (echo protection).
 //! - Extraction runs once per source (parallel), writers fan out per target.
 //! - Idempotent via `~/.local/share/xses/index.jsonl`.
 //! - CLI-backed targets (opencode) are imported through their own CLI, never
@@ -27,6 +27,21 @@ fn acquire_index_lock() -> Result<crate::storage::Lock> {
     })
 }
 
+/// Hold the operation lock across recovery, discovery, planning, and writes.
+/// Scanning before recovery could otherwise select half-published history.
+pub fn prepare(dry_run: bool) -> Result<crate::storage::Lock> {
+    let lock = acquire_index_lock()?;
+    if dry_run {
+        anyhow::ensure!(
+            !crate::publication::has_pending()?,
+            "an interrupted import needs recovery; run sync or clean without --dry-run first"
+        );
+    } else {
+        crate::publication::recover()?;
+    }
+    Ok(lock)
+}
+
 /// Idempotency key: target + source tool + source id + mtime + size, plus the
 /// writer mapping version — a mapping change must re-import so older, poorer
 /// copies get upgraded instead of lingering.
@@ -48,15 +63,16 @@ pub fn fingerprint(target: Tool, src: &Session, scope: Option<usize>) -> String 
 /// content markers), plus their codex `threads`/projection rows and opencode
 /// sessions. Truncates the index — keys can't be mapped back reliably after
 /// mass removal. Returns the number of artifacts removed.
-pub fn clean(dry_run: bool, progress: &crate::progress::Progress) -> Result<usize> {
+pub fn clean(dry_run: bool, force: bool, progress: &crate::progress::Progress) -> Result<usize> {
     progress.add_total(1);
-    clean_impl(dry_run, None, progress)
+    clean_impl(dry_run, force, None, progress)
 }
 
 /// Remove only the imports of the given source sessions (their artifacts in
 /// every target). Keeps the rest of the index intact.
 pub fn clean_selected(
     dry_run: bool,
+    force: bool,
     selected: &HashSet<(Tool, String)>,
     progress: &crate::progress::Progress,
 ) -> Result<usize> {
@@ -64,7 +80,7 @@ pub fn clean_selected(
         return Ok(0);
     }
     progress.add_total(1);
-    clean_impl(dry_run, Some(selected), progress)
+    clean_impl(dry_run, force, Some(selected), progress)
 }
 
 /// Import artifact ids belonging to the selection; `None` matches everything.
@@ -80,10 +96,10 @@ fn selection_matcher(only: Option<&HashSet<(Tool, String)>>) -> impl Fn(&str) ->
 
 fn clean_impl(
     dry_run: bool,
+    force: bool,
     only: Option<&HashSet<(Tool, String)>>,
     progress: &crate::progress::Progress,
 ) -> Result<usize> {
-    let _lock = acquire_index_lock()?;
     let mut index = Index::load()?;
     let mut paths: HashSet<PathBuf> = index
         .records()
@@ -161,11 +177,42 @@ fn clean_impl(
     for id in crate::scan::opencode_import_ids(only)? {
         paths.insert(PathBuf::from(format!("opencode://{id}")));
     }
-    let paths: Vec<_> = paths.into_iter().collect();
+    let mut protected = HashSet::new();
+    if !force {
+        for path in paths
+            .iter()
+            .filter(|path| crate::continuations::is_transcript(path))
+        {
+            let tool = if path.to_string_lossy().starts_with("opencode://") {
+                Tool::Opencode
+            } else if path.starts_with(home.join(".omp")) {
+                Tool::Omp
+            } else if path.starts_with(home.join(".pi")) {
+                Tool::Pi
+            } else if path.starts_with(home.join(".codex")) {
+                Tool::Codex
+            } else {
+                Tool::Claude
+            };
+            if let Err(e) = crate::continuations::protect(tool, std::slice::from_ref(path)) {
+                eprintln!(
+                    "clean: preserved {}: {e:#} (use --force to delete)",
+                    path.display()
+                );
+                protected.insert(path.clone());
+                protected.insert(path.with_extension("xses.json"));
+                protected.insert(path.with_extension("").join("custom-title.json"));
+            }
+        }
+    }
+    let paths: Vec<_> = paths
+        .into_iter()
+        .filter(|p| !protected.contains(p))
+        .collect();
     progress.add_total(paths.len());
     if !dry_run {
         retire_artifacts(&paths)?;
-        index.remove_sources(only)?;
+        index.remove_artifacts(&paths)?;
     }
     Ok(paths.len())
 }
@@ -266,6 +313,15 @@ fn batch_end(sources: &[&Session], start: usize) -> usize {
     let mut end = start;
     let mut bytes = 0u64;
     while end < sources.len() && end - start < 4 {
+        // OpenCode's scan metadata may underestimate blob-heavy history. Read
+        // one database transcript per batch rather than buffering four large
+        // snapshots before their actual sizes become known.
+        if sources[end].tool == Tool::Opencode {
+            if end == start {
+                end += 1;
+            }
+            break;
+        }
         let next = sources[end].size;
         if end > start && bytes.saturating_add(next) > 32 * 1024 * 1024 {
             break;
@@ -284,7 +340,6 @@ pub fn sync(
     scope: Option<usize>,
     progress: &crate::progress::Progress,
 ) -> Result<SyncReport> {
-    let _lock = acquire_index_lock()?;
     let targets: Vec<Tool> = if targets.is_empty() {
         Tool::all_tools().to_vec()
     } else {
@@ -300,26 +355,40 @@ pub fn sync(
             .map(|&target| TargetReport::new(target))
             .collect(),
     };
-    let mut sources: Vec<_> = sessions
+    let sources: Vec<_> = sessions
         .iter()
         .filter(|s| include_imports || !s.is_import)
         .cloned()
         .collect();
-    let mut snapshots = refresh_opencode_revisions(&mut sources, &targets)?;
-    // Pre-snapshot keys migrate without re-importing (below); merged into
-    // `seen` either way so dry runs report what a real run would skip.
-    let migrated = migrate_opencode_keys(&index, &sources, &targets, scope)?;
-    let migrated_keys: HashSet<String> = migrated.iter().map(|r| r.key.clone()).collect();
-    if !dry_run && !migrated.is_empty() {
-        index.commit(migrated)?;
-    }
-    let mut seen = index.keys();
-    seen.extend(migrated_keys);
-    let pending = plan_pending(&sources, &mut report, &seen, scope, dry_run, progress);
-    progress.flush(&format!("{} transcripts need importing", pending.len()));
+    let references: Vec<_> = sources.iter().collect();
     let mut start = 0;
-    while start < pending.len() {
-        let end = batch_end(&pending, start);
+    while start < sources.len() {
+        let end = batch_end(&references, start);
+        // Snapshot only this bounded batch. Global snapshots used to spawn one
+        // worker per session and retain all transcripts until the sync ended.
+        let mut batch = sources[start..end].to_vec();
+        let mut snapshots = refresh_opencode_revisions(&mut batch, &targets)?;
+        let migrated = migrate_opencode_keys(&index, &batch, &targets, scope)?;
+        let migrated_keys: HashSet<_> = migrated.iter().map(|r| r.key.clone()).collect();
+        if !dry_run && !migrated.is_empty() {
+            index.commit(migrated)?;
+        }
+        let mut seen = index.keys();
+        seen.extend(migrated_keys);
+        for source in &batch {
+            for target in &targets {
+                let key = fingerprint(*target, source, scope);
+                if seen.contains(&key) {
+                    if let Some(record) = index.records().iter().rev().find(|r| r.key == key) {
+                        if !artifacts_complete(*target, &record.paths)? {
+                            seen.remove(&key);
+                        }
+                    }
+                }
+            }
+        }
+        let pending = plan_pending(&batch, &mut report, &seen, scope, dry_run, progress);
+        progress.flush(&format!("{} transcripts need importing", pending.len()));
         progress.status(&format!(
             "reading transcripts {}–{} of {}",
             start + 1,
@@ -327,7 +396,7 @@ pub fn sync(
             pending.len()
         ));
         sync_batch(
-            &pending[start..end],
+            &pending,
             &mut report,
             &seen,
             scope,
@@ -339,6 +408,27 @@ pub fn sync(
         start = end;
     }
     Ok(report)
+}
+
+fn artifacts_complete(target: Tool, paths: &[PathBuf]) -> Result<bool> {
+    for path in paths {
+        if let Some(id) = path.to_string_lossy().strip_prefix("opencode://") {
+            if !crate::scan::opencode_exists(id)? {
+                return Ok(false);
+            }
+        } else {
+            if !path.is_file() {
+                return Ok(false);
+            }
+            if target == Tool::Codex
+                && crate::continuations::is_transcript(path)
+                && !crate::write::codex_registered(path)?
+            {
+                return Ok(false);
+            }
+        }
+    }
+    Ok(!paths.is_empty())
 }
 
 /// OpenCode's own content digest also catches edits/deletions where an
@@ -476,13 +566,15 @@ fn sync_batch(
 ) -> Result<()> {
     let extracted = canonicalize_batch(batch, scope, snapshots)?;
     let targets: Vec<Tool> = report.targets.iter().map(|t| t.target).collect();
+    let index_ref: &Index = index;
     let completed = std::thread::scope(|threads| -> Result<Vec<_>> {
         let workers: Vec<_> = targets
             .iter()
             .map(|&target| {
                 let extracted = &extracted;
-                threads
-                    .spawn(move || write_target(target, extracted, seen, scope, dry_run, progress))
+                threads.spawn(move || {
+                    write_target(target, extracted, seen, scope, dry_run, progress, index_ref)
+                })
             })
             .collect();
         workers
@@ -524,6 +616,7 @@ fn write_target(
     scope: Option<usize>,
     dry_run: bool,
     progress: &crate::progress::Progress,
+    index: &Index,
 ) -> (TargetReport, Vec<Record>) {
     let mut updates = Vec::new();
     let mut result = TargetReport::new(target);
@@ -545,6 +638,23 @@ fn write_target(
         let (has_content, loss) = canonical.transfer_summary();
         if !has_content {
             result.skipped += 1;
+            continue;
+        }
+        let pair = key.split('|').take(3).collect::<Vec<_>>().join("|");
+        let protection = index
+            .records()
+            .iter()
+            .filter(|record| {
+                record.pair() == pair
+                    && record.key.split('|').nth(5)
+                        == Some(format!("m{}", crate::write::MAPPING).as_str())
+            })
+            .try_for_each(|record| crate::continuations::protect(target, &record.paths));
+        if let Err(e) = protection {
+            let detail = format!("{}: {e}", source.short());
+            crate::issues::record("sync-conflict", &source.id, &detail);
+            result.failed.push(detail);
+            progress.fail(&format!("{} {}", target.as_str(), source.id));
             continue;
         }
         if dry_run {
@@ -595,8 +705,28 @@ impl TargetReport {
 /// Retire only paths belonging to obsolete generations. Missing files are
 /// already retired; any other error keeps the record for a later retry.
 pub(crate) fn retire_artifacts(paths: &[PathBuf]) -> Result<()> {
-    let mut opencode = HashSet::new();
+    retire_artifacts_preserving(paths, &[])
+}
+
+/// Moving a rollout without changing its native ID must retain the new
+/// registration/projections. Creation-time corrections can change its path.
+pub(crate) fn retire_artifacts_preserving(paths: &[PathBuf], keep: &[PathBuf]) -> Result<()> {
+    // Validate every artifact before mutation: OMP transcripts depend on a
+    // sidecar which must still exist while their provenance is checked.
     for path in paths {
+        if path.to_string_lossy().starts_with("opencode://") || !path.exists() {
+            continue;
+        }
+        anyhow::ensure!(
+            removable_import(path),
+            "refusing to retire unmarked file {}",
+            path.display()
+        );
+    }
+    let mut ordered: Vec<_> = paths.iter().collect();
+    ordered.sort_by_key(|p| !crate::continuations::is_transcript(p));
+    let mut opencode = HashSet::new();
+    for path in ordered {
         if let Some(id) = path.to_string_lossy().strip_prefix("opencode://") {
             opencode.insert(id.to_owned());
             continue;
@@ -606,14 +736,11 @@ pub(crate) fn retire_artifacts(paths: &[PathBuf]) -> Result<()> {
                 .file_name()
                 .and_then(|p| p.to_str())
                 .is_some_and(|s| s.starts_with("rollout-"))
+            && !keep
+                .iter()
+                .any(|new| codex_id(new).is_some() && codex_id(new) == codex_id(path))
         {
             crate::write::retire_codex(path)?;
-        }
-        if !removable_import(path) {
-            // Defense in depth with the write-side clobber guard: a record
-            // pointing at a native file must fail loudly, never delete.
-            // The error keeps the record for a later retry (and a human).
-            anyhow::bail!("refusing to retire unmarked file {}", path.display());
         }
         match fs::remove_file(path) {
             Ok(()) => {}
@@ -623,6 +750,12 @@ pub(crate) fn retire_artifacts(paths: &[PathBuf]) -> Result<()> {
     }
     crate::scan::delete_opencode_sessions(&opencode, &crate::progress::Progress::disabled())?;
     Ok(())
+}
+
+fn codex_id(path: &std::path::Path) -> Option<&str> {
+    let name = path.file_stem()?.to_str()?;
+    name.starts_with("rollout-").then_some(())?;
+    name.get(name.len().checked_sub(36)?..)
 }
 
 /// True when a file artifact is provably an import (import-shaped name,

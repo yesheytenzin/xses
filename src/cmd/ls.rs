@@ -61,14 +61,27 @@ pub fn run(
 /// `ls --count`: per-tool tallies across every project (a health check, so it
 /// deliberately ignores the directory scope and the row cap).
 fn counts() -> anyhow::Result<()> {
-    let sessions = crate::scan::scan_all(None)?;
-    for tool in Tool::all_tools() {
-        let n = sessions.iter().filter(|s| s.tool == *tool).count();
+    let counts = crate::scan::counts::all()?;
+    let mut empty = 0;
+    let mut unanswered = 0;
+    let mut failed = 0;
+    for (tool, count) in counts {
+        let n = count.total;
+        empty += count.empty;
+        unanswered += count.unanswered;
+        failed += count.failed;
         if n > 0 || !tool.is_cli_backed() {
             println!("{:<8} {:>4} sessions", tool.as_str(), n);
         }
     }
-    let noise = scope::noise_tally(&sessions);
+    let noise: Vec<_> = [
+        ("empty", empty),
+        ("failed", failed),
+        ("unanswered", unanswered),
+    ]
+    .into_iter()
+    .filter(|(_, n)| *n > 0)
+    .collect();
     if !noise.is_empty() {
         println!(
             "hidden   {:>4} not worth resuming ({})",

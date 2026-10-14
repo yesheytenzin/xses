@@ -25,6 +25,7 @@ pub(crate) struct Snapshot {
     pub revision: String,
     pub size: u64,
     pub events: Events,
+    pub identities: std::collections::BTreeSet<String>,
 }
 
 /// One revision-UNION read, raw bytes. Shared by the snapshot (digest +
@@ -53,10 +54,16 @@ pub(crate) fn opencode_snapshot(id: &str) -> Result<Snapshot> {
     let rows: Vec<Value> =
         crate::proc::json_rows(&String::from_utf8_lossy(&stdout), "opencode transcript")?;
     let events = events_from_union(&rows);
+    let identities = rows
+        .iter()
+        .filter(|r| matches!(r["kind"].as_str(), Some("message" | "session_message")))
+        .filter_map(|r| r["id"].as_str().map(str::to_owned))
+        .collect();
     Ok(Snapshot {
         revision: format!("{:016x}", hash.finish()),
         size: stdout.len() as u64,
         events,
+        identities,
     })
 }
 

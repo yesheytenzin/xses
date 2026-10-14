@@ -15,9 +15,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
       - run: cargo test --all-targets --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo build --locked
+      - run: sudo apt-get update && sudo apt-get install -y sqlite3
+      - run: |
+          python3 verify-xses/flows/regression.py target/debug/xses
+          python3 verify-xses/flows/continuations.py target/debug/xses
+          python3 verify-xses/flows/safety.py target/debug/xses
 
   build:
     name: Build ${{ matrix.platform }}
@@ -80,7 +89,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: release-${{ matrix.platform }}
-          path: dist/*
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
           if-no-files-found: error
           retention-days: 1
 
@@ -103,9 +114,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          find dist -maxdepth 1 -type f \( -name '*.tar.gz' -o -name '*.zip' \) -print0 \
-            | sort -z \
-            | xargs -0 sha256sum > dist/SHA256SUMS
+          (cd dist && sha256sum *.tar.gz *.zip) > dist/SHA256SUMS
           cat dist/SHA256SUMS
       - name: Unpack binaries for attestation
         shell: bash
@@ -113,20 +122,25 @@ jobs:
           set -euo pipefail
           mkdir -p dist/unpacked
           for archive in dist/*.tar.gz; do
-            tar -xzf "$archive" -C dist/unpacked
+            destination="dist/unpacked/$(basename "$archive" .tar.gz)"
+            mkdir -p "$destination"
+            tar -xzf "$archive" -C "$destination"
           done
           for archive in dist/*.zip; do
-            unzip -q "$archive" -d dist/unpacked
+            destination="dist/unpacked/$(basename "$archive" .zip)"
+            mkdir -p "$destination"
+            unzip -q "$archive" -d "$destination"
           done
       - name: Generate signed build provenance
         uses: actions/attest@v4
         with:
-          subject-path: 'dist/unpacked/xses*'
+          subject-path: 'dist/unpacked/**/xses*'
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          awk '/^## / { if (found) exit; found = 1; next } found { print }' CHANGELOG.md > release-notes.md
           gh release create "$GITHUB_REF_NAME" dist/*.tar.gz dist/*.zip dist/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" \
             --title "xses $GITHUB_REF_NAME" \
-            --generate-notes
+            --notes-file release-notes.md

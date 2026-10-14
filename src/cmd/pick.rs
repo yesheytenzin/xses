@@ -15,7 +15,7 @@ pub fn run(
         return Ok(());
     }
     if let Some(s) = picker::picker(&sessions, &query, scope::limit(all, limit))? {
-        exec_resume(&s);
+        exec_resume(&s)?;
     }
     Ok(())
 }

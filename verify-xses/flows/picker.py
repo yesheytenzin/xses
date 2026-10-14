@@ -32,10 +32,10 @@ base = ["tmux", "-S", str(root / "tmux.sock"), "-f", "/dev/null"]
 def tmux(*args):
     return subprocess.check_output([*base, *args], env=env, text=True)
 
-def wait_for(test):
+def wait_for(test, target="verify:0"):
     deadline = time.monotonic() + 10
     while time.monotonic() < deadline:
-        screen = tmux("capture-pane", "-p", "-t", "verify:0")
+        screen = tmux("capture-pane", "-p", "-t", target)
         if test(screen):
             return screen
         time.sleep(0.025)
@@ -55,7 +55,25 @@ try:
     assert "-icanon" not in terminal and "-echo " not in terminal
     (root / "before.txt").write_text(before)
     (root / "filtered.txt").write_text(after)
-    print("PASS: j/k type into search, search reaches older sessions beyond the default cap, Escape restores terminal modes")
+    # Resume a session in another cwd. A deliberately failing native command
+    # must run there and produce a failing xses exit instead of silent success.
+    fake_bin = root / 'bin'
+    fake_bin.mkdir()
+    received = root / 'resume.json'
+    fake_pi = fake_bin / 'pi'
+    fake_pi.write_text('#!/usr/bin/env python3\nimport json,os,sys\nfrom pathlib import Path\n' +
+        f'Path({str(received)!r}).write_text(json.dumps(dict(cwd=os.getcwd(),argv=sys.argv[1:])))\n' +
+        'sys.exit(42)\n')
+    fake_pi.chmod(0o755)
+    resume_command = f'env PATH={shlex.quote(str(fake_bin)+os.pathsep+env["PATH"])} {shlex.quote(binary)} pick --all -q jkneedle; result=$?; printf "__EXIT__%s\\n" "$result"; sleep 30'
+    tmux('new-session', '-d', '-s', 'resume', '-x', '110', '-y', '20', '-c', str(root), resume_command)
+    wait_for(lambda screen: '1 sessions' in screen, 'resume:0')
+    tmux('send-keys', '-t', 'resume:0', 'Enter')
+    failed = wait_for(lambda screen: '__EXIT__1' in screen, 'resume:0')
+    called = json.loads(received.read_text())
+    assert called['cwd'] == str(project) and called['argv'] == ['--session', '0'], called
+    assert '42' in failed
+    print("PASS: picker search/caps, terminal restoration, resume cwd and propagated native failure")
     print("Evidence:", root)
 finally:
     subprocess.run([*base, "kill-server"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

@@ -68,7 +68,7 @@ pub enum Cmd {
         /// Only convert the trailing N turns of each session.
         #[arg(long)]
         scope: Option<usize>,
-        /// Also re-import files xses itself wrote (default: skip imports).
+        /// Also re-import untouched copies (continued imports sync automatically).
         #[arg(long)]
         include_imports: bool,
         /// Output file for format targets (default: stdout).
@@ -113,6 +113,9 @@ pub enum Cmd {
         all: bool,
         #[arg(long)]
         dry_run: bool,
+        /// Also delete continued copies and copies with unknown history.
+        #[arg(long)]
+        force: bool,
     },
 }
 

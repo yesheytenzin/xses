@@ -70,7 +70,11 @@ fn run_cmd(cli: Cli) -> anyhow::Result<()> {
             include_noise,
         }) => ls::run(tool.map(Tool::from), all, count, limit, include_noise),
         Some(Cmd::Doctor { all, limit }) => doctor::run(all, limit),
-        Some(Cmd::Clean { all, dry_run }) => clean::run(all, dry_run),
+        Some(Cmd::Clean {
+            all,
+            dry_run,
+            force,
+        }) => clean::run(all, dry_run, force),
     }
 }
 
@@ -94,7 +98,7 @@ fn export_path(base: &Path, fmt: &str, session: &Session, disambiguate: bool) ->
     parent.join(format!("{stem}.{}-{id}.{fmt}", session.tool.as_str()))
 }
 
-/// Select the newest native sessions per source tool for bulk sync.
+/// Select the newest eligible sessions per source tool for bulk sync.
 fn select_bulk_sources(
     sessions: Vec<Session>,
     all: bool,
@@ -161,22 +165,23 @@ fn preview_format(canon: &CanonicalSession, fmt: &str) {
     );
 }
 
-fn exec_resume(s: &Session) {
+fn exec_resume(s: &Session) -> anyhow::Result<()> {
     let argv = picker::resume_argv(s);
     if argv.is_empty() {
         eprintln!("{} has no CLI resume — move it instead:", s.tool.as_str());
         eprintln!("  xses sync {} --to claude", s.locator());
-        return;
+        anyhow::bail!("no native resume command for {}", s.tool.as_str());
     }
     let Some((bin, rest)) = argv.split_first() else {
-        return; // guarded by the is_empty check above; never fires
+        anyhow::bail!("empty resume command");
     };
     eprintln!("▶ resuming {} ({})", s.short(), s.cwd.display());
-    match std::process::Command::new(bin).args(rest).status() {
-        Ok(st) if st.success() => {}
-        Ok(st) => eprintln!("resume exited with {st}"),
-        Err(e) => eprintln!("spawn {bin}: {e}"),
-    }
+    let status = std::process::Command::new(bin)
+        .args(rest)
+        .current_dir(&s.cwd)
+        .status()?;
+    anyhow::ensure!(status.success(), "resume exited with {status}");
+    Ok(())
 }
 
 /// Distinct (tool, id) pairs from a session list.

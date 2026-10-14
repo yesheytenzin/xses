@@ -3,10 +3,32 @@ use anyhow::{Context, Result};
 use std::process::{Command, Output};
 use std::time::{Duration, Instant};
 
+// Explicit resource budgets: transcript queries may be large, diagnostic
+// stderr should not be. Overflow fails visibly instead of truncating history.
+const MAX_STDOUT: usize = 128 * 1024 * 1024;
+const MAX_STDERR: usize = 8 * 1024 * 1024;
+
+fn read_limited(reader: &mut dyn std::io::Read, limit: usize) -> std::io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut chunk)?;
+        if n == 0 {
+            return Ok(bytes);
+        }
+        if bytes.len().saturating_add(n) > limit {
+            return Err(std::io::Error::other(format!(
+                "child output exceeded {limit} byte limit; output was not accepted"
+            )));
+        }
+        bytes.extend_from_slice(&chunk[..n]);
+    }
+}
+
 /// Run a command to completion, killing it once `timeout` elapses so a
 /// wedged CLI (or a locked database) cannot hang a sync.
 pub fn output_with_timeout(command: Command, timeout: Duration) -> std::io::Result<Output> {
-    run_with_timeout(command, timeout, None)
+    run_with_timeout(command, timeout, None, (MAX_STDOUT, MAX_STDERR))
 }
 
 pub fn output_with_input(
@@ -14,13 +36,14 @@ pub fn output_with_input(
     input: Vec<u8>,
     timeout: Duration,
 ) -> std::io::Result<Output> {
-    run_with_timeout(command, timeout, Some(input))
+    run_with_timeout(command, timeout, Some(input), (MAX_STDOUT, MAX_STDERR))
 }
 
 fn run_with_timeout(
     mut command: Command,
     timeout: Duration,
     input: Option<Vec<u8>>,
+    limits: (usize, usize),
 ) -> std::io::Result<Output> {
     use std::io::Read;
     use std::process::Stdio;
@@ -68,8 +91,7 @@ fn run_with_timeout(
     for (stdout, mut pipe) in pipes {
         let send = send.clone();
         std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+            let result = read_limited(&mut *pipe, if stdout { limits.0 } else { limits.1 });
             let _ = send.send((stdout, result));
         });
     }
@@ -301,6 +323,20 @@ mod tests {
             }
             _ => {}
         }
+    }
+
+    #[test]
+    fn excessive_output_fails_instead_of_truncating_or_hanging() {
+        let start = Instant::now();
+        let error = run_with_timeout(
+            fixture("verbose"),
+            Duration::from_secs(10),
+            None,
+            (1024, 1024),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("byte limit"));
+        assert!(start.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

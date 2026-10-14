@@ -43,3 +43,11 @@
   only that exact id failed). Fixed with a per-session note id
   (`msg_<ses-hash>-note`); `XSES_KEEP_PAYLOAD=1` hatch added to the writer
   for capturing payloads for manual `opencode session import` replays.
+
+- [x] 12. codex result-side ids bypassed `TargetIds` (live bug, exposed by
+  the item-2 allowlist): `push_tool_result` used the raw source call id
+  while the call side mapped it, so `call_x|fc_y` pairs never met and the
+  raw `|` tripped the SQL allowlist at seed time. Both sides now share the
+  mapped id (pending lookup compares like with like). MAPPING 8 → 9 so old
+  raw-id copies upgrade; regression test
+  `composite_call_ids_meet_on_the_mapped_value` green.

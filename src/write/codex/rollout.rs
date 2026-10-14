@@ -182,6 +182,55 @@ mod tests {
     }
 
     #[test]
+    fn composite_call_ids_meet_on_the_mapped_value() {
+        // codex/omp compose `call_x|fc_y`: both sides of the pair must land
+        // on the target-safe `call_x` — a raw `|` id 500s nothing here but
+        // trips the SQL allowlist at seed time (verified live).
+        let s = test_session(vec![
+            Event {
+                msg: 0,
+                block: Block::ToolCall {
+                    name: "read".into(),
+                    args: r#"{"path":"/tmp/x"}"#.into(),
+                    call_id: Some("call_abc|fc_abc".into()),
+                    status: None,
+                },
+            },
+            Event {
+                msg: 1,
+                block: Block::ToolResult {
+                    name: "read".into(),
+                    output: "a".into(),
+                    call_id: Some("call_abc|fc_abc".into()),
+                    is_error: false,
+                    duration_ms: None,
+                },
+            },
+        ]);
+        let items = rollout_items(&s);
+        let ids: Vec<&str> = items.iter().map(|i| i.item_id.as_str()).collect();
+        assert!(
+            ids.iter().all(|id| !id.contains('|')),
+            "raw composite id leaked: {ids:?}"
+        );
+        let call = items
+            .iter()
+            .find(|i| i.payload.get("type").and_then(|t| t.as_str()) == Some("function_call"))
+            .expect("call row");
+        let result = items
+            .iter()
+            .find(|i| {
+                i.payload.get("type").and_then(|t| t.as_str()) == Some("function_call_output")
+            })
+            .expect("result row");
+        assert_eq!(
+            call.payload.get("call_id").and_then(|v| v.as_str()),
+            result.payload.get("call_id").and_then(|v| v.as_str()),
+            "call and result must share one id"
+        );
+    }
+
+    #[test]
     fn usage_skips_the_projection() {
         let s = test_session(vec![Event {
             msg: 0,

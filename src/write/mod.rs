@@ -30,7 +30,7 @@ pub(super) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Mapping version recorded in every import. Bump it whenever the writers
 /// change what they emit, so `sync` can re-import and upgrade old copies.
-pub(crate) const MAPPING: u32 = 8;
+pub(crate) const MAPPING: u32 = 9;
 
 /// Shown as a system message at the top of every import: the transcript that
 /// follows already ran somewhere else and must not be treated as live state.

@@ -16,6 +16,9 @@
   Error`: the import-note message reused the constant id `msg_000000-note`
   while v2 message ids are globally unique. The note id is now per-session,
   and `XSES_KEEP_PAYLOAD=1` keeps the import payload for manual replays.
+- Fixed codex imports of sessions with composite call ids (`call_x|fc_y`):
+  result rows now share the call side's mapped id instead of carrying the
+  raw id (which also tripped the new SQL allowlist). MAPPING 8 → 9.
 
 ## 0.7.2
 

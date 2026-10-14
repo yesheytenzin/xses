@@ -233,8 +233,12 @@ impl Roller<'_> {
         duration_ms: Option<u64>,
         ts: Option<chrono::DateTime<chrono::Utc>>,
     ) {
+        // Same mapping the call side used, so both sides of the pair share
+        // one target-safe id (`call_x|fc_y` sources map to `call_x`) and the
+        // pending lookup below compares like with like.
         let id = call_id
             .clone()
+            .map(|c| self.ids.get(&c))
             .or_else(|| {
                 self.pending
                     .iter()

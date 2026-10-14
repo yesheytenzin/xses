@@ -226,12 +226,19 @@ mod tests {
             ],
         };
         let native = skill_history(&source);
-        assert!(
-            matches!(&native.events[0].block, Block::ToolCall { args, .. } if args.contains("/recorded/skill/SKILL.md"))
-        );
-        let Block::ToolCall { call_id: first, .. } = &native.events[0].block else {
+        let Block::ToolCall {
+            call_id: first,
+            args,
+            ..
+        } = &native.events[0].block
+        else {
             panic!("skill read")
         };
+        let input: Value = serde_json::from_str(args).unwrap();
+        assert_eq!(
+            std::path::PathBuf::from(input["path"].as_str().unwrap()),
+            std::path::Path::new("/recorded/skill").join("SKILL.md")
+        );
         let Block::ToolResult {
             call_id: second,
             output,

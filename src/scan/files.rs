@@ -268,6 +268,13 @@ fn bytes_at(file: &mut File, offset: u64, length: u64) -> Result<Vec<u8>> {
 fn summarize(path: &Path, tool: Tool, stamp: Stamp, previous: Option<&Entry>) -> Result<Entry> {
     let mut file = File::open(path)?;
     let mut state = State::default();
+    // Omp-shaped imports carry provenance in a sidecar (their records must
+    // stay native-shaped), so a sidecarred file is an import even when its
+    // content reads native. Adopt the sidecar's source for the display title.
+    if let Some((source, _)) = crate::write::sidecar_provenance(path) {
+        state.imported = true;
+        state.source = state.source.or(Some(source));
+    }
     if tool == Tool::Claude {
         state.id = path
             .file_stem()

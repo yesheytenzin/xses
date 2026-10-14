@@ -103,24 +103,32 @@ fn imports() -> anyhow::Result<()> {
     println!("\nimports");
     println!("  index     {}", path.display());
     println!("  recorded  {} source sessions", sources.len());
-    let (artifacts, stale) = artifact_health()?;
+    let (artifacts, stale, unmarked) = artifact_health()?;
     println!("  artifacts {artifacts}");
     if stale > 0 {
         println!("  stale     {stale} index records point at missing artifacts");
     }
+    if unmarked > 0 {
+        println!(
+            "  unmarked  {unmarked} recorded files carry no import marker — possible native files claimed by the index (left alone; inspect before cleaning)"
+        );
+    }
     Ok(())
 }
 
-/// One pass over the index: recorded artifacts, and how many point at
-/// artifacts that no longer exist.
-fn artifact_health() -> anyhow::Result<(usize, usize)> {
+/// One pass over the index: recorded artifacts, how many point at
+/// artifacts that no longer exist, and how many point at files with no
+/// import marker (inline or sidecar) — a record claiming a native file
+/// must never be cleaned on blind trust.
+fn artifact_health() -> anyhow::Result<(usize, usize, usize)> {
     let p = index::path()?;
     if !p.exists() {
-        return Ok((0, 0));
+        return Ok((0, 0, 0));
     }
     use std::io::BufRead;
     let mut recorded = 0;
     let mut stale = 0;
+    let mut unmarked = 0;
     for line in std::io::BufReader::new(std::fs::File::open(p)?)
         .lines()
         .map_while(Result::ok)
@@ -135,9 +143,22 @@ fn artifact_health() -> anyhow::Result<(usize, usize)> {
                 None => !Path::new(&path).exists(),
             };
             stale += usize::from(missing);
+            // Existing file artifacts must read as imports (inline marker
+            // or sidecar); otherwise the record may claim a native file.
+            // opencode:// ids and sidecars themselves are skipped: the
+            // former live in SQLite, the latter are provenance by shape.
+            if !missing
+                && !path.starts_with("opencode://")
+                && !path.ends_with(".xses.json")
+                && Path::new(&path).extension().and_then(|e| e.to_str()) == Some("jsonl")
+                && !crate::sync::first_line_has_marker(Path::new(&path))
+                && crate::write::sidecar_provenance(Path::new(&path)).is_none()
+            {
+                unmarked += 1;
+            }
         }
     }
-    Ok((recorded, stale))
+    Ok((recorded, stale, unmarked))
 }
 
 /// Recent failures from the journal (the newest `limit`), one line each: the

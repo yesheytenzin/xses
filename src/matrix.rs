@@ -98,6 +98,36 @@ fn fingerprints_key_target_source_and_mapping() {
     );
 }
 
+/// Two-layer identity: the fingerprint moves with content (mtime/size),
+/// while the artifact revision is content-blind — so a live source's
+/// updates overwrite the same paths instead of minting new ones.
+#[test]
+fn identity_is_stable_while_fingerprint_tracks_content() {
+    let a = session(Tool::Omp, "01a1349e");
+    let mut b = a.clone();
+    b.mtime += chrono::Duration::seconds(60);
+    b.size += 1;
+    assert_ne!(
+        fingerprint(Tool::Pi, &a, None),
+        fingerprint(Tool::Pi, &b, None),
+        "content change must re-import"
+    );
+    assert_eq!(
+        crate::write::artifact_revision(),
+        crate::write::artifact_revision(),
+        "artifact identity must not depend on content"
+    );
+    assert!(
+        crate::write::artifact_revision().contains(&crate::write::MAPPING.to_string()),
+        "identity migrates with the mapping"
+    );
+    // Same session+target always maps to one import slug.
+    assert_eq!(
+        import_id_for(Tool::Pi, "01a1349e@m10"),
+        import_id_for(Tool::Pi, "01a1349e@m10")
+    );
+}
+
 /// Failure-mode contracts: hostile ids never reach SQL (rejected at the
 /// choke point), and cleaning nothing touches nothing.
 #[test]

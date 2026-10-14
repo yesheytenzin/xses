@@ -122,10 +122,18 @@ fn clean_impl(
             } else {
                 path.to_owned()
             };
+            // Sidecars are collected with their session, never alone:
+            // the session leg below bundles an existing sidecar.
+            if name.ends_with(".xses.json") {
+                continue;
+            }
+            let sidecarred =
+                name.ends_with(".jsonl") && crate::write::sidecar_provenance(path).is_some();
             let imported = is_import_filename(&name)
                 || (name.ends_with(".bak")
                     && (is_import_stem(&name) || first_line_has_marker(path)))
                 || (name.ends_with(".jsonl") && first_line_has_marker(path))
+                || sidecarred
                 || (name == "custom-title.json" && first_line_has_marker(&marker_path));
             if !imported {
                 continue;
@@ -135,7 +143,18 @@ fn clean_impl(
                     || selection_matcher(Some(selected))(&name)
             });
             if selected {
+                if !removable_import(path) {
+                    eprintln!(
+                        "clean: skipping unmarked file {} (not provably an import)",
+                        path.display()
+                    );
+                    continue;
+                }
                 paths.insert(path.into());
+                let sidecar = path.with_extension("xses.json");
+                if sidecar.exists() {
+                    paths.insert(sidecar);
+                }
             }
         }
     }
@@ -152,6 +171,9 @@ fn clean_impl(
 }
 
 fn import_provenance(path: &std::path::Path) -> Option<(Tool, String)> {
+    if let Some(provenance) = crate::write::sidecar_provenance(path) {
+        return Some(provenance);
+    }
     let head = crate::jsonl::head_bytes(path, 64 * 1024)?;
     let row: serde_json::Value = serde_json::from_str(head.lines().next()?).ok()?;
     let marker = row
@@ -530,8 +552,13 @@ fn write_target(
             result.loss.merge(loss);
             continue;
         }
-        // A new generation cannot overwrite the last working import.
-        let outcome = crate::write::session_revision(target, canonical, &key);
+        // Identity is stable per session+target (`artifact_revision`):
+        // the new generation overwrites the same paths in place (atomic
+        // renames, idempotent rows), so a live source updates without
+        // minting orphans. A failed write bails before publishing, and the
+        // last working import stays recorded and on disk.
+        let outcome =
+            crate::write::session_revision(target, canonical, &crate::write::artifact_revision());
         match outcome {
             Ok((artifacts, loss)) => {
                 updates.push(Record {
@@ -582,6 +609,12 @@ pub(crate) fn retire_artifacts(paths: &[PathBuf]) -> Result<()> {
         {
             crate::write::retire_codex(path)?;
         }
+        if !removable_import(path) {
+            // Defense in depth with the write-side clobber guard: a record
+            // pointing at a native file must fail loudly, never delete.
+            // The error keeps the record for a later retry (and a human).
+            anyhow::bail!("refusing to retire unmarked file {}", path.display());
+        }
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -590,6 +623,28 @@ pub(crate) fn retire_artifacts(paths: &[PathBuf]) -> Result<()> {
     }
     crate::scan::delete_opencode_sessions(&opencode, &crate::progress::Progress::disabled())?;
     Ok(())
+}
+
+/// True when a file artifact is provably an import (import-shaped name,
+/// inline marker, or sidecar) and may be removed. A recorded path without
+/// any of these is treated as native: removing it could delete a live
+/// session (verified live — a same-millisecond native file once shared an
+/// import's filename). Callers skip such files with a warning instead.
+pub(crate) fn removable_import(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    // Sidecars and title sidecars are provenance by shape.
+    if name.ends_with(".xses.json") || name == "custom-title.json" {
+        return true;
+    }
+    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+        return true;
+    }
+    is_import_filename(name)
+        || first_line_has_marker(path)
+        || crate::write::sidecar_provenance(path).is_some()
 }
 
 /// True for xses-written filenames, which are structurally distinct from
@@ -621,7 +676,7 @@ fn is_import_stem(name: &str) -> bool {
 }
 
 /// True if the file's first line carries an xses or legacy provenance marker.
-fn first_line_has_marker(path: &std::path::Path) -> bool {
+pub(crate) fn first_line_has_marker(path: &std::path::Path) -> bool {
     let Some(head) = crate::jsonl::head_bytes(path, 2000) else {
         return false;
     };
@@ -635,6 +690,29 @@ fn first_line_has_marker(path: &std::path::Path) -> bool {
 mod tests {
     use super::*;
     use crate::index::decode_paths;
+
+    #[test]
+    fn only_provable_imports_are_removable() {
+        let dir = std::env::temp_dir().join(format!("xses-removable-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let native = dir.join("2026-10-13T18-34-28_01a1368b-6a19-7856-8469-0a3b2f4f2086.jsonl");
+        std::fs::write(&native, "{\"type\":\"title\",\"source\":\"auto\"}\n").unwrap();
+        // A native-shaped file with no marker or sidecar must never be
+        // removed, even when an index record claims it.
+        assert!(!removable_import(&native));
+        // An inline marker, an import-shaped name, or a sidecar each suffice.
+        let marked = dir.join("2026-10-14T05-35-19_5ab5d48bf3904da389f6f3905ab5d48b.jsonl");
+        std::fs::write(&marked, "{\"xses\":{\"source\":\"codex\"}}\n").unwrap();
+        assert!(removable_import(&marked));
+        std::fs::write(
+            dir.join("2026-10-13T18-34-28_01a1368b-6a19-7856-8469-0a3b2f4f2086.xses.json"),
+            "{\"source\":\"codex\",\"srcId\":\"x\"}",
+        )
+        .unwrap();
+        assert!(removable_import(&native));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn index_paths_support_commas_without_breaking_legacy_lines() {

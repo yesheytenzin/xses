@@ -175,7 +175,8 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let old = dir.join("old.jsonl");
         let new = dir.join("new.jsonl");
-        std::fs::write(&old, b"old").unwrap();
+        // Marked: provably an import, so retirement proceeds.
+        std::fs::write(&old, b"{\"xses\":{\"source\":\"claude\"}}\n").unwrap();
         std::fs::write(&new, b"new").unwrap();
         let old_record = Record {
             key: "pi|claude|source|old".into(),
@@ -193,12 +194,33 @@ mod tests {
         index.save().unwrap();
         index.commit(Vec::new()).unwrap();
         assert!(!old.exists());
-        assert_eq!(std::fs::read(new).unwrap(), b"new");
+        assert_eq!(std::fs::read(&new).unwrap(), b"new");
         assert_eq!(index.records.len(), 1);
         assert_eq!(index.keys(), HashSet::from(["pi|claude|source|new".into()]));
         assert!(!std::fs::read_to_string(&index.path)
             .unwrap()
             .contains("|old"));
+        // An unmarked file at a recorded path is treated as native:
+        // retirement refuses and the record survives for a human.
+        let native = dir.join("native.jsonl");
+        std::fs::write(&native, b"{\"type\":\"title\",\"source\":\"auto\"}\n").unwrap();
+        let mut index2 = Index {
+            path: dir.join("index2.jsonl"),
+            records: vec![
+                Record {
+                    key: "pi|claude|source|old".into(),
+                    paths: vec![native.clone()],
+                },
+                Record {
+                    key: "pi|claude|source|new".into(),
+                    paths: vec![new.clone()],
+                },
+            ],
+        };
+        index2.save().unwrap();
+        index2.commit(Vec::new()).unwrap();
+        assert!(native.exists(), "native file must survive");
+        assert_eq!(index2.records.len(), 2, "record must be kept");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

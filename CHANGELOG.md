@@ -19,6 +19,11 @@
 - Fixed codex imports of sessions with composite call ids (`call_x|fc_y`):
   result rows now share the call side's mapped id instead of carrying the
   raw id (which also tripped the new SQL allowlist). MAPPING 8 → 9.
+- Omp/pi imports now carry `*.xses.json` provenance sidecars (recorded,
+  swept, and read by scan); writers refuse to overwrite unmarked files,
+  and `clean`/retirement refuse to delete them — a record can no longer
+  aim at a native session. `doctor` reports `unmarked` records.
+  MAPPING 9 → 10 (stable artifact identity) → 11 (sidecars).
 
 ## 0.7.2
 

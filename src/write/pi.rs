@@ -16,8 +16,10 @@ pub(super) fn write(
     target: Tool,
     session: &CanonicalSession,
     revision: Option<&str>,
-) -> Option<PathBuf> {
-    let home = dirs::home_dir()?;
+) -> Vec<Option<PathBuf>> {
+    let Some(home) = dirs::home_dir() else {
+        return vec![None, None];
+    };
     let is_omp = matches!(target, Tool::Omp);
     // pi wraps the absolute path slug; omp strips home then wraps segments.
     // The store is chosen by the TARGET, not the source.
@@ -48,6 +50,20 @@ pub(super) fn write(
             import_id(session.tool, &super::artifact_key(session, revision))
         }
     ));
+    let subject = format!("{} {}", session.tool.as_str(), session.id);
+    // Never adopt a native path: omp-shaped filenames carry the source's
+    // own timestamp and a timestamp-derived uuid, so a same-millisecond
+    // native session can share the full filename (verified live — an index
+    // record once pointed at a native file). Overwriting it would corrupt
+    // the store; refusing keeps the native session intact and the failure
+    // journalled for a human to resolve.
+    if target.exists() && !super::target_is_ours(&target) {
+        super::journal_failure(
+            &subject,
+            &format!("refusing to overwrite unmarked file {}", target.display()),
+        );
+        return vec![None, None];
+    }
     let sid = if is_omp {
         omp_id(session, revision)
     } else {
@@ -323,14 +339,11 @@ pub(super) fn write(
             parent = Some(mid);
         }
     }
-    if !super::atomic_write_journaled(
-        &target,
-        &buf,
-        &format!("{} {}", session.tool.as_str(), session.id),
-    ) {
-        return None;
+    if !super::atomic_write_journaled(&target, &buf, &subject) {
+        return vec![None, None];
     }
-    Some(target)
+    let sidecar = super::write_import_sidecar(&target, session, &subject);
+    vec![Some(target), sidecar]
 }
 
 /// Model for a pi import, by provenance priority: the source transcript's
@@ -491,5 +504,130 @@ mod tests {
         let blocks = vec![&gap, &user];
         assert_eq!(group_role(&blocks, Role::Assistant), Role::User);
         let _ = Event { msg: 0, block: gap };
+    }
+}
+
+#[cfg(test)]
+mod sidecar_tests {
+    use super::super::*;
+    use super::*;
+    /// Scratch `$HOME` for writer tests (serialized by `HOME_LOCK`: writers
+    /// resolve their store through `dirs::home_dir()`).
+    struct ScratchHome {
+        _serial: std::sync::MutexGuard<'static, ()>,
+        dir: PathBuf,
+        prev_home: Option<std::ffi::OsString>,
+        prev_xdg: Option<std::ffi::OsString>,
+    }
+
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            match &self.prev_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.prev_xdg {
+                Some(v) => std::env::set_var("XDG_DATA_HOME", v),
+                None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn scratch_home() -> ScratchHome {
+        let serial = HOME_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = std::env::temp_dir().join(format!("xses-pi-sidecar-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let prev_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &dir);
+        // dirs::data_dir() prefers XDG_DATA_HOME over $HOME: without this,
+        // journal writes during tests land in the real journal.
+        let prev_xdg = std::env::var_os("XDG_DATA_HOME");
+        std::env::set_var("XDG_DATA_HOME", dir.join(".local/share"));
+        ScratchHome {
+            _serial: serial,
+            dir,
+            prev_home,
+            prev_xdg,
+        }
+    }
+
+    fn omp_session() -> CanonicalSession {
+        CanonicalSession {
+            id: "01a1368b-6a19-7856-8469-0a3b2f4f2086".into(),
+            tool: Tool::Codex,
+            cwd: "/tmp/project".into(),
+            created: chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0).unwrap(),
+            title: Some("probe".into()),
+            msg_times: Default::default(),
+            events: vec![crate::canonical::Event {
+                msg: 0,
+                block: Block::Text {
+                    role: Role::User,
+                    text: "hi".into(),
+                },
+            }],
+        }
+    }
+
+    #[test]
+    fn omp_imports_carry_a_provenance_sidecar() {
+        let home = scratch_home();
+        let dir = &home.dir;
+        let out = write(Tool::Omp, &omp_session(), Some("m11"));
+        assert_eq!(out.len(), 2, "session + sidecar");
+        let session = out[0].clone().expect("session written");
+        let sidecar = out[1].clone().expect("sidecar written");
+        assert_eq!(sidecar, import_sidecar(&session));
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&sidecar).unwrap()).unwrap();
+        assert_eq!(v.get("source").and_then(|s| s.as_str()), Some("codex"));
+        assert_eq!(
+            v.get("srcId").and_then(|s| s.as_str()),
+            Some("01a1368b-6a19-7856-8469-0a3b2f4f2086")
+        );
+        // The session record itself stays native-shaped: no inline marker.
+        let head = std::fs::read_to_string(&session).unwrap();
+        assert!(
+            !head.contains("\"xses\":"),
+            "must stay byte-identical to native shape"
+        );
+        // Scan attribution reads the sidecar, not the content.
+        assert_eq!(
+            sidecar_provenance(&session).map(|(t, _)| t),
+            Some(Tool::Codex)
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        drop(home);
+    }
+
+    #[test]
+    fn omp_write_refuses_unmarked_files() {
+        let home = scratch_home();
+        let dir = &home.dir;
+        let session = omp_session();
+        // First write lands session + sidecar.
+        let out = write(Tool::Omp, &session, Some("m11"));
+        let path = out[0].clone().expect("session written");
+        // Lose the sidecar and the markers: what remains reads native.
+        std::fs::remove_file(import_sidecar(&path)).ok();
+        // Rewriting our own unmarked-shaped copy must fail loudly, and the
+        // file must be byte-identical afterwards — never adopted.
+        let before = std::fs::read(&path).unwrap();
+        let retry = write(Tool::Omp, &session, Some("m11"));
+        assert!(
+            retry.iter().all(|o| o.is_none()),
+            "unmarked file must be refused"
+        );
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "native file untouched"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        drop(home);
     }
 }

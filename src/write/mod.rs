@@ -30,7 +30,7 @@ pub(super) static HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Mapping version recorded in every import. Bump it whenever the writers
 /// change what they emit, so `sync` can re-import and upgrade old copies.
-pub(crate) const MAPPING: u32 = 9;
+pub(crate) const MAPPING: u32 = 11;
 
 /// Shown as a system message at the top of every import: the transcript that
 /// follows already ran somewhere else and must not be treated as live state.
@@ -223,7 +223,7 @@ pub fn session_revision(
 ) -> Result<(Vec<PathBuf>, LossReport)> {
     let (_, report) = session.transfer_summary();
     let files = match target {
-        Tool::Pi | Tool::Omp => vec![pi::write(target, session, Some(revision))],
+        Tool::Pi | Tool::Omp => pi::write(target, session, Some(revision)),
         Tool::Claude => claude::write(session, Some(revision)),
         Tool::Codex => vec![codex::write(session, Some(revision))],
         Tool::Opencode => vec![opencode::write(session, Some(revision))],
@@ -237,6 +237,20 @@ pub fn session_revision(
     Ok((files.into_iter().flatten().collect(), report))
 }
 
+/// Stable artifact identity for one session in one target: the mapping
+/// version only — never content, mtime, or size. Two-layer design:
+/// `sync::fingerprint` (content-sensitive) decides *whether* to write;
+/// this decides *where*, so a live source updates its copies in place
+/// instead of minting a new filename/session id per sync. Writers are
+/// overwrite-safe (atomic temp→rename files, `INSERT OR REPLACE` rows,
+/// opencode's delete-and-reimport on id conflict), and the index
+/// reconciles by pair, retiring only paths the new record doesn't share —
+/// identical paths mean nothing is retired. Tied to the mapping so a
+/// mapping bump still migrates every copy to the new shape.
+pub fn artifact_revision() -> String {
+    format!("m{MAPPING}")
+}
+
 pub(super) fn artifact_key(session: &CanonicalSession, revision: Option<&str>) -> String {
     match revision {
         Some(revision) => format!("{}@{revision}", session.id),
@@ -244,6 +258,58 @@ pub(super) fn artifact_key(session: &CanonicalSession, revision: Option<&str>) -
     }
 }
 
+/// Sidecar provenance for pi/omp imports: `<session>.xses.json` next to
+/// the import, carrying `{source, srcId, mapping}`. Omp-shaped records
+/// must stay byte-identical to native ones (the store validates their
+/// fields), so they cannot hold an inline marker — the sidecar is what
+/// makes them detectable as imports (scan echo protection, clean sweep)
+/// and what proves an existing file is ours before overwriting it.
+/// A recorded path without a sidecar or inline marker is treated as
+/// native: writers refuse to adopt it, and doctor flags the record.
+pub(super) fn import_sidecar(session_path: &Path) -> PathBuf {
+    session_path.with_extension("xses.json")
+}
+
+/// Read sidecar provenance: `(source tool, source id)` when the sidecar
+/// exists and parses, so scan and clean can attribute sidecar-marked
+/// files without trusting their (native-shaped) content.
+pub(crate) fn sidecar_provenance(session_path: &Path) -> Option<(Tool, String)> {
+    let raw = fs::read(import_sidecar(session_path)).ok()?;
+    let v: Value = serde_json::from_str(&String::from_utf8_lossy(&raw)).ok()?;
+    Some((
+        Tool::parse(v.get("source")?.as_str()?)?,
+        v.get("srcId")?.as_str()?.to_owned(),
+    ))
+}
+
+/// Write the sidecar for a freshly written import. Returns the sidecar
+/// path on success; writers record it alongside the session so clean
+/// removes both and the next generation overwrites both in place.
+pub(super) fn write_import_sidecar(
+    session_path: &Path,
+    session: &CanonicalSession,
+    subject: &str,
+) -> Option<PathBuf> {
+    let sidecar = import_sidecar(session_path);
+    let bytes = serde_json::to_vec_pretty(&serde_json::json!({
+        "source": session.tool.as_str(),
+        "srcId": session.id,
+        "mapping": MAPPING,
+    }))
+    .ok()?;
+    if !atomic_write_journaled(&sidecar, &bytes, subject) {
+        return None;
+    }
+    Some(sidecar)
+}
+
+/// True when an existing file is provably ours (inline marker or sidecar)
+/// and may be overwritten by a new generation. Anything else at the target
+/// path is native: adopting it would corrupt the store and poison the
+/// index with a record pointing at a native file.
+pub(super) fn target_is_ours(path: &Path) -> bool {
+    crate::sync::first_line_has_marker(path) || sidecar_provenance(path).is_some()
+}
 /// Import artifact id for a source session; import filenames and opencode
 /// slugs embed it, so `clean` can map artifacts back to their session.
 pub fn import_id_for(tool: Tool, id: &str) -> String {

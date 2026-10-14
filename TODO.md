@@ -51,3 +51,19 @@
   mapped id (pending lookup compares like with like). MAPPING 8 → 9 so old
   raw-id copies upgrade; regression test
   `composite_call_ids_meet_on_the_mapped_value` green.
+
+- [x] 13. omp imports were unmarked + a record pointed at a native file
+  (live incident): the omp writer mimics native record shapes (validated
+  fields), so copies carried no `xses` marker — invisible to echo
+  protection and clean — and a same-millisecond native filename collided
+  with an import path, leaving an index record aimed at a live native
+  session (one `clean` away from deleting it). Fixed in depth:
+  `*.xses.json` provenance sidecars (mirroring claude) written + recorded
+  + read by scan/sweep/provenance; writers refuse to overwrite unmarked
+  files (`target_is_ours` clobber guard); `clean` and `retire_artifacts`
+  refuse unmarked files instead of deleting; `doctor` reports `unmarked`
+  records. MAPPING 10 → 11. Regression tests: sidecar round-trip,
+  clobber refusal (file byte-identical), `removable_import` predicate,
+  index keeps records whose retirement is refused.
+  Also fixed: test journal pollution via `XDG_DATA_HOME` (it overrides
+  `$HOME` for `dirs::data_dir`).

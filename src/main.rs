@@ -8,6 +8,8 @@ mod extract;
 mod index;
 mod issues;
 mod jsonl;
+#[cfg(test)]
+mod matrix;
 mod model;
 mod picker;
 mod proc;

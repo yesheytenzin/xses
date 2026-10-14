@@ -152,19 +152,9 @@ fn issues(limit: usize) {
     let width = report_width();
     let mut cut = false;
     for issue in recent {
-        // Journalled text is verbatim (another CLI's own output, escapes and
-        // all); a report line must not carry those escapes to the terminal.
-        let head = format!(
-            "  {} {:<16} {} — ",
-            issue.at.format("%m-%d %H:%M"),
-            issue.kind,
-            crate::ansi::strip(&issue.subject)
-        );
-        let budget = width.saturating_sub(head.chars().count()).max(24);
-        let detail = crate::text::collapse(&crate::ansi::strip(&issue.detail));
-        let line = crate::text::shorten(&detail, budget);
-        cut |= line != detail;
-        println!("{head}{line}");
+        let (line, truncated) = format_issue_line(&issue, width);
+        cut |= truncated;
+        println!("{line}");
     }
     if cut {
         if let Some(path) = crate::issues::path() {
@@ -173,6 +163,26 @@ fn issues(limit: usize) {
     }
 }
 
+/// One journal entry → one printable line. Pure (no terminal, no clock
+/// beyond the entry's own stamp) so tests pin it with fixture outputs.
+/// Returns the line plus whether the detail was truncated.
+///
+/// Journalled text is verbatim — another CLI's own output, escapes and
+/// all — so classification stays structural (kind/subject), never a match
+/// on upstream wording: only stripping and shortening touch the detail.
+fn format_issue_line(issue: &crate::issues::Issue, width: usize) -> (String, bool) {
+    let head = format!(
+        "  {} {:<16} {} — ",
+        issue.at.format("%m-%d %H:%M"),
+        issue.kind,
+        crate::ansi::strip(&issue.subject)
+    );
+    let budget = width.saturating_sub(head.chars().count()).max(24);
+    let detail = crate::text::collapse(&crate::ansi::strip(&issue.detail));
+    let line = crate::text::shorten(&detail, budget);
+    let truncated = line != detail;
+    (format!("{head}{line}"), truncated)
+}
 /// Line budget: the terminal's width, capped so one issue still reads as one
 /// line on a very wide screen.
 fn report_width() -> usize {
@@ -184,13 +194,54 @@ fn report_width() -> usize {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use chrono::TimeZone as _;
+
+    fn entry(kind: &str, subject: &str, detail: &str) -> crate::issues::Issue {
+        crate::issues::Issue {
+            at: chrono::Utc
+                .with_ymd_and_hms(2026, 10, 13, 9, 30, 0)
+                .unwrap(),
+            kind: kind.into(),
+            subject: subject.into(),
+            detail: detail.into(),
+        }
+    }
+
+    /// Fixture outputs shaped like real journal rows (anonymized, trimmed
+    /// to the shape — never matched verbatim in production).
+    const SQLITE_LOCKED: &str =
+        "exit status: 1 Error: database is locked | Failed query: insert into \"thread_items\"";
+    const SQLITE_SCHEMA: &str =
+        "exit status: 1 Error: Unexpected error | | Failed query: insert into \"message\"";
+    const CLI_MISSING: &str =
+        "launch sqlite3 for codex thread registration: No such file or directory";
+
     #[test]
     fn issue_details_become_one_short_line() {
-        let sql =
-            "exit status: 1 Error: Unexpected error | | Failed query: insert into \"message\"";
-        let line = crate::text::shorten(&crate::text::collapse(sql), 40);
-        assert!(line.chars().count() <= 40, "{line}");
-        assert!(line.ends_with('…'), "{line}");
-        assert_eq!(crate::text::shorten("exit status: 1", 80), "exit status: 1");
+        for detail in [SQLITE_LOCKED, SQLITE_SCHEMA, CLI_MISSING] {
+            // Width 96: the head (~41 chars) leaves room for a truncated detail.
+            let (line, truncated) = format_issue_line(&entry("codex-seed", "ses_abc", detail), 96);
+            assert_eq!(line.lines().count(), 1, "{line}");
+            assert!(line.contains("ses_abc"), "{line}");
+            assert!(!line.contains('\x1b'), "{line}");
+            // Long details truncate with an ellipsis marker.
+            assert!(truncated, "{line}");
+            assert!(line.chars().count() <= 96, "{line}");
+        }
+        // Short details pass through unmarked.
+        let (line, truncated) =
+            format_issue_line(&entry("opencode-import", "ses_abc", "exit status: 1"), 80);
+        assert!(!truncated, "{line}");
+        assert!(line.ends_with("exit status: 1"), "{line}");
+    }
+
+    #[test]
+    fn ansi_escapes_never_reach_the_report_line() {
+        let (line, _) = format_issue_line(
+            &entry("k", "\x1b[31mses_abc\x1b[0m", "\x1b[1mdetail\x1b[0m"),
+            80,
+        );
+        assert!(!line.contains('\x1b'), "{line}");
     }
 }

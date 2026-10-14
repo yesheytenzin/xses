@@ -16,60 +16,6 @@ use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
-use std::time::Duration;
-
-/// Sessions deleted per sqlite3 invocation. Import rows are blob-heavy and
-/// free at roughly 3k rows/s on a store with hundreds of imports, so one
-/// monolithic transaction outlives any sane deadline; chunks keep each
-/// command bounded and make progress visible.
-const OPENCODE_DELETE_CHUNK: usize = 128;
-
-fn delete_opencode_imports(
-    ids: &HashSet<String>,
-    progress: &crate::progress::Progress,
-) -> Result<usize> {
-    if ids.is_empty() {
-        return Ok(0);
-    }
-    let Some(db) = crate::scan::opencode_db() else {
-        return Ok(0);
-    };
-    let total = ids.len();
-    let mut removed = 0usize;
-    let ids: Vec<&String> = ids.iter().collect();
-    for chunk in ids.chunks(OPENCODE_DELETE_CHUNK) {
-        let quoted = chunk
-            .iter()
-            .map(|id| format!("'{}'", id.replace('\'', "''")))
-            .collect::<Vec<_>>()
-            .join(",");
-        // Both store generations: v1 (`session`/`message`/`part`) always,
-        // v2 (`session_v2`/`session_message`) when the store has it.
-        let v2 = if crate::scan::opencode_has_v2(&db) {
-            format!(
-                " DELETE FROM session_message WHERE session_id IN ({quoted}); \
-                 DELETE FROM session_v2 WHERE id IN ({quoted});"
-            )
-        } else {
-            String::new()
-        };
-        let sql = format!(
-            "PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; \
-             DELETE FROM part WHERE session_id IN ({quoted}); \
-             DELETE FROM message WHERE session_id IN ({quoted}); \
-             DELETE FROM session WHERE id IN ({quoted});{v2} COMMIT;"
-        );
-        // Generous per chunk: 128 sessions of imports measure at ~20-30s.
-        if let Err(e) =
-            crate::proc::sqlite_exec(&db, &sql, Duration::from_secs(300), "OpenCode bulk cleanup")
-        {
-            anyhow::bail!("OpenCode bulk cleanup failed after {removed}/{total}: {e}");
-        }
-        removed += chunk.len();
-        progress.inc(&format!("opencode {removed}/{total} sessions"));
-    }
-    Ok(removed)
-}
 
 fn acquire_index_lock() -> Result<crate::storage::Lock> {
     let path = crate::index::path()?.with_extension("lock");
@@ -527,11 +473,15 @@ fn sync_batch(
     })?;
     let mut updates = Vec::new();
     for (result, records) in completed {
-        let total = report
+        let Some(total) = report
             .targets
             .iter_mut()
             .find(|t| t.target == result.target)
-            .expect("known target");
+        else {
+            // Targets are built from the same list the workers run, so a
+            // miss is a logic bug — fail loudly instead of panicking.
+            anyhow::bail!("sync worker reported unknown target");
+        };
         total.written += result.written;
         total.skipped += result.skipped;
         total.failed.extend(result.failed);
@@ -638,7 +588,7 @@ pub(crate) fn retire_artifacts(paths: &[PathBuf]) -> Result<()> {
             Err(e) => return Err(e).with_context(|| format!("retire {}", path.display())),
         }
     }
-    delete_opencode_imports(&opencode, &crate::progress::Progress::disabled())?;
+    crate::scan::delete_opencode_sessions(&opencode, &crate::progress::Progress::disabled())?;
     Ok(())
 }
 

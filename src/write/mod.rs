@@ -34,6 +34,16 @@ pub(crate) const MAPPING: u32 = 8;
 
 /// Shown as a system message at the top of every import: the transcript that
 /// follows already ran somewhere else and must not be treated as live state.
+/// Default mime when an image block carries no type. One canonical default
+/// (TODO-8): every writer resolves through [`image_mime`], never a string
+/// literal of its own.
+pub(super) const DEFAULT_IMAGE_MIME: &str = "image/png";
+
+/// Borrowed mime for an image block, defaulting to [`DEFAULT_IMAGE_MIME`].
+pub(super) fn image_mime(mime: &Option<String>) -> &str {
+    mime.as_deref().unwrap_or(DEFAULT_IMAGE_MIME)
+}
+
 pub(super) const IMPORT_NOTE: &str = "Imported history from another agent's session. \
      The tool calls and results below already executed there; treat them as a transcript to \
      read, never as pending state to continue.";
@@ -53,6 +63,8 @@ pub(super) fn fallback_text(block: &Block) -> Option<String> {
             "[image reference: {} ({bytes} bytes)]",
             path.as_ref()
                 .map(|p| p.display().to_string())
+                // Intentional fallback: a display label, never a mime —
+                // resolved via `image_mime` wherever the target needs one.
                 .unwrap_or_else(|| mime.clone().unwrap_or_else(|| "image".into()))
         )),
         Block::Context { kind, text, path } => {
@@ -123,6 +135,8 @@ pub(super) fn usage_of(blocks: &[&Block]) -> Usage {
             }),
             _ => None,
         })
+        // Intentional fallback: no usage block means zero usage — the
+        // zero value is the correct accounting, not missing data.
         .unwrap_or_default()
 }
 
@@ -378,6 +392,9 @@ pub(super) fn journal_failure(subject: &str, detail: &str) {
 }
 
 pub(super) fn push(buf: &mut Vec<u8>, v: &Value) {
+    // Intentional fallback: serializing a `Value` fails only on allocator
+    // failure (keys are always strings, floats always finite), so an empty
+    // line here is a theoretical OOM path, not a data-shape risk.
     buf.extend(serde_json::to_vec(v).unwrap_or_default());
     buf.push(b'\n');
 }

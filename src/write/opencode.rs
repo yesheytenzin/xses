@@ -74,6 +74,11 @@ struct Builder {
     folded: std::collections::HashMap<String, (String, bool, Option<u64>)>,
     model_id: String,
     provider_id: String,
+    /// Session id stem for the import-note message id. Message ids are
+    /// globally unique in v2 stores, so a constant note id 500s every
+    /// import after the first (verified live); scoping it per session
+    /// keeps re-imports deterministic without collisions.
+    ses: String,
 }
 
 impl Builder {
@@ -120,7 +125,7 @@ impl Builder {
                 // The note is assistant speech: it gets its own row ahead of
                 // a leading user message so roles stay clean.
                 note = Some(json!({
-                    "id": "msg_000000-note",
+                    "id": format!("msg_{}-note", self.ses.strip_prefix("ses_").unwrap_or(&self.ses)),
                     "type": "assistant",
                     "agent": "build",
                     "model": {"id": self.model_id, "providerID": self.provider_id},
@@ -196,7 +201,7 @@ impl Builder {
                         // User rows carry pictures as file entries
                         // (data/mime/source/name, verified live).
                         Some(d) if matches!(role, Role::User) => {
-                            let mime = mime.clone().unwrap_or_else(|| "image/png".to_string());
+                            let mime = super::image_mime(mime).to_string();
                             let filename = path
                                 .as_ref()
                                 .and_then(|p| p.file_name())
@@ -373,6 +378,7 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         folded: std::collections::HashMap::new(),
         model_id,
         provider_id,
+        ses: ses.clone(),
     };
     builder.fold(&groups);
     // Import note rides on the first message as assistant text, so a resumed
@@ -448,20 +454,41 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
         super::journal_failure(&subject, &format!("{}: {e}", tmp.display()));
         return None;
     }
+    // Debug hatch: keep the payload for manual replays
+    // (`opencode session import --directory …`) when the server 500s.
+    let keep_payload = std::env::var_os("XSES_KEEP_PAYLOAD").is_some();
+    // Named retry policy (TODO-10): attempts, base delay, deadline slope.
+    const IMPORT_ATTEMPTS: u32 = 3;
+    const RETRY_BASE_MS: u64 = 750;
+    const DEADLINE_BASE_SECS: u64 = 60;
+    const DEADLINE_PER_MB_SECS: u64 = 3;
     // Imports are serial per OpenCode store. The deadline scales with payload
     // size; retries only contend with external OpenCode writers.
-    let deadline = Duration::from_secs(60 + 3 * (bytes.len() as u64 / (1024 * 1024)));
-    static RETRY_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let deadline = Duration::from_secs(
+        DEADLINE_BASE_SECS + DEADLINE_PER_MB_SECS * (bytes.len() as u64 / (1024 * 1024)),
+    );
+    // Serializes *retried* imports against each other (first attempts run
+    // freely in parallel): opencode opens SQLite with busy_timeout=0, so a
+    // competing writer fails immediately instead of waiting. The backoff
+    // sleep runs *outside* the gate with jitter, so one session's wait
+    // never blocks an unrelated session's import.
+    static RETRY_GATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let mut last = None;
-    for attempt in 0..3u32 {
-        let _serial;
+    for attempt in 0..IMPORT_ATTEMPTS {
+        // Back off before re-entering: exponential with jitter, outside the
+        // gate so other sessions proceed while this one waits.
         if attempt > 0 {
-            // opencode opens SQLite with busy_timeout=0, so a competing writer
-            // fails immediately instead of waiting; retries back off and run
-            // one at a time so only external writers can still be in the way.
-            _serial = Some(RETRY_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-            std::thread::sleep(Duration::from_millis(750 * 3u64.pow(attempt - 1)));
+            let backoff = RETRY_BASE_MS * 3u64.pow(attempt - 1);
+            let jitter = retry_jitter(attempt);
+            std::thread::sleep(Duration::from_millis(backoff + jitter));
         }
+        // Retries hold the gate only around the import itself, so at most
+        // one retried import contends with external writers at a time.
+        let _serial = if attempt > 0 {
+            Some(RETRY_GATE.lock().unwrap_or_else(|e| e.into_inner()))
+        } else {
+            None
+        };
         // The payload directory is ignored: the session lands in the
         // `--directory` cwd, so the source project must be passed outright.
         let mut command = session_cmd();
@@ -471,6 +498,9 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
             .arg(&session.cwd)
             .arg(&tmp);
         let out = crate::proc::output_with_timeout(command, deadline);
+        // Intentional fallback: a failed spawn yields no stdout, which
+        // correctly reads as "not already there" and flows to the failure
+        // report below.
         let stdout = out
             .as_ref()
             .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
@@ -501,7 +531,9 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
             Err(_) => false,
         };
         if imported {
-            fs::remove_file(&tmp).ok();
+            if !keep_payload {
+                fs::remove_file(&tmp).ok();
+            }
             return Some(PathBuf::from(format!("opencode://{ses}")));
         }
         last = Some(out);
@@ -527,15 +559,38 @@ pub(super) fn write(session: &CanonicalSession, revision: Option<&str>) -> Optio
             crate::issues::record("opencode-rollback", &ses, &e.to_string());
         }
     }
-    let _ = fs::remove_file(&tmp);
+    if keep_payload {
+        eprintln!("kept opencode payload: {}", tmp.display());
+    } else {
+        let _ = fs::remove_file(&tmp);
+    }
     crate::issues::record("opencode-import", &ses, &reason);
     eprintln!(
         "opencode import failed for {ses}: {}",
         crate::ansi::strip(&reason)
     );
-    fs::remove_file(&tmp).ok();
+    if !keep_payload {
+        fs::remove_file(&tmp).ok();
+    }
     None
 }
+/// Deterministic jitter for retry backoff (0–250ms): spreads simultaneous
+/// retries without pulling in a RNG dependency. Counter-seeded like
+/// [`mint_suffix`], for the same reason — the clock alone repeats in tests.
+fn retry_jitter(attempt: u32) -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static JITTER_SEED: AtomicU64 = AtomicU64::new(0x9E3779B97F4A7C15);
+    let seed = JITTER_SEED.fetch_add(
+        0x9E3779B97F4A7C15u64.wrapping_mul(attempt as u64 + 1),
+        Ordering::Relaxed,
+    );
+    (seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407)
+        >> 41)
+        % 251
+}
+
 /// One `opencode session …` invocation with piped output. Callers add
 /// their subcommand: imports also pass `--directory` (the payload directory
 /// is ignored by the CLI, so the project must be stated outright).
@@ -576,6 +631,8 @@ fn mint_suffix() -> String {
         .chars()
         .collect();
     let mut s = String::new();
+    // Intentional fallback: a pre-epoch clock still mints unique ids —
+    // the counter alone keeps them distinct within a process.
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())

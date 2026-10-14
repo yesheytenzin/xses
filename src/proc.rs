@@ -41,7 +41,10 @@ fn run_with_timeout(
     let (input_send, input_receive) = mpsc::channel();
     let mut input_done = input.is_none();
     if let Some(input) = input {
-        let mut stdin = child.stdin.take().expect("stdin pipe");
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| std::io::Error::other("child stdin pipe missing"))?;
         std::thread::spawn(move || {
             use std::io::Write;
             let result = stdin.write_all(&input);
@@ -50,9 +53,17 @@ fn run_with_timeout(
         });
     }
     let (send, receive) = mpsc::channel();
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("child stdout pipe missing"))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| std::io::Error::other("child stderr pipe missing"))?;
     let pipes: Vec<(bool, Box<dyn Read + Send>)> = vec![
-        (true, Box::new(child.stdout.take().expect("stdout pipe"))),
-        (false, Box::new(child.stderr.take().expect("stderr pipe"))),
+        (true, Box::new(stdout_pipe)),
+        (false, Box::new(stderr_pipe)),
     ];
     for (stdout, mut pipe) in pipes {
         let send = send.clone();
@@ -80,10 +91,12 @@ fn run_with_timeout(
             }
             if let Some(status) = child.try_wait()? {
                 if input_done && stdout.is_some() && stderr.is_some() {
+                    let missing =
+                        || std::io::Error::other("child pipe closed before delivering output");
                     return Ok(Output {
                         status,
-                        stdout: stdout.take().unwrap(),
-                        stderr: stderr.take().unwrap(),
+                        stdout: stdout.take().ok_or_else(missing)?,
+                        stderr: stderr.take().ok_or_else(missing)?,
                     });
                 }
             }
@@ -105,6 +118,39 @@ fn run_with_timeout(
         let _ = child.wait();
     }
     result
+}
+
+/// Quote one SQLite string literal. The `sqlite3` CLI has no bind
+/// parameters, so every interpolated literal funnels through here: the
+/// single quote is doubled, and ids are additionally allowlisted by
+/// [`sql_quote_id`].
+pub fn sql_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "''"))
+}
+
+/// Quote a session/store id for interpolation. Ids are machine-made
+/// (`ses_*`, uuids, slugs); anything outside that shape is refused instead
+/// of escaped — a hostile id must fail loudly, never ride into SQL.
+pub fn sql_quote_id(id: &str) -> Result<String> {
+    let ok = !id.is_empty()
+        && id.len() <= 256
+        && id.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'+' | b'.' | b':' | b'/' | b'@')
+        });
+    anyhow::ensure!(ok, "refusing to interpolate suspicious sqlite id: {id:?}");
+    Ok(sql_quote(id))
+}
+
+/// Quote several ids as an `IN (...)` list. Empty input is a caller bug —
+/// fail rather than emit `IN ()`, which sqlite rejects with a bare syntax
+/// error far from the cause.
+pub fn sql_id_list<'a>(ids: impl Iterator<Item = &'a str>) -> Result<String> {
+    let mut quoted = Vec::new();
+    for id in ids {
+        quoted.push(sql_quote_id(id)?);
+    }
+    anyhow::ensure!(!quoted.is_empty(), "empty id list for sqlite IN clause");
+    Ok(quoted.join(","))
 }
 
 /// Parse `sqlite3 -json` output. An empty result set prints no bytes at all,
@@ -199,6 +245,24 @@ pub fn sqlite_exec_input(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sqlite_id_quoting_rejects_hostile_input() {
+        assert_eq!(super::sql_quote_id("ses_abc123").unwrap(), "'ses_abc123'");
+        assert_eq!(
+            super::sql_quote_id("01a1349e-571e-727e-b6e4-221162373935").unwrap(),
+            "'01a1349e-571e-727e-b6e4-221162373935'"
+        );
+        // Classic injection: spaces and quotes are outside the id shape.
+        assert!(super::sql_quote_id("' OR '1'='1").is_err());
+        assert!(super::sql_quote_id("ses_x'; DROP TABLE session;--").is_err());
+        assert!(super::sql_quote_id("").is_err());
+        assert!(super::sql_id_list(["a", "b"].into_iter()).is_ok());
+        assert!(super::sql_id_list(["a", "'"].into_iter()).is_err());
+        assert!(super::sql_id_list([].into_iter()).is_err());
+        // Free text still quotes by doubling.
+        assert_eq!(super::sql_quote("o'Brien"), "'o''Brien'");
+    }
 
     #[test]
     fn empty_sqlite_json_output_is_an_empty_list() {

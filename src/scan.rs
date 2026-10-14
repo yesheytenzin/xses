@@ -188,8 +188,8 @@ fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
     };
     let condition = match cwd_filter {
         Some(cwd) => format!(
-            "s.directory = '{}'",
-            cwd.to_string_lossy().replace('\'', "''")
+            "s.directory = {}",
+            crate::proc::sql_quote(&cwd.to_string_lossy())
         ),
         None => "s.time_archived IS NULL AND (s.parent_id IS NULL OR s.parent_id = '')".into(),
     };
@@ -227,6 +227,38 @@ fn scan_opencode(cwd_filter: Option<&Path>) -> Result<Vec<Session>> {
     Ok(out)
 }
 
+/// Full session-read UNION for one opencode session id, across both store
+/// generations. v1 legs (`session`/`message`/`part`) always run; v2 legs
+/// (`session_v2`/`session_message`) append when the store has them. `legacy`
+/// selects the pre-snapshot digest shape (no `message_id` on part rows, no
+/// `seq` on v2 rows) for the key migration. Single owner of generation SQL:
+/// extractors pass a shape flag, never table names.
+pub(crate) fn opencode_session_union(id: &str, legacy: bool) -> anyhow::Result<String> {
+    let esc = crate::proc::sql_quote_id(id)?;
+    let part_cols = if legacy {
+        "json_object('data', data, 'created', time_created)"
+    } else {
+        "json_object('data', data, 'created', time_created, 'message_id', message_id)"
+    };
+    let v2_msg_cols = if legacy {
+        "json_object('type', type, 'data', data, 'created', time_created)"
+    } else {
+        "json_object('type', type, 'data', data, 'created', time_created, 'seq', seq)"
+    };
+    let Some(db) = opencode_db() else {
+        anyhow::bail!("opencode database not found")
+    };
+    let v2 = if opencode_has_v2(&db) {
+        format!(" UNION ALL SELECT 'session_v2' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session_v2 WHERE id={esc}\
+        UNION ALL SELECT 'session_message', id, {v2_msg_cols} FROM session_message WHERE session_id={esc}")
+    } else {
+        String::new()
+    };
+    Ok(format!("SELECT 'session' AS kind, id, json_object('title', title, 'directory', directory, 'created', time_created) AS data FROM session WHERE id={esc}\
+        UNION ALL SELECT 'message', id, json_object('data', data, 'created', time_created) FROM message WHERE session_id={esc}\
+        UNION ALL SELECT 'part', id, {part_cols} FROM part WHERE session_id={esc}{v2} ORDER BY kind, id;"))
+}
+
 /// True when the store has the v2 generation (opencode ≥ 2.x); older stores
 /// carry v1 tables only.
 pub(crate) fn opencode_has_v2(db: &std::path::Path) -> bool {
@@ -237,6 +269,63 @@ pub(crate) fn opencode_has_v2(db: &std::path::Path) -> bool {
         "opencode generation probe",
     )
     .is_ok_and(|out| out.contains('1'))
+}
+
+/// Sessions deleted per sqlite3 invocation. Import rows are blob-heavy
+/// (roughly 3k rows freed per second on a store with hundreds of imports),
+/// so one monolithic transaction outlives any sane deadline; chunks keep
+/// each command bounded and make progress visible.
+pub(crate) const OPENCODE_DELETE_CHUNK: usize = 128;
+
+/// Delete sessions from both opencode store generations: v1
+/// (`session`/`message`/`part`) always, v2 (`session_v2`/`session_message`)
+/// when the store has it. This is the single owner of the generation
+/// branch — scanners, extractors and cleaners query through it or
+/// [`opencode_has_v2`], never with inline `session_v2` SQL of their own.
+pub(crate) fn delete_opencode_sessions(
+    ids: &std::collections::HashSet<String>,
+    progress: &crate::progress::Progress,
+) -> anyhow::Result<usize> {
+    use anyhow::Context;
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let Some(db) = opencode_db() else {
+        return Ok(0);
+    };
+    let total = ids.len();
+    let mut removed = 0usize;
+    let ids: Vec<&String> = ids.iter().collect();
+    for chunk in ids.chunks(OPENCODE_DELETE_CHUNK) {
+        let quoted = crate::proc::sql_id_list(chunk.iter().map(|s| s.as_str()))
+            .context("OpenCode cleanup ids")?;
+        let v2 = if opencode_has_v2(&db) {
+            format!(
+                " DELETE FROM session_message WHERE session_id IN ({quoted}); \
+                 DELETE FROM session_v2 WHERE id IN ({quoted});"
+            )
+        } else {
+            String::new()
+        };
+        let sql = format!(
+            "PRAGMA foreign_keys=ON; BEGIN IMMEDIATE; \
+             DELETE FROM part WHERE session_id IN ({quoted}); \
+             DELETE FROM message WHERE session_id IN ({quoted}); \
+             DELETE FROM session WHERE id IN ({quoted});{v2} COMMIT;"
+        );
+        // Generous per chunk: 128 blob-heavy sessions measure at ~20-30s.
+        if let Err(e) = crate::proc::sqlite_exec(
+            &db,
+            &sql,
+            std::time::Duration::from_secs(300),
+            "OpenCode bulk cleanup",
+        ) {
+            anyhow::bail!("OpenCode bulk cleanup failed after {removed}/{total}: {e}");
+        }
+        removed += chunk.len();
+        progress.inc(&format!("opencode {removed}/{total} sessions"));
+    }
+    Ok(removed)
 }
 
 /// One generation's session rows → [`Session`]s. Runs one aggregate query

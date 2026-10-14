@@ -234,6 +234,8 @@ pub(super) fn write(
                         "toolCallId": fallback_call_id(&mut ids, call_id, &mut minted, name),
                         "toolName": name,
                         "isError": is_error,
+                        // Intentional fallback: sources without a duration
+                        // read as instant, not unknown.
                         "durationMs": duration_ms.unwrap_or(0),
                         "content": [{"type": "text", "text": output}],
                     }));
@@ -241,7 +243,7 @@ pub(super) fn write(
                 Block::Image { mime, data, .. } => match data {
                     Some(d) => parts.push(json!({
                         "type": "image",
-                        "mimeType": mime.clone().unwrap_or_else(|| "image/png".into()),
+                        "mimeType": super::image_mime(mime),
                         "data": d,
                     })),
                     // Anything else a target cannot hold rides as labelled text.
@@ -438,11 +440,18 @@ pub(super) fn omp_id(session: &CanonicalSession, revision: Option<&str>) -> Stri
         "{:08x}-{:04x}-7{:03x}-8{:03x}-{}",
         (ms >> 16) as u32,
         (ms & 0xffff) as u32,
+        // Intentional fallback: `base` is hex by construction (synth_id),
+        // so these parses cannot fail; the zero keeps uuid shape on bug.
         u16::from_str_radix(&base[0..3], 16).unwrap_or(0) & 0xfff,
         u16::from_str_radix(&base[3..6], 16).unwrap_or(0) & 0xfff,
         &base[6..18]
     )
 }
+
+/// Fixed epoch anchor for the uuidv7 test: a known instant whose
+/// timestamped uuid the test pins byte-for-byte.
+#[cfg(test)]
+const FIXTURE_EPOCH_SECS: i64 = 1_700_000_000;
 
 #[cfg(test)]
 mod tests {
@@ -452,7 +461,8 @@ mod tests {
 
     #[test]
     fn omp_id_is_timestamped_uuidv7() {
-        let created = DateTime::<Utc>::from_timestamp(1_700_000_000, 123_000_000).unwrap();
+        let created =
+            DateTime::<Utc>::from_timestamp(super::FIXTURE_EPOCH_SECS, 123_000_000).unwrap();
         let session = CanonicalSession {
             id: "id".into(),
             tool: Tool::Pi,

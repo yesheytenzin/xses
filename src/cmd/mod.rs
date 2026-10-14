@@ -168,7 +168,9 @@ fn exec_resume(s: &Session) {
         eprintln!("  xses sync {} --to claude", s.locator());
         return;
     }
-    let (bin, rest) = argv.split_first().expect("resume argv non-empty");
+    let Some((bin, rest)) = argv.split_first() else {
+        return; // guarded by the is_empty check above; never fires
+    };
     eprintln!("▶ resuming {} ({})", s.short(), s.cwd.display());
     match std::process::Command::new(bin).args(rest).status() {
         Ok(st) if st.success() => {}

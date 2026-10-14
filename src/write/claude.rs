@@ -140,7 +140,7 @@ fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(Pa
                         "type": "image",
                         "source": {
                             "type": "base64",
-                            "media_type": mime.clone().unwrap_or_else(|| "image/png".into()),
+                            "media_type": super::image_mime(mime),
                             "data": d,
                         },
                     })),
@@ -235,12 +235,22 @@ fn write_inner(session: &CanonicalSession, revision: Option<&str>) -> Option<(Pa
     Some((target, sidecar))
 }
 
+/// Fixed wall-clock anchor for writer tests (named, not magic): imports
+/// stamp synthetic ids and leaf uuids from message times, so every fixture
+/// session starts here and offsets from it.
+#[cfg(test)]
+fn fixture_created() -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    chrono::Utc
+        .with_ymd_and_hms(2026, 10, 13, 9, 30, 0)
+        .unwrap()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::canonical::{Block, Event, Role};
     use crate::model::Tool;
-    use chrono::{TimeZone, Utc};
 
     /// Anthropic validates `tool_use.id` against `^[A-Za-z0-9_-]+$` and 400s
     /// otherwise; sources compose ids like `call_x|fc_y`, so the writer must
@@ -256,12 +266,12 @@ mod tests {
 
         let composite =
             "call_01a1349e7cfa7468a35787224ed8fc45|fc_01a1349e7cfa7468a35787224ed8fc45".to_string();
-        let source_time = Utc.with_ymd_and_hms(2026, 10, 13, 9, 31, 0).unwrap();
+        let source_time = super::fixture_created() + chrono::Duration::minutes(1);
         let mut session = CanonicalSession {
             id: "01a1349e-571e-727e-b6e4-221162373935".into(),
             tool: Tool::Omp,
             cwd: "/tmp/project".into(),
-            created: Utc.with_ymd_and_hms(2026, 10, 13, 9, 30, 0).unwrap(),
+            created: super::fixture_created(),
             title: None,
             msg_times: Default::default(),
             events: vec![
@@ -354,7 +364,7 @@ mod tests {
             id: "01a1349e-571e-727e-b6e4-221162373935".into(),
             tool: Tool::Omp,
             cwd: "/tmp/project".into(),
-            created: Utc.with_ymd_and_hms(2026, 10, 13, 9, 30, 0).unwrap(),
+            created: super::fixture_created(),
             title: Some("[omp] fix the picker".into()),
             msg_times: Default::default(),
             events: vec![

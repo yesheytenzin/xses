@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Tech-debt paydown (TODO.md, all 10 items): split `write/codex.rs` into
+  `write/codex/{mod,rollout,roller,tools,seed}.rs`; central SQLite quoting
+  (`proc::sql_quote`/`sql_quote_id`/`sql_id_list`) with hostile ids refused,
+  applied to opencode deletes, codex seeding/registration/retirement, and
+  opencode snapshot reads; opencode v1/v2 SQL owned by `scan.rs`
+  (`delete_opencode_sessions`, `opencode_session_union`); opencode retries
+  back off with jitter outside the serial gate; no production `.expect()` on
+  IO; documented silent fallbacks; one `DEFAULT_IMAGE_MIME`; pure
+  `doctor::format_issue_line` with fixture tests; named retry/fixture consts.
+  Test count 75 → 80 (`matrix` id/fingerprint/failure-mode coverage).
+- Fixed every opencode import after the first failing with `Internal Server
+  Error`: the import-note message reused the constant id `msg_000000-note`
+  while v2 message ids are globally unique. The note id is now per-session,
+  and `XSES_KEEP_PAYLOAD=1` keeps the import payload for manual replays.
+
 ## 0.7.2
 
 - Removed the push-CI workflow; the release workflow keeps its own test

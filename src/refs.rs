@@ -271,11 +271,12 @@ pub fn select(sessions: &[Session], r: Ref) -> anyhow::Result<&Session> {
                         candidates.iter().copied().filter(|s| s.id == id).collect();
                     let pick = if exact.len() == 1 {
                         exact[0]
+                    } else if let Some(newest) = candidates.iter().max_by_key(|s| s.mtime) {
+                        *newest
                     } else {
-                        *candidates
-                            .iter()
-                            .max_by_key(|s| s.mtime)
-                            .expect("non-empty")
+                        // Unreachable: `matches` held 2+ sessions and
+                        // `candidates` falls back to it, so it is non-empty.
+                        anyhow::bail!("no session matching {id:?}");
                     };
                     Ok(pick)
                 }

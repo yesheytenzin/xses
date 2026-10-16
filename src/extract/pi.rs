@@ -24,6 +24,20 @@ pub(super) fn pi_family(path: &Path, tool: Tool) -> Result<Events> {
             Some("message") => {
                 let msg = v.get("message").cloned().unwrap_or(Value::Null);
                 let msg_role = msg.get("role").and_then(|r| r.as_str());
+                if msg_role == Some("compactionSummary") {
+                    out.boundary();
+                    if let Some(ts) = any_time(&v) {
+                        out.at(ts);
+                    }
+                    out.push(Compressed {
+                        text: msg
+                            .get("summary")
+                            .and_then(Value::as_str)
+                            .unwrap_or("session compacted")
+                            .to_string(),
+                    });
+                    continue;
+                }
                 let Some(content) = msg.get("content") else {
                     continue;
                 };

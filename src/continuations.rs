@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::Hasher;
-use std::io::BufRead;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 
 type Marks = BTreeMap<String, usize>;
@@ -122,6 +122,77 @@ fn file_signature(path: &Path) -> Result<(String, BTreeSet<String>)> {
 }
 
 impl Baseline {
+    fn only_appended_omp_exit_records(&self) -> Result<bool> {
+        if self.tool != Tool::Omp {
+            return Ok(false);
+        }
+        let Some((length, _)) = self.stamp else {
+            return Ok(false);
+        };
+        let mut reader = std::io::BufReader::new(std::fs::File::open(&self.path)?);
+        let mut prefix = reader.by_ref().take(length);
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        let mut line = Vec::new();
+        let mut ends_at_newline = false;
+        loop {
+            line.clear();
+            if prefix.read_until(b'\n', &mut line)? == 0 {
+                break;
+            }
+            hash.write(&line);
+            ends_at_newline = line.last() == Some(&b'\n');
+        }
+        if prefix.limit() != 0
+            || !ends_at_newline
+            || format!("{:016x}", hash.finish()) != self.signature
+        {
+            return Ok(false);
+        }
+        let mut has_exit_record = false;
+        loop {
+            line.clear();
+            if reader.read_until(b'\n', &mut line)? == 0 {
+                return Ok(has_exit_record);
+            }
+            if line.last() != Some(&b'\n') {
+                return Ok(false);
+            }
+            let Ok(row) = serde_json::from_slice::<serde_json::Value>(&line) else {
+                return Ok(false);
+            };
+            if row["type"].as_str() != Some("custom")
+                || row["customType"].as_str() != Some("session_exit")
+            {
+                return Ok(false);
+            }
+            let Some(data) = row["data"].as_object() else {
+                return Ok(false);
+            };
+            if data.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "reason" | "kind" | "recordedAt" | "pendingToolCalls"
+                )
+            }) || data.get("reason").and_then(|v| v.as_str()).is_none()
+                || !matches!(
+                    data.get("kind").and_then(|v| v.as_str()),
+                    Some("normal" | "signal" | "fatal" | "process_exit")
+                )
+                || data
+                    .get("recordedAt")
+                    .and_then(|v| v.as_str())
+                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                    .is_none()
+                || data
+                    .get("pendingToolCalls")
+                    .is_some_and(|value| value.as_array().is_none_or(|calls| !calls.is_empty()))
+            {
+                return Ok(false);
+            }
+            has_exit_record = true;
+        }
+    }
+
     fn current_stamp(&self) -> Result<Option<(u64, chrono::DateTime<chrono::Utc>)>> {
         if self.tool.is_cli_backed() {
             return Ok(None);
@@ -228,7 +299,7 @@ pub fn protect(tool: Tool, paths: &[PathBuf]) -> Result<()> {
         } else {
             file_signature(path)?.0
         };
-        anyhow::ensure!(signature == baseline.signature,
+        anyhow::ensure!(signature == baseline.signature || baseline.only_appended_omp_exit_records()?,
             "continued copy at {} was preserved; sync its session ID explicitly to share its branch", path.display());
     }
     Ok(())

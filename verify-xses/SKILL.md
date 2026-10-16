@@ -81,3 +81,11 @@ Codex dates use realistic epoch seconds, and OpenCode has no bogus empty rows.
 The flow also converts a hidden Claude skill injection into a Pi tool result
 without losing its historical instructions. Captured UI text is saved beside
 the native flow's command log.
+
+## Pi imported compaction summaries
+
+Pi imports store standalone compaction summaries as native `compactionSummary`
+messages. Pi folds them when resuming and keeps every summary in model context.
+The native Pi HTML exporter embeds these messages in its session data, but its
+conversation view currently omits this message role. Summary text remains
+available to xses exports and round trips.

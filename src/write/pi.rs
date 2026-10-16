@@ -223,6 +223,36 @@ fn write_at(
         let row_ts = next_row_time(session, m, &mut prev_ts);
         let row_ts_iso = iso(&row_ts);
         let row_ts_ms = row_ts.timestamp_millis();
+        // Canonical summaries lack a retained-history boundary. Pi's folded
+        // summary message keeps them without discarding earlier entries.
+        if !is_omp
+            && blocks
+                .iter()
+                .all(|block| matches!(block, Block::Compressed { .. } | Block::Usage { .. }))
+        {
+            for block in &blocks {
+                if let Block::Compressed { text } = block {
+                    let mid = next_id(&sid, &mut minted);
+                    push(
+                        &mut buf,
+                        &json!({
+                            "type": "message",
+                            "id": mid,
+                            "parentId": parent,
+                            "timestamp": row_ts_iso,
+                            "message": {
+                                "role": "compactionSummary",
+                                "summary": text,
+                                "tokensBefore": 0,
+                                "timestamp": row_ts_ms,
+                            },
+                        }),
+                    );
+                    parent = Some(mid);
+                }
+            }
+            continue;
+        }
         let role = group_role(&blocks, Role::Assistant);
         let usage = usage_of(&blocks);
         let mut parts: Vec<Value> = Vec::new();
@@ -678,6 +708,105 @@ mod sidecar_tests {
                 assistants > 0,
                 "{target:?} should emit an assistant message"
             );
+        }
+    }
+
+    #[test]
+    fn pi_compressed_summaries_roundtrip_with_native_role() {
+        let home = scratch_home();
+        let mut session = omp_session();
+        let first_time = session.created + chrono::Duration::seconds(10);
+        let second_time = session.created + chrono::Duration::seconds(20);
+        let summaries = [
+            "# Earlier work\nPreserve this summary.",
+            "# Later work\nPreserve this too.",
+        ];
+        for (i, text) in summaries.iter().enumerate() {
+            session.events.push(crate::canonical::Event {
+                msg: i as u32 + 1,
+                block: Block::Compressed {
+                    text: text.to_string(),
+                },
+            });
+        }
+        session.msg_times.insert(1, first_time);
+        session.msg_times.insert(2, second_time);
+        session.events.push(crate::canonical::Event {
+            msg: 3,
+            block: Block::Text {
+                role: Role::Assistant,
+                text: "Work after both summaries.".into(),
+            },
+        });
+        let out = write_at(Tool::Pi, &session, None, &home.dir);
+        let path = out[0].as_ref().expect("session written");
+        let rows: Vec<Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let native_summaries: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                row.pointer("/message/role").and_then(Value::as_str) == Some("compactionSummary")
+            })
+            .collect();
+        assert_eq!(
+            native_summaries.len(),
+            2,
+            "both summaries use Pi's folded native role"
+        );
+        for ((row, text), time) in native_summaries
+            .iter()
+            .zip(summaries)
+            .zip([first_time, second_time])
+        {
+            assert_eq!(row["type"], "message");
+            assert_eq!(row["message"]["summary"], text);
+            assert_eq!(row["message"]["tokensBefore"], 0);
+            assert_eq!(row["message"]["timestamp"], time.timestamp_millis());
+            assert_eq!(row["timestamp"], iso(&time));
+        }
+        let chain: Vec<_> = rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row["type"].as_str(),
+                    Some("model_change" | "thinking_level_change" | "message")
+                )
+            })
+            .collect();
+        for pair in chain.windows(2) {
+            assert_eq!(pair[1]["parentId"], pair[0]["id"]);
+        }
+        let recovered =
+            crate::extract::extract(Tool::Pi, "roundtrip", &session.cwd, session.created, path)
+                .unwrap();
+        let recovered_summaries: Vec<_> = recovered
+            .events
+            .iter()
+            .filter_map(|event| match &event.block {
+                Block::Compressed { text } => {
+                    Some((text.as_str(), recovered.msg_times[&event.msg]))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            recovered_summaries,
+            vec![(summaries[0], first_time), (summaries[1], second_time)]
+        );
+        assert!(recovered
+            .blocks()
+            .any(|block| matches!(block, Block::Text { text, .. } if text == "hi")));
+        assert!(recovered.blocks().any(|block| matches!(block, Block::Text { text, .. } if text == "Work after both summaries.")));
+        let omp = write_at(Tool::Omp, &session, None, &home.dir);
+        let omp_text =
+            std::fs::read_to_string(omp[0].as_ref().expect("OMP session written")).unwrap();
+        assert!(!omp_text.contains("\"role\":\"compactionSummary\""));
+        for summary in summaries {
+            assert!(omp_text
+                .contains(&serde_json::to_string(&format!("[compaction]\n{summary}")).unwrap()));
         }
     }
 

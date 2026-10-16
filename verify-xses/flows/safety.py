@@ -110,6 +110,66 @@ try:
         assert all(not p.exists() for p in artifacts)
         assert source.exists()
 
+    for mode in ['exit-only', 'empty-pending-tools', 'message-and-exit', 'unknown-custom-and-exit',
+                 'changed-prefix-and-exit', 'reordered-prefix-and-exit', 'deleted-prefix-and-exit',
+                 'pending-tools-and-exit', 'unknown-exit-data', 'missing-exit-data',
+                 'invalid-exit-time', 'invalid-exit-kind', 'truncated-exit', 'invalid-exit',
+                 'missing-baseline-and-exit', 'non-omp-exit']:
+        base, source, env, project, run, paths = fixture('omp-lifecycle-'+mode)
+        target = 'claude' if mode == 'non-omp-exit' else 'omp'
+        run('sync', '--from', 'pi', '--to', target)
+        dest = next(p for p in paths() if p.suffix == '.jsonl')
+        if mode == 'message-and-exit':
+            append(dest, 'assistant', 'local work before exit')
+        elif mode == 'unknown-custom-and-exit':
+            with dest.open('a') as f:
+                f.write(json.dumps({'type': 'custom', 'customType': 'local_context',
+                                   'data': {'text': 'local work'}})+'\n')
+        elif mode == 'changed-prefix-and-exit':
+            dest.write_bytes(dest.read_bytes().replace(b'original answer', b'parallel answer'))
+        elif mode == 'reordered-prefix-and-exit':
+            rows = dest.read_text().splitlines(keepends=True)
+            rows[-2:] = reversed(rows[-2:])
+            dest.write_text(''.join(rows))
+        elif mode == 'deleted-prefix-and-exit':
+            dest.write_text(''.join(dest.read_text().splitlines(keepends=True)[:-1]))
+        elif mode == 'missing-baseline-and-exit':
+            for p in (base / 'data/xses/import-baselines').glob('*.json'):
+                p.unlink()
+        exit_row = {'type': 'custom', 'customType': 'session_exit',
+                    'data': {'reason': 'sighup', 'kind': 'signal',
+                             'recordedAt': '2026-10-16T07:10:24.884Z'},
+                    'id': 'aefb9efa', 'parentId': 'import-m1',
+                    'timestamp': '2026-10-16T07:10:24.884Z',
+                    'runtime': {'version': '18.11.1'}}
+        if mode == 'empty-pending-tools':
+            exit_row['data']['pendingToolCalls'] = []
+        elif mode == 'pending-tools-and-exit':
+            exit_row['data']['pendingToolCalls'] = [{'toolCallId': 'recover-me', 'toolName': 'bash'}]
+        elif mode == 'unknown-exit-data':
+            exit_row['data']['recoveryContext'] = 'local work'
+        elif mode == 'missing-exit-data':
+            del exit_row['data']
+        elif mode == 'invalid-exit-time':
+            exit_row['data']['recordedAt'] = 'not a timestamp'
+        elif mode == 'invalid-exit-kind':
+            exit_row['data']['kind'] = 'unknown'
+        suffix = json.dumps(exit_row)+'\n'
+        if mode == 'truncated-exit':
+            suffix = suffix.rstrip('\n')
+        elif mode == 'invalid-exit':
+            suffix += '{broken}\n'
+        with dest.open('a') as f:
+            f.write(suffix)
+        before = dest.read_bytes()
+        append(source, 'user', 'source update after resume')
+        if mode in ['exit-only', 'empty-pending-tools']:
+            assert '1 written' in run('sync', '--from', 'pi', '--to', target)
+            assert b'source update after resume' in dest.read_bytes()
+        else:
+            assert 'preserved' in run('sync', '--from', 'pi', '--to', target, ok=False)
+            assert dest.read_bytes() == before
+
     for mode in ['assistant', 'image']:
         base, source, env, project, run, paths = fixture('continuation-'+mode)
         run('sync', '--from', 'pi', '--to', 'claude')

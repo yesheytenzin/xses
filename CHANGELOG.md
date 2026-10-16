@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Fix Pi resume stalls after importing large OpenCode compaction summaries.
+  Store them as folded native summary messages and preserve their text,
+  timestamps, parent links, and surrounding history during round trips.
+- Allow OMP imports to refresh after native exit diagnostics when the original
+  transcript bytes are unchanged. Preserve actual edits, unknown metadata,
+  malformed records, and pending tool recovery data.
+- Mapping 16 refreshes unchanged imports while preserving continued copies.
+- Pi's native HTML exporter retains summary messages in its session data but
+  currently omits them from the conversation view. xses exports retain them.
+
 ## 0.8.2
 
 - Render known tools with target-native names and arguments; include Claude

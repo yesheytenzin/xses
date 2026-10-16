@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.4
 
 - Fix Pi resume stalls after importing large OpenCode compaction summaries.
   Store them as folded native summary messages and preserve their text,
